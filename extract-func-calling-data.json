@@ -130,313 +130,65 @@
         "source": "Glaive"
     },
     {
-        "id": "ce10dba6-043b-4ef4-8427-25c6293c20d1",
+        "id": "357b94dd-d234-4463-b280-9c96458722fd",
         "conversations": [
             {
                 "from": "system",
-                "value": "You are a helpful assistant, with no access to external functions."
+                "value": "You are a function calling AI model. You are provided with function signatures within <tools></tools> XML tags.You may call one or more functions to assist with the user query. Don't make assumptions about what values to plug into functions.Here are the available tools:<tools>\n[{\"type\": \"function\", \"function\": {\"name\": \"search_movies\", \"description\": \"Search for movies based on title or genre\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"The search query\"}, \"genre\": {\"type\": \"string\", \"description\": \"The genre of the movie\"}}, \"required\": [\"query\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"calculate_discount\", \"description\": \"Calculate the discounted price\", \"parameters\": {\"type\": \"object\", \"properties\": {\"original_price\": {\"type\": \"number\", \"description\": \"The original price of the item\"}, \"discount_percentage\": {\"type\": \"number\", \"description\": \"The percentage discount\"}}, \"required\": [\"original_price\", \"discount_percentage\"]}}}]\n</tools>Use the following pydantic model json schema for each tool call you will make: {'title': 'FunctionCall', 'type': 'object', 'properties': {'arguments': {'title': 'Arguments', 'type': 'object'}, 'name': {'title': 'Name', 'type': 'string'}}, 'required': ['arguments', 'name']}For each function call return a json object with function name and arguments within <tool_call></tool_call> XML tags as follows:\n<tool_call>\n{tool_call}\n</tool_call>"
             },
             {
                 "from": "human",
-                "value": "Imagine a sci-fi story where a group of astronauts aboard a spaceship are on a mission to save Earth from a deadly asteroid impact. However, they soon discover that their ship has been sent back in time, and their actions to save the future only seem to worsen the outcome. Can you come up with a title that captures the thrilling time-travel aspect of this story, as well as the high stakes of the mission? Bonus points for incorporating the emotional struggles of the characters as they grapple with the consequences of their choices."
+                "value": "I want to watch a movie but I can't decide. Can you suggest me some?"
             },
             {
                 "from": "gpt",
-                "value": "\"Chrono-Crisis: Racing Against Time to Save Tomorrow, But At What Cost?\""
+                "value": "Of course, I can help with that. Could you tell me your preferred genre or any specific movie title you have in mind?"
             },
             {
                 "from": "human",
-                "value": "That's a great title! Now, let's go deeper into the story. How would you describe the emotional journey of the main characters? How do they deal with the pressure of being responsible for saving the world while also facing the consequences of their time-travel actions?"
+                "value": "I like action movies."
             },
             {
                 "from": "gpt",
-                "value": "The emotional journey of the characters in this story would be a rollercoaster ride. At first, they would feel invincible as they embark on their mission to save Earth. However, as they realize that their actions in the past are causing the exact disaster they were trying to prevent, they become plagued with doubt, fear, and guilt. They would be confronted with tough choices, such as whether to risk altering the timeline even further to try again or to accept that they may have failed in their mission. Each character would handle these challenges differently, some becoming more resolute in their determination to succeed, while others become overwhelmed by the weight of their responsibility."
+                "value": "<tool_call>\n{\"name\": \"search_movies\", \"arguments\": {\"query\": \"action\"}}\n</tool_call>"
+            },
+            {
+                "from": "tool",
+                "value": "<tool_response>\n{\"name\": \"search_movies\", \"content\": {\"movies\": [\"Die Hard\", \"Mad Max: Fury Road\", \"The Dark Knight\", \"Inception\", \"John Wick\"]}}\n</tool_response>"
+            },
+            {
+                "from": "gpt",
+                "value": "Here are some action movies you might enjoy: \"Die Hard\", \"Mad Max: Fury Road\", \"The Dark Knight\", \"Inception\", and \"John Wick\"."
             },
             {
                 "from": "human",
-                "value": "It sounds like exploring the characters' reactions to the consequences of their actions is a central aspect of the story. Can you give some examples of how each character might react differently to the difficult choices they face throughout their journey?"
+                "value": "I have already watched \"Die Hard\" and \"The Dark Knight\". Any other suggestions?"
             },
             {
                 "from": "gpt",
-                "value": "Absolutely. For example, one character might become increasingly obsessive and ruthless in their attempts to alter the timeline, convinced that they can find a way to fix the future no matter what. Another character might become paralyzed by the enormity of the situation, unable to make any decisions at all. They might withdraw from the group and experience intense feelings of anxiety and depression. Still, another character might become consumed by guilt for what they perceive as their role in causing the disaster, putting themselves in harm's way to make up for their mistakes. These different reactions would create complex interpersonal dynamics within the group, adding another layer of tension to an already high-stakes situation."
+                "value": "<tool_call>\n{\"name\": \"search_movies\", \"arguments\": {\"query\": \"action\"}}\n</tool_call>"
+            },
+            {
+                "from": "tool",
+                "value": "<tool_response>\n{\"name\": \"search_movies\", \"content\": {\"movies\": [\"Terminator 2: Judgment Day\", \"The Matrix\", \"Gladiator\", \"Kill Bill: Volume 1\", \"The Bourne Identity\"]}}\n</tool_response>"
+            },
+            {
+                "from": "gpt",
+                "value": "Sure, here are some more action movies: \"Terminator 2: Judgment Day\", \"The Matrix\", \"Gladiator\", \"Kill Bill: Volume 1\", and \"The Bourne Identity\"."
             },
             {
                 "from": "human",
-                "value": "That's fascinating. It seems like the story would require a lot of attention to detail and consistency to keep track of the different timelines and character arcs. How would you approach writing this kind of complex, multi-layered story?"
+                "value": "Great! I will watch \"The Matrix\". Thanks for the suggestions."
             },
             {
                 "from": "gpt",
-                "value": "Writing a story like this would require a lot of planning and organization. I would start by creating a detailed timeline of events, mapping out each character's arc and how their choices impact the course of the story. I would also create character profiles, outlining their personalities, motivations, and histories, so that their actions and reactions feel authentic throughout the story. To ensure consistency, I would need to constantly refer back to my notes and timelines as I wrote, checking for any inconsistencies or plot holes. It might also be helpful to get feedback from beta readers or other writers to catch any issues I might have missed. Ultimately, though, it would be a labor of love, with the satisfaction of seeing the story come together making all the hard work worthwhile."
+                "value": "You're welcome! Enjoy your movie."
             }
         ],
-        "tools": "null",
-        "category": "Exploration",
-        "subcategory": null,
-        "task": "Sci-Fi Exploration and Existential Themes",
-        "source": "Glaive"
-    },
-    {
-        "id": "9743e1bc-be00-4460-a347-3cce9b24b91d",
-        "conversations": [
-            {
-                "from": "system",
-                "value": "You are a helpful assistant, with no access to external functions."
-            },
-            {
-                "from": "human",
-                "value": "Convert the string \"I am currently studying natural language processing (NLP) through various resources such as online courses, textbooks, and research papers\" to title case while ensuring that all acronyms and abbreviations are capitalized properly."
-            },
-            {
-                "from": "gpt",
-                "value": "\"I Am Currently Studying Natural Language Processing (NLP) Through Various Resources Such as Online Courses, Textbooks, and Research Papers\""
-            },
-            {
-                "from": "human",
-                "value": "What are some of the most popular algorithms used in natural language processing?"
-            },
-            {
-                "from": "gpt",
-                "value": "Some of the most popular algorithms used in natural language processing include Naive Bayes, Support Vector Machines (SVM), Hidden Markov Models (HMM), and Recurrent Neural Networks (RNN). Each algorithm has its own strengths and weaknesses and is suited for different tasks within NLP."
-            },
-            {
-                "from": "human",
-                "value": "How does sentiment analysis work in natural language processing?"
-            },
-            {
-                "from": "gpt",
-                "value": "Sentiment analysis, also known as opinion mining, is a technique used in natural language processing to identify and extract subjective information from text. This involves analyzing the words and phrases used in a piece of text to determine whether the overall sentiment is positive, negative, or neutral. This is often achieved using machine learning algorithms that have been trained on large datasets of labeled text."
-            },
-            {
-                "from": "human",
-                "value": "Can you explain the concept of word embeddings in natural language processing?"
-            },
-            {
-                "from": "gpt",
-                "value": "Word embeddings are a way of representing words as numerical vectors in a high-dimensional space. This allows us to perform mathematical operations on words, such as measuring their similarity or finding analogies between them. The most common approach to creating word embeddings is to use neural networks, which are trained on large amounts of text data to learn representations that capture the meaning of each word."
-            },
-            {
-                "from": "human",
-                "value": "What are some challenges faced by natural language processing when dealing with multiple languages?"
-            },
-            {
-                "from": "gpt",
-                "value": "One of the biggest challenges faced by natural language processing when dealing with multiple languages is the issue of language ambiguity. This occurs when multiple languages share the same words, but those words have different meanings in each language. Another challenge is the need to create models that can handle the nuances of different languages, such as differences in grammar, syntax, and vocabulary. Additionally, there is the challenge of dealing with non-standard language use, such as slang and colloquialisms, which can vary widely from one language to another."
-            }
-        ],
-        "tools": "null",
-        "category": "Natural Language Processing",
-        "subcategory": null,
-        "task": "Understanding GPT-3 and Natural Language Processing",
-        "source": "Glaive"
-    },
-    {
-        "id": "29882872-dcda-494a-9026-20ca529cea6f",
-        "conversations": [
-            {
-                "from": "system",
-                "value": "You are a helpful assistant, with no access to external functions."
-            },
-            {
-                "from": "human",
-                "value": "What is the JSON data format of an Excel table that contains information about different countries such as name, population, and GDP? And can you provide a Python code that generates this Excel table from the given JSON data?\n[JSON data]\n{\n \"countries\": [\n {\n \"name\": \"United States\",\n \"population\": 328200000,\n \"gdp\": 19390600000000\n },\n {\n \"name\": \"China\",\n \"population\": 1393000000,\n \"gdp\": 12237700404400\n },\n {\n \"name\": \"India\",\n \"population\": 1353000000,\n \"gdp\": 2657015425252\n },\n {\n \"name\": \"Japan\",\n \"population\": 126500000,\n \"gdp\": 4872418621924\n }\n ]\n}\n[Python code]\n```python\nimport pandas as pd\nimport json\n# Read JSON data\nwith open('countries.json', 'r') as f:\n data = json.load(f)\n# Create DataFrame\ndf = pd.DataFrame(data['countries'], columns=['name', 'population', 'gdp'])\n# Export to Excel\ndf.to_excel('countries.xlsx', index=False)\n```"
-            },
-            {
-                "from": "gpt",
-                "value": "That is correct! The provided JSON data represents a list of dictionaries, where each dictionary represents a country with its respective name, population, and GDP. The Python code reads the JSON data, creates a DataFrame using the Pandas library, and exports the DataFrame to an Excel file. This is a great example of how easy it is to work with different data formats using Python and its libraries."
-            },
-            {
-                "from": "human",
-                "value": "Can you explain how the Pandas library is used for data analysis in Python?"
-            },
-            {
-                "from": "gpt",
-                "value": "Absolutely! Pandas is a popular library in Python used for data manipulation and analysis. It provides DataFrame objects which allow you to easily handle tabular data, similar to Excel spreadsheets. With Pandas, you can perform operations such as filtering, merging, grouping, and aggregation on your data. Additionally, Pandas also provides tools for reading and writing data in various formats, including CSV, Excel, SQL databases, and JSON."
-            },
-            {
-                "from": "human",
-                "value": "How does the Pandas library handle missing data in datasets?"
-            },
-            {
-                "from": "gpt",
-                "value": "Good question! Pandas has several tools to handle missing data. One way to deal with missing data is to remove it altogether using the `dropna()` method. Another way is to fill in missing values with a specific value or a calculated value using the `fillna()` method. Additionally, Pandas provides interpolation methods like linear or polynomial interpolation to guess missing values based on other values in the dataset."
-            },
-            {
-                "from": "human",
-                "value": "What is the difference between supervised and unsupervised learning in machine learning?"
-            },
-            {
-                "from": "gpt",
-                "value": "In supervised learning, the algorithm learns from labeled examples, where each example is a pair of input and output values. The algorithm tries to learn a function that maps the inputs to the outputs by minimizing the difference between predicted and actual outputs. On the other hand, in unsupervised learning, the algorithm learns from unlabeled data, where there are no predefined output values. The goal of unsupervised learning is to discover patterns and structures in the data, such as clustering or dimensionality reduction."
-            },
-            {
-                "from": "human",
-                "value": "How does the Gradient Descent algorithm work in machine learning?"
-            },
-            {
-                "from": "gpt",
-                "value": "Gradient Descent is a commonly used optimization algorithm in machine learning that aims to find the best parameters for a given model. It works by iteratively adjusting the parameters in the direction of the steepest descent of the loss function, which measures the difference between predicted and actual outputs. In each iteration, the algorithm calculates the partial derivatives of the loss function with respect to each parameter and updates the parameters accordingly. The learning rate determines the step size of each update and is usually set manually or using a search algorithm."
-            },
-            {
-                "from": "human",
-                "value": "What is an activation function in neural networks?"
-            },
-            {
-                "from": "gpt",
-                "value": "An activation function is a mathematical function applied element-wise to the output of a neural network layer. It introduces non-linearities into the model, allowing it to learn complex patterns and relationships in the data. Common activation functions include the sigmoid, tanh, ReLU, and softmax functions. The choice of activation function depends on the problem and the architecture of the neural network. For example, the ReLU function is widely used in deep learning because it is computationally efficient and avoids the vanishing gradient problem, where gradients become too small to be useful for training."
-            }
-        ],
-        "tools": "null",
-        "category": "Machine Learning",
-        "subcategory": null,
-        "task": "Machine Learning and Data Handling",
-        "source": "Glaive"
-    },
-    {
-        "id": "b42911e1-5abf-4fe4-a69c-e48536e231d1",
-        "conversations": [
-            {
-                "from": "system",
-                "value": "You are a helpful assistant, with no access to external functions."
-            },
-            {
-                "from": "human",
-                "value": "Sort the following numbers by ascending order.\n5, 37, 18, 90, 23"
-            },
-            {
-                "from": "gpt",
-                "value": "5, 18, 23, 37, 90"
-            },
-            {
-                "from": "human",
-                "value": "Can you explain the concept of exponential growth?"
-            },
-            {
-                "from": "gpt",
-                "value": "Exponential growth refers to a pattern of growth where a quantity increases at a rate proportional to its current size. In other words, the larger the quantity becomes, the faster it grows. This can lead to very rapid growth over time, as the quantity multiplies itself repeatedly. For example, if a population of bacteria doubles every hour, then after one hour there will be two bacteria, after two hours there will be four bacteria, and so on. This is an example of exponential growth."
-            },
-            {
-                "from": "human",
-                "value": "How are exponential growth and compound interest related?"
-            },
-            {
-                "from": "gpt",
-                "value": "Compound interest is a type of exponential growth that occurs when the interest earned on an investment is added back to the principal amount, and then earns interest itself. This means that the overall value of the investment grows at an accelerating rate over time. The formula for calculating compound interest is based on exponential growth, with the interest rate acting as the growth rate. Just like with exponential growth, the longer the investment period, the more pronounced the effect of compounding becomes."
-            },
-            {
-                "from": "human",
-                "value": "Can you give me an example of using compound interest in real life?"
-            },
-            {
-                "from": "gpt",
-                "value": "Sure, a common example of compound interest in real life is with savings accounts or investments. Let's say you invest $10,000 in a savings account with an interest rate of 5% per year compounded annually. After one year, your investment would be worth $10,500 ($10,000 x 1.05). After two years, it would be worth $11,025 ($10,500 x 1.05), and so on. Over time, the effect of compounding results in significant growth of your initial investment. Another example would be with credit card debt, where the interest charged on the outstanding balance can also compound over time, leading to increasing debt if not managed carefully."
-            },
-            {
-                "from": "human",
-                "value": "How does compound interest differ from simple interest and why is it more beneficial for long-term investments?"
-            },
-            {
-                "from": "gpt",
-                "value": "Simple interest is calculated based only on the original principal amount, while compound interest takes into account both the principal amount and any accumulated interest. This means that with simple interest, the growth rate remains constant over time, whereas with compound interest, the growth rate increases as the investment grows. For long-term investments, this means that compound interest can result in much larger returns than simple interest, due to the compounding effect. In fact, given enough time and a high enough interest rate, even small differences in the interest rate between simple and compound interest can lead to significant differences in the final value of the investment."
-            },
-            {
-                "from": "human",
-                "value": "Can you explain the concept of diversification in investing?"
-            },
-            {
-                "from": "gpt",
-                "value": "Diversification is a strategy used in investing to manage risk by spreading investments across multiple assets or types of investments. By diversifying your portfolio, you reduce the impact of any one investment performing poorly, as losses are offset by gains in other areas. The goal of diversification is to maximize returns while minimizing risk, as a diversified portfolio is less vulnerable to market fluctuations or other economic events that could negatively affect a single asset class. Diversification can be achieved through investing in a variety of stocks, bonds, mutual funds, real estate, commodities, and other asset classes."
-            },
-            {
-                "from": "human",
-                "value": "What are some of the potential drawbacks or limitations of diversification, if any?"
-            },
-            {
-                "from": "gpt",
-                "value": "While diversification is generally considered a sound investment strategy, there are some potential drawbacks to consider. One limitation is that over-diversification can dilute returns, as spreading investments too thinly can lower the overall rate of return. Additionally, certain types of investments may be highly correlated, meaning that they tend to move in the same direction at the same time, reducing the benefits of diversification. Another consideration is that diversification does not eliminate all risk, as the entire market or economy could experience a downturn that affects all types of investments regardless of diversification. Finally, diversification requires ongoing management and monitoring to ensure that the portfolio remains balanced and aligned with the investor's goals and risk tolerance."
-            }
-        ],
-        "tools": "null",
-        "category": "Mathematics",
-        "subcategory": null,
-        "task": "Statistics and Probability Explained",
-        "source": "Glaive"
-    },
-    {
-        "id": "fc808ac3-8b0f-46a2-b935-ec26310aeb7d",
-        "conversations": [
-            {
-                "from": "system",
-                "value": "You are a helpful assistant, with no access to external functions."
-            },
-            {
-                "from": "human",
-                "value": "What is the name of the sentence structure that lends human qualities to non-human entities?"
-            },
-            {
-                "from": "gpt",
-                "value": "The name of the sentence structure that lends human qualities to non-human entities is personification."
-            },
-            {
-                "from": "human",
-                "value": "Can you give me an example of personification in literature?"
-            },
-            {
-                "from": "gpt",
-                "value": "Sure, one example of personification in literature can be found in the famous poem \"The Tyger\" by William Blake. In the poem, the tiger is described as a creature that possesses qualities such as fearlessness and power, which are traditionally associated with humans. This lends the animal a sense of majesty and awe-inspiring presence, making it a powerful symbol in the poem."
-            },
-            {
-                "from": "human",
-                "value": "What is the difference between metaphor and simile?"
-            },
-            {
-                "from": "gpt",
-                "value": "Metaphors and similes are both figures of speech used to make comparisons between two seemingly unrelated objects or ideas. The difference is that a simile uses \"like\" or \"as\" to make the comparison, while a metaphor does not. For example, \"Life is like a box of chocolates\" is a simile, while \"Life is a journey\" is a metaphor."
-            },
-            {
-                "from": "human",
-                "value": "How do metaphors and similes affect the reader's understanding of a text?"
-            },
-            {
-                "from": "gpt",
-                "value": "Metaphors and similes can greatly enhance a reader's understanding and appreciation of a text. By comparing complex or abstract ideas to concrete, tangible objects or experiences, metaphors and similes can help readers make connections and draw parallels between different concepts. They also add depth and richness to the writing, making it more engaging and memorable."
-            },
-            {
-                "from": "human",
-                "value": "What is the difference between denotation and connotation?"
-            },
-            {
-                "from": "gpt",
-                "value": "Denotation refers to the literal, dictionary definition of a word, while connotation refers to the emotional and cultural associations that people have with a word. For example, the denotation of the word \"snake\" might be \"a long, legless reptile,\" but its connotations could include things like danger, deceitfulness, or fear."
-            },
-            {
-                "from": "human",
-                "value": "How do writers use connotation to convey meaning in their writing?"
-            },
-            {
-                "from": "gpt",
-                "value": "Writers can use connotation to add layers of meaning and nuance to their writing. By choosing words with specific connotations, they can subtly influence the reader's emotions or perceptions of a character, setting, or event. For example, describing a character as wearing a \"well-worn\" coat could convey a sense of poverty or hard work, while describing the same coat as \"tattered\" could imply neglect or carelessness."
-            },
-            {
-                "from": "human",
-                "value": "What is the difference between syntax and diction?"
-            },
-            {
-                "from": "gpt",
-                "value": "Syntax refers to the arrangement of words and phrases to create well-formed sentences in a language, while diction refers to the choice and use of words and phrases in speech or writing. In other words, syntax is concerned with the structure of language, while diction is concerned with the content."
-            },
-            {
-                "from": "human",
-                "value": "How can writers use syntax and diction to create a particular tone or mood in their writing?"
-            },
-            {
-                "from": "gpt",
-                "value": "Writers can use syntax and diction to create a variety of tones and moods in their writing. For example, using short, choppy sentences and simple vocabulary can create a sense of urgency or tension, while longer, more complex sentences and poetic language can create a more contemplative or philosophical tone. The choice of words and sentence structure can also convey a sense of emotion, whether it be anger, sadness, or joy."
-            }
-        ],
-        "tools": "null",
-        "category": "Literary Analysis",
-        "subcategory": null,
-        "task": "Figures of Speech and Literary Devices",
+        "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"search_movies\", \"description\": \"Search for movies based on title or genre\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"The search query\"}, \"genre\": {\"type\": \"string\", \"description\": \"The genre of the movie\"}}, \"required\": [\"query\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"calculate_discount\", \"description\": \"Calculate the discounted price\", \"parameters\": {\"type\": \"object\", \"properties\": {\"original_price\": {\"type\": \"number\", \"description\": \"The original price of the item\"}, \"discount_percentage\": {\"type\": \"number\", \"description\": \"The percentage discount\"}}, \"required\": [\"original_price\", \"discount_percentage\"]}}}]",
+        "category": "Movie",
+        "subcategory": "Search Movies",
+        "task": "Action Movie Recommendations",
         "source": "Glaive"
     }
 ]

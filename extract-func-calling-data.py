@@ -22,9 +22,13 @@ def count_human_turns(item):
 
 
 def has_valid_tools(item):
-    """Return True if the item has a non-null tools field."""
+    """Return True if the item has a real tools field (not None or string 'null')."""
     tools = item.get("tools")
-    return tools is not None
+    if tools is None:
+        return False
+    if isinstance(tools, str) and tools.strip().lower() == "null":
+        return False
+    return True
 
 
 def main():
