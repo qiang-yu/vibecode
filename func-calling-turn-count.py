@@ -5,6 +5,24 @@
 # Each file is processed and reported independently.
 ###
 
+"""
+==================================================
+  File: glaive-function-calling-5k.json
+==================================================
+ Turns |    Count | Percentage
+--------------------------------
+     1 |      640 |     12.29%
+     2 |     2663 |     51.12%
+     3 |     1440 |     27.64%
+     4 |      133 |      2.55%
+     5 |      282 |      5.41%
+     6 |       46 |      0.88%
+     7 |        4 |      0.08%
+     8 |        1 |      0.02%
+--------------------------------
+ Total |     5209 |    100.00%
+"""
+
 import json
 import os
 from collections import Counter
