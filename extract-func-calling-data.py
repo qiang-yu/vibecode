@@ -21,6 +21,12 @@ def count_human_turns(item):
     return sum(1 for msg in conversations if msg.get("from") == "human")
 
 
+def has_valid_tools(item):
+    """Return True if the item has a non-null tools field."""
+    tools = item.get("tools")
+    return tools is not None
+
+
 def main():
     # Load the source dataset
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
@@ -32,13 +38,17 @@ def main():
         turns = count_human_turns(item)
         groups[turns].append(item)
 
-    # Randomly pick one sample from each turn-count group
+    # Randomly pick one sample with non-null tools from each turn-count group
     random.seed(42)
     extracted = []
     for turns in sorted(groups):
-        sample = random.choice(groups[turns])
+        valid_items = [item for item in groups[turns] if has_valid_tools(item)]
+        if not valid_items:
+            print(f"Turns {turns}: no items with non-null tools, skipped")
+            continue
+        sample = random.choice(valid_items)
         extracted.append(sample)
-        print(f"Turns {turns}: picked 1 sample from {len(groups[turns])} items")
+        print(f"Turns {turns}: picked 1 sample from {len(valid_items)} valid items")
 
     # Write pretty-printed JSON array to output file
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
