@@ -1,0 +1,49 @@
+
+# 统计 func-calling 中，不同轮次对话分别有多少
+# 比如， 1轮对话 3000个，2轮对话 1000个，3轮对话500个，...
+func-calling-turn-count.py
+
+
+# func-calling 目录下的文件是 ShareGPT 格式，里面的对话自带 system 标签（里面是对 tools 的定义）
+# 我调用大模型的时候，会自动用 apply_chat_template 让它生成 tools 定义
+# 所以不需要 system 标签了，这里批量删除  system 内容
+func-calling-remove-system.py
+
+
+# ShareGPT 格式的文件，里面自带了 gpt 生成结果，但是这个结果没有 <think> 标签
+# 我需要用 qwen 重新生成带 <think> 的结果 
+infer-func-calling-data-with-think-8b.py
+infer-func-calling-data-with-think-32b.py
+
+
+# 用 qwen 重新生成的带 <think> 的内容，里面会推理使用的 tool call
+# 原始 ShareGPT 里面自带 tool_response，有一种情况是  tool call 要调用的 func 和 tool_response 的 func 不一致
+# 这两个文件是，检测不一致，清除不一致的内容
+check-inference-tool_call-consistent.py
+check-inference-tool_call-consistent-clean.py
+
+
+# 针对大模型推理之后的 <tool_call> 标签，生成对应的 <tool_call_security> 安全内容
+# 支持 多显卡并行生成，速度比较快 
+qwen_reanson_tool_call_security.py
+
+
+---- 其它工具 ----
+
+# func-calling 文件中是多轮对话，比如 1轮，2轮，3轮...6轮
+# 从每种轮次，随机抽取一个数据，方便我自己查看数据长什么样，因为原文件太长了不好找对应的数据
+extract-func-calling-data.py
+
+
+# 加载 Lora 微调之后的模型
+#  Prompt 一个工具调用，然后看 模型输出的结果是什么，用于测试看模型输出的 RAW 消息
+test_qwen_ft_tool.py
+
+
+# 把 ShareGPT 格式的内容转为 Qwen 的 RAW message text，方便知道大模型 text 具体长什么样
+test-sharegpt-json-to-qwen-message.py
+
+
+# 查看 Qwen 工具调用输出的消息是什么样 
+test_qwen_tool.py
+
