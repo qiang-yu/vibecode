@@ -1,46 +1,31 @@
 ###
-# This script loads the Qwen3-8B model with thinking mode enabled
-# and re-infers function calling training data to include thinking
-# (reasoning) content. It processes ShareGPT-format conversations,
-# replacing all assistant responses with model-generated outputs
-# that include think tags.
+# This script loads multiple instances of the Qwen3-32B model across several GPUs
+# and processes ShareGPT-format conversations from a JSON file in parallel.
+# For each data entry, it re-infers assistant responses with thinking (reasoning)
+# content enabled. A dedicated writer process serializes results to a JSON Lines
+# temp file, which is finally converted into a JSON array output.
 ###
 
 import json
+import multiprocessing as mp
 import os
 import sys
 from pathlib import Path
 
-# Use GPU 7 only. Must be set before importing torch.
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-32B"
+INPUT_FILE = "func-calling/glaive-function-calling-5k-injected.json"
+OUTPUT_FILE = "func-calling/glaive-function-calling-5k-injected-inference-32b.json"
+TEMP_FILE = "func-calling/glaive-function-calling-5k-injected-inference-32b.jsonl"
 
-
-def load_model(model_path: str):
-    """Load the Qwen3-8B model and tokenizer."""
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    model.eval()
-
-    # Ensure pad_token is set
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    return model, tokenizer
+# GPU list used for parallel processing. Each GPU loads its own model instance.
+GPU_IDS = [4, 5, 6, 7]
 
 
 def generate_response(messages, tools, model, tokenizer):
     """Generate a response from the model using chat template."""
+    import torch
+
     kwargs = {
         "tokenize": False,
         "add_generation_prompt": True,
@@ -152,37 +137,146 @@ def process_single_data(data: dict, model, tokenizer) -> dict:
     return data
 
 
+def worker(gpu_id, task_queue, result_queue):
+    """
+    Worker process that binds to a single GPU, loads its own model instance,
+    consumes tasks from the task queue, and pushes results to the result queue.
+    """
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    print(f"[GPU {gpu_id}] Loading model and tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_PATH,
+        trust_remote_code=True,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model.eval()
+
+    # Ensure pad_token is set
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    print(f"[GPU {gpu_id}] Model loaded successfully.")
+
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+        idx, total, data = task
+        try:
+            processed_data = process_single_data(data, model, tokenizer)
+            result_queue.put((gpu_id, idx, processed_data, total))
+        except Exception as e:
+            print(f"[GPU {gpu_id}] Error processing entry {idx}: {e}")
+            # Return original data to prevent writer deadlock
+            result_queue.put((gpu_id, idx, data, total))
+
+
+def writer_process(result_queue, total_count, temp_file, initial_count):
+    """
+    Dedicated writer process that serializes processed results to the temp file.
+    Running in a single process guarantees safe, non-corrupting append writes.
+    All worker processes send results to this single writer via result_queue,
+    so there is no concurrent file access — no extra file lock is needed.
+    """
+    processed = initial_count
+    with open(temp_file, "a", encoding="utf-8") as f:
+        while processed < total_count:
+            msg = result_queue.get()
+            if msg is None:
+                break
+            gpu_id, idx, processed_data, total = msg
+            f.write(json.dumps(processed_data, ensure_ascii=False) + "\n")
+            f.flush()
+            processed += 1
+            print(f"[GPU {gpu_id}]{idx + 1}/{total}")
+
+
+def convert_jsonl_to_json_array(jsonl_path, output_path):
+    """Read a JSON Lines file and write it as a JSON array."""
+    results = []
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                results.append(json.loads(line))
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+
 def main():
-    input_path = Path("func-calling/glaive-function-calling-5k-no-system.json")
-    output_path = Path("func-calling/glaive-function-calling-5k-inference-32b.json")
-    model_path = "/home/qiangyu/Models/Qwen/Qwen3-32B"
+    input_path = Path(INPUT_FILE)
 
     if not input_path.exists():
         print(f"Error: Input file not found: {input_path}", file=sys.stderr)
         sys.exit(1)
 
-    print("Loading model...")
-    model, tokenizer = load_model(model_path)
-    print("Model loaded.")
-
     print(f"Loading data from {input_path}...")
     with open(input_path, "r", encoding="utf-8") as f:
         dataset = json.load(f)
-    print(f"Loaded {len(dataset)} entries.")
+    total = len(dataset)
+    print(f"Loaded {total} entries.")
 
-    print(f"Writing results to {output_path} (append mode)...")
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("[\n")
-        for idx, data in enumerate(dataset):
-            print(f"Processing entry {idx + 1}/{len(dataset)}...")
-            processed = process_single_data(data, model, tokenizer)
-            if idx > 0:
-                f.write(",\n")
-            json.dump(processed, f, ensure_ascii=False, indent=2)
-            f.flush()
-        f.write("\n]\n")
+    # Check progress from temp file for resume support
+    processed_count = 0
+    if os.path.exists(TEMP_FILE):
+        with open(TEMP_FILE, "r", encoding="utf-8") as f:
+            for _ in f:
+                processed_count += 1
+        print(f"Found temp file, already processed: {processed_count}")
 
-    print("Done!")
+    if processed_count >= total:
+        print("All records already processed, converting to final output...")
+        convert_jsonl_to_json_array(TEMP_FILE, OUTPUT_FILE)
+        print(f"Done. Output written to: {OUTPUT_FILE}")
+        return
+
+    # Limit queue size to avoid excessive memory usage with large inputs
+    task_queue = mp.Queue(maxsize=len(GPU_IDS) * 2)
+    result_queue = mp.Queue()
+
+    # Start one worker process per GPU
+    workers = []
+    for gpu_id in GPU_IDS:
+        p = mp.Process(target=worker, args=(gpu_id, task_queue, result_queue))
+        p.start()
+        workers.append(p)
+
+    # Start a single writer process to serialize results to disk safely
+    writer_p = mp.Process(
+        target=writer_process,
+        args=(result_queue, total, TEMP_FILE, processed_count)
+    )
+    writer_p.start()
+
+    # Dispatch remaining tasks to workers
+    for idx in range(processed_count, total):
+        task_queue.put((idx, total, dataset[idx]))
+
+    # Signal workers to exit after they finish current tasks
+    for _ in GPU_IDS:
+        task_queue.put(None)
+
+    # Wait for all workers to finish
+    for p in workers:
+        p.join()
+
+    # Signal writer to exit and wait for it
+    result_queue.put(None)
+    writer_p.join()
+
+    # Convert temp file to final JSON array
+    print(f"\nConverting temp file to final JSON array: {OUTPUT_FILE}")
+    convert_jsonl_to_json_array(TEMP_FILE, OUTPUT_FILE)
+    print(f"Done. Total processed: {total}")
 
 
 if __name__ == "__main__":
