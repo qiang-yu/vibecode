@@ -13,7 +13,7 @@ from peft import PeftModel
 os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 BASE_MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-8B"
-LORA_PATH       = "/home/qiangyu/Models/FineTune/Result/train_20260603"
+LORA_PATH       = "/home/qiangyu/Models/FineTune/Result/train_20260608"
 
 ################################################################################
 # load
