@@ -47,3 +47,50 @@ test-sharegpt-json-to-qwen-message.py
 # 查看 Qwen 工具调用输出的消息是什么样 
 test_qwen_tool.py
 
+
+---- 数据处理逻辑 ----
+
+---- 没有 tool 注入的数据 ---
+
+1. 原始数据文件，Hermes 格式的 ShareGPT 文件
+    glaive-function-calling-5k.json
+
+2. 去除自带的 System 内容 (让 tools 列表自动生成)
+    glaive-function-calling-5k-no-system.json
+
+3. 重新推理生成 from:gpt 的内容，要带 <think>标签
+    glaive-function-calling-5k-inference-32b.json
+
+4. 去除推理错误的内容，推理的 tool_call 和之前的 tool_response 函数对应不上，推理错了
+    glaive-function-calling-5k-inference-32b-clean.json
+    
+5. 生成 <tool_call_security> 标签
+    glaive-function-calling-5k-inference-32b-clean-tool-call-security.json
+    
+---- 注入了 tool 的数据 ---    
+
+6. 在 tool_response 中，随机注入另外一个 tool
+    原始：glaive-function-calling-5k-no-system.json  (随机挑选另外一个 tool 注入到当前一个 ShareGPT 数据中)
+    结果：glaive-function-calling-5k-injected.json
+    
+7. 注入的文件 重新推理生成 from:gpt 的内容，要带 <think>标签
+    glaive-function-calling-5k-injected-inference-32b.json 
+
+8. 清理注入无效数据
+    在 tool_response 中注入另外一个 tool，可能推理的时候没推理出来这个注入的 tool_call，清理掉注入无效的数据
+    
+    
+9. 生成 <tool_call_security> 标签
+
+
+
+
+
+
+
+
+
+
+
+
+

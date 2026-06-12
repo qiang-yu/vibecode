@@ -19,7 +19,7 @@ OUTPUT_FILE = "func-calling/glaive-function-calling-5k-injected-inference-32b.js
 TEMP_FILE = "func-calling/glaive-function-calling-5k-injected-inference-32b.jsonl"
 
 # GPU list used for parallel processing. Each GPU loads its own model instance.
-GPU_IDS = [4, 5, 6, 7]
+GPU_IDS = [0, 1, 2, 3, 4, 5, 6, 7]
 
 
 def generate_response(messages, tools, model, tokenizer):
@@ -54,11 +54,6 @@ def generate_response(messages, tools, model, tokenizer):
     return response
 
 
-def has_tool_call(response: str) -> bool:
-    """Check if the response contains a tool call."""
-    return "<tool_call>" in response
-
-
 def process_single_data(data: dict, model, tokenizer) -> dict:
     """Process a single ShareGPT data entry."""
     conversations = data["conversations"]
@@ -79,59 +74,45 @@ def process_single_data(data: dict, model, tokenizer) -> dict:
 
         elif role == "human":
             messages.append({"role": "user", "content": value})
+            i += 1
 
             # Generate response for this human message
             response = generate_response(messages, tools, model, tokenizer)
 
-            # Replace the following gpt message
-            if i + 1 < len(conversations) and conversations[i + 1]["from"] == "gpt":
-                conversations[i + 1]["value"] = response
+            # Replace the following gpt message or insert a new one
+            if i < len(conversations) and conversations[i]["from"] == "gpt":
+                conversations[i]["value"] = response
                 messages.append({"role": "assistant", "content": response})
-
-                # Check if tool call was made
-                if has_tool_call(response):
-                    i += 2  # Move past human and gpt
-
-                    # Handle tool response and final answer
-                    if i < len(conversations) and conversations[i]["from"] == "tool":
-                        tool_value = conversations[i]["value"]
-                        messages.append({"role": "tool", "content": tool_value})
-
-                        # Generate final answer after tool
-                        final_response = generate_response(
-                            messages, tools, model, tokenizer
-                        )
-
-                        if (
-                            i + 1 < len(conversations)
-                            and conversations[i + 1]["from"] == "gpt"
-                        ):
-                            conversations[i + 1]["value"] = final_response
-                            messages.append(
-                                {"role": "assistant", "content": final_response}
-                            )
-                            i += 2  # Skip tool and final gpt
-                        else:
-                            # No gpt after tool, just skip tool
-                            i += 1
-                    else:
-                        # Expected tool but not found
-                        i += 1
-                else:
-                    i += 2  # Skip human and gpt
+                i += 1
             else:
-                # No gpt after human, insert a new gpt entry
-                conversations.insert(i + 1, {"from": "gpt", "value": response})
+                conversations.insert(i, {"from": "gpt", "value": response})
                 messages.append({"role": "assistant", "content": response})
-                i += 2  # Move past human and the newly inserted gpt
+                i += 1
 
         elif role == "tool":
-            # Unhandled tool (shouldn't normally reach here)
+            # Add the tool result to history and generate the assistant reply
+            # that should follow this tool. If no gpt follows, insert one.
             messages.append({"role": "tool", "content": value})
             i += 1
 
+            response = generate_response(messages, tools, model, tokenizer)
+
+            if i < len(conversations) and conversations[i]["from"] == "gpt":
+                conversations[i]["value"] = response
+                messages.append({"role": "assistant", "content": response})
+                i += 1
+            else:
+                conversations.insert(i, {"from": "gpt", "value": response})
+                messages.append({"role": "assistant", "content": response})
+                i += 1
+
         elif role == "gpt":
-            # Unhandled gpt (shouldn't normally reach here)
+            # Directly encountered gpt (shouldn't normally happen in well-formed data).
+            # Regenerate using current history.
+            messages.append({"role": "assistant", "content": value})
+            response = generate_response(messages, tools, model, tokenizer)
+            conversations[i]["value"] = response
+            messages[-1] = {"role": "assistant", "content": response}
             i += 1
 
     return data

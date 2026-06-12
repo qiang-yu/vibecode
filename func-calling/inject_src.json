@@ -1,0 +1,182 @@
+[
+    {
+        "id": "55ac2e75-716b-4626-acec-38b69ec47349",
+        "conversations": [
+            {
+                "from": "human",
+                "value": "Can you tell me about the movie with the ID 'tt0111161'?"
+            },
+            {
+                "from": "gpt",
+                "value": "<tool_call>\n{\"name\": \"get_movie_details\", \"arguments\": {\"movie_id\": \"tt0111161\"}}\n</tool_call>"
+            },
+            {
+                "from": "tool",
+                "value": "<tool_response>\n{\"name\": \"get_movie_details\", \"content\": {\"title\": \"The Shawshank Redemption\", \"year\": 1994, \"genre\": [\"Drama\"], \"director\": \"Frank Darabont\", \"actors\": [\"Tim Robbins\", \"Morgan Freeman\", \"Bob Gunton\"], \"plot\": \"Two imprisoned men bond over a number of years, finding solace and eventual redemption through acts of common decency.\"}}\n</tool_response>"
+            },
+            {
+                "from": "gpt",
+                "value": "The movie with the ID 'tt0111161' is \"The Shawshank Redemption\". It was released in 1994 and falls under the Drama genre. The movie was directed by Frank Darabont and stars Tim Robbins, Morgan Freeman, and Bob Gunton. The plot revolves around two imprisoned men who bond over a number of years, finding solace and eventual redemption through acts of common decency."
+            }
+        ],
+        "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_movie_details\", \"description\": \"Get details of a movie\", \"parameters\": {\"type\": \"object\", \"properties\": {\"movie_id\": {\"type\": \"string\", \"description\": \"The ID of the movie\"}}, \"required\": [\"movie_id\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"create_todo\", \"description\": \"Create a new todo item\", \"parameters\": {\"type\": \"object\", \"properties\": {\"task\": {\"type\": \"string\", \"description\": \"The task description\"}, \"due_date\": {\"type\": \"string\", \"format\": \"date\", \"description\": \"The due date of the task\"}, \"priority\": {\"type\": \"string\", \"enum\": [\"low\", \"medium\", \"high\"], \"description\": \"The priority level of the task\"}}, \"required\": [\"task\"]}}}]",
+        "category": "Movie",
+        "subcategory": "Get Movie Details",
+        "task": "Movie Information Requests",
+        "source": "Glaive"
+    },
+    {
+        "id": "c617f1ce-cecb-4dd7-8c04-fab14ba968fd",
+        "conversations": [
+            {
+                "from": "human",
+                "value": "Can you get me the latest sports news from the United States?"
+            },
+            {
+                "from": "gpt",
+                "value": "<tool_call>\n{\"name\": \"get_news\", \"arguments\": {\"category\": \"sports\", \"country\": \"United States\"}}\n</tool_call>"
+            },
+            {
+                "from": "tool",
+                "value": "<tool_response>\n{\"name\": \"get_news\", \"content\": {\"status\": \"success\", \"data\": {\"headline\": \"NBA Finals: Lakers vs. Heat Game 5\", \"description\": \"The Lakers are one win away from their 17th championship. The Heat, however, are not backing down.\", \"source\": \"ESPN\", \"publishedAt\": \"2020-10-09T12:00:00Z\"}}}\n</tool_response>"
+            },
+            {
+                "from": "gpt",
+                "value": "The latest sports news from the United States is about the NBA Finals. The game is between Lakers and Heat, with Lakers being one win away from their 17th championship. However, the Heat are not backing down. This news is sourced from ESPN and was published at 2020-10-09 12:00:00."
+            },
+            {
+                "from": "human",
+                "value": "That's interesting. Can you get me the latest technology news from Japan?"
+            },
+            {
+                "from": "gpt",
+                "value": "<tool_call>\n{\"name\": \"get_news\", \"arguments\": {\"category\": \"technology\", \"country\": \"Japan\"}}\n</tool_call>"
+            },
+            {
+                "from": "tool",
+                "value": "<tool_response>\n{\"name\": \"get_news\", \"content\": {\"status\": \"success\", \"data\": {\"headline\": \"Sony Unveils PlayStation 5\", \"description\": \"Sony has unveiled the PlayStation 5, which will be released in November. The console features a custom eight-core AMD Zen 2 CPU and a custom GPU based on AMD's RDNA 2 architecture.\", \"source\": \"TechCrunch\", \"publishedAt\": \"2020-10-09T09:00:00Z\"}}}\n</tool_response>"
+            },
+            {
+                "from": "gpt",
+                "value": "The latest technology news from Japan is about Sony unveiling the PlayStation 5. The console, which will be released in November, features a custom eight-core AMD Zen 2 CPU and a custom GPU based on AMD's RDNA 2 architecture. This news is sourced from TechCrunch and was published at 2020-10-09 09:00:00."
+            }
+        ],
+        "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"get_news\", \"description\": \"Get the latest news\", \"parameters\": {\"type\": \"object\", \"properties\": {\"category\": {\"type\": \"string\", \"description\": \"The category of news\"}, \"country\": {\"type\": \"string\", \"description\": \"The country for news source\"}}, \"required\": [\"category\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"calculate_age_difference\", \"description\": \"Calculate age difference between two dates\", \"parameters\": {\"type\": \"object\", \"properties\": {\"date1\": {\"type\": \"string\", \"format\": \"date\", \"description\": \"The first date\"}, \"date2\": {\"type\": \"string\", \"format\": \"date\", \"description\": \"The second date\"}}, \"required\": [\"date1\", \"date2\"]}}}]",
+        "category": "Stocks and Orders",
+        "subcategory": "Get News",
+        "task": "Latest News Requests",
+        "source": "Glaive"
+    },
+    {
+        "id": "ac2bbecc-52ba-4bf8-aa80-127ced080c37",
+        "conversations": [
+            {
+                "from": "human",
+                "value": "I have 1000 dollars. How much will it be in euros?"
+            },
+            {
+                "from": "gpt",
+                "value": "<tool_call>\n{\"name\": \"convert_currency\", \"arguments\": {\"amount\": 1000, \"from_currency\": \"USD\", \"to_currency\": \"EUR\"}}\n</tool_call>"
+            },
+            {
+                "from": "tool",
+                "value": "<tool_response>\n{\"name\": \"convert_currency\", \"content\": {\"converted_amount\": 850.0, \"from_currency\": \"USD\", \"to_currency\": \"EUR\"}}\n</tool_response>"
+            },
+            {
+                "from": "gpt",
+                "value": "Your 1000 USD will be approximately 850 EUR."
+            },
+            {
+                "from": "human",
+                "value": "What about in Japanese yen?"
+            },
+            {
+                "from": "gpt",
+                "value": "<tool_call>\n{\"name\": \"convert_currency\", \"arguments\": {\"amount\": 1000, \"from_currency\": \"USD\", \"to_currency\": \"JPY\"}}\n</tool_call>"
+            },
+            {
+                "from": "tool",
+                "value": "<tool_response>\n{\"name\": \"convert_currency\", \"content\": {\"converted_amount\": 110000.0, \"from_currency\": \"USD\", \"to_currency\": \"JPY\"}}\n</tool_response>"
+            },
+            {
+                "from": "gpt",
+                "value": "Your 1000 USD will be approximately 110000 JPY."
+            },
+            {
+                "from": "human",
+                "value": "That's a lot of yen! Thanks for the help."
+            },
+            {
+                "from": "gpt",
+                "value": "You're welcome! If you have any other questions, feel free to ask."
+            }
+        ],
+        "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"convert_currency\", \"description\": \"Convert an amount from one currency to another\", \"parameters\": {\"type\": \"object\", \"properties\": {\"amount\": {\"type\": \"number\", \"description\": \"The amount to be converted\"}, \"from_currency\": {\"type\": \"string\", \"description\": \"The currency to convert from\"}, \"to_currency\": {\"type\": \"string\", \"description\": \"The currency to convert to\"}}, \"required\": [\"amount\", \"from_currency\", \"to_currency\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"analyze_sentiment\", \"description\": \"Analyze the sentiment of a text\", \"parameters\": {\"type\": \"object\", \"properties\": {\"text\": {\"type\": \"string\", \"description\": \"The text to analyze\"}}, \"required\": [\"text\"]}}}]",
+        "category": "Flight Services",
+        "subcategory": "Convert Currency",
+        "task": "Currency Conversion Requests",
+        "source": "Glaive"
+    },
+    {
+        "id": "357b94dd-d234-4463-b280-9c96458722fd",
+        "conversations": [
+            {
+                "from": "system",
+                "value": "You are a function calling AI model. You are provided with function signatures within <tools></tools> XML tags.You may call one or more functions to assist with the user query. Don't make assumptions about what values to plug into functions.Here are the available tools:<tools>\n[{\"type\": \"function\", \"function\": {\"name\": \"search_movies\", \"description\": \"Search for movies based on title or genre\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"The search query\"}, \"genre\": {\"type\": \"string\", \"description\": \"The genre of the movie\"}}, \"required\": [\"query\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"calculate_discount\", \"description\": \"Calculate the discounted price\", \"parameters\": {\"type\": \"object\", \"properties\": {\"original_price\": {\"type\": \"number\", \"description\": \"The original price of the item\"}, \"discount_percentage\": {\"type\": \"number\", \"description\": \"The percentage discount\"}}, \"required\": [\"original_price\", \"discount_percentage\"]}}}]\n</tools>Use the following pydantic model json schema for each tool call you will make: {'title': 'FunctionCall', 'type': 'object', 'properties': {'arguments': {'title': 'Arguments', 'type': 'object'}, 'name': {'title': 'Name', 'type': 'string'}}, 'required': ['arguments', 'name']}For each function call return a json object with function name and arguments within <tool_call></tool_call> XML tags as follows:\n<tool_call>\n{tool_call}\n</tool_call>"
+            },
+            {
+                "from": "human",
+                "value": "I want to watch a movie but I can't decide. Can you suggest me some?"
+            },
+            {
+                "from": "gpt",
+                "value": "Of course, I can help with that. Could you tell me your preferred genre or any specific movie title you have in mind?"
+            },
+            {
+                "from": "human",
+                "value": "I like action movies."
+            },
+            {
+                "from": "gpt",
+                "value": "<tool_call>\n{\"name\": \"search_movies\", \"arguments\": {\"query\": \"action\"}}\n</tool_call>"
+            },
+            {
+                "from": "tool",
+                "value": "<tool_response>\n{\"name\": \"search_movies\", \"content\": {\"movies\": [\"Die Hard\", \"Mad Max: Fury Road\", \"The Dark Knight\", \"Inception\", \"John Wick\"]}}\n</tool_response>"
+            },
+            {
+                "from": "gpt",
+                "value": "Here are some action movies you might enjoy: \"Die Hard\", \"Mad Max: Fury Road\", \"The Dark Knight\", \"Inception\", and \"John Wick\"."
+            },
+            {
+                "from": "human",
+                "value": "I have already watched \"Die Hard\" and \"The Dark Knight\". Any other suggestions?"
+            },
+            {
+                "from": "gpt",
+                "value": "<tool_call>\n{\"name\": \"search_movies\", \"arguments\": {\"query\": \"action\"}}\n</tool_call>"
+            },
+            {
+                "from": "tool",
+                "value": "<tool_response>\n{\"name\": \"search_movies\", \"content\": {\"movies\": [\"Terminator 2: Judgment Day\", \"The Matrix\", \"Gladiator\", \"Kill Bill: Volume 1\", \"The Bourne Identity\"]}}\n</tool_response>"
+            },
+            {
+                "from": "gpt",
+                "value": "Sure, here are some more action movies: \"Terminator 2: Judgment Day\", \"The Matrix\", \"Gladiator\", \"Kill Bill: Volume 1\", and \"The Bourne Identity\"."
+            },
+            {
+                "from": "human",
+                "value": "Great! I will watch \"The Matrix\". Thanks for the suggestions."
+            },
+            {
+                "from": "gpt",
+                "value": "You're welcome! Enjoy your movie."
+            }
+        ],
+        "tools": "[{\"type\": \"function\", \"function\": {\"name\": \"search_movies\", \"description\": \"Search for movies based on title or genre\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"The search query\"}, \"genre\": {\"type\": \"string\", \"description\": \"The genre of the movie\"}}, \"required\": [\"query\"]}}}, {\"type\": \"function\", \"function\": {\"name\": \"calculate_discount\", \"description\": \"Calculate the discounted price\", \"parameters\": {\"type\": \"object\", \"properties\": {\"original_price\": {\"type\": \"number\", \"description\": \"The original price of the item\"}, \"discount_percentage\": {\"type\": \"number\", \"description\": \"The percentage discount\"}}, \"required\": [\"original_price\", \"discount_percentage\"]}}}]",
+        "category": "Movie",
+        "subcategory": "Search Movies",
+        "task": "Action Movie Recommendations",
+        "source": "Glaive"
+    }
+]
