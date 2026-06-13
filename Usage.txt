@@ -27,6 +27,9 @@ check-inference-tool_call-consistent-clean.py
 # 支持 多显卡并行生成，速度比较快 
 qwen_reanson_tool_call_security.py
 
+# 在 tool_response 中注入另外一个 tool，可能推理的时候没推理出来这个注入的 tool_call，清理掉注入无效的数据
+clean-inject-item-with-no-reason-tool_call.py
+
 
 ---- 其它工具 ----
 
