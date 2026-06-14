@@ -6,9 +6,9 @@ Inject additional tools into a ShareGPT-format function calling dataset.
 Logic:
 1. Stream through the input JSON Array item by item.
 2. If an item has no "tools" or its tools list is empty, write it unchanged.
-3. If an item has non-empty tools, randomly pick another item that also has
-   non-empty tools (cannot be the same item), merge its tools into the current
-   item's tools, and deduplicate by function name.
+3. If an item has non-empty tools, randomly pick 1 to 5 other items that also
+   have non-empty tools (cannot include the same item), merge their tools into
+   the current item's tools, and deduplicate by function name.
 4. Write the processed item to the output JSON Array.
 
 Two-pass streaming is used so the large input file is never fully loaded.
@@ -136,10 +136,14 @@ def process_and_write(input_path: Path, output_path: Path, tools_by_index: dict)
 
         for idx, item in enumerate(ijson.items(fin, "item")):
             if idx in indices_with_tools and total_tools >= 2:
-                # Randomly pick another item that has tools (cannot be itself)
+                # Randomly pick 1 to 5 other items that have tools (cannot include itself)
                 candidates = [i for i in indices_with_tools if i != idx]
-                rand_idx = random.choice(candidates)
-                extra_tools = tools_by_index[rand_idx]
+                max_samples = min(5, len(candidates))
+                sample_count = random.randint(1, max_samples)
+                selected_indices = random.sample(candidates, sample_count)
+                extra_tools = []
+                for rand_idx in selected_indices:
+                    extra_tools.extend(tools_by_index[rand_idx])
                 merged = merge_tools(parse_tools(item), extra_tools)
                 preserve_tools_format(item, merged)
 
