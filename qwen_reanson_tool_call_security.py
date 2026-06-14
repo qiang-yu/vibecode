@@ -45,6 +45,15 @@ def extract_security_blocks(text):
     return matches
 
 
+def clean_security_block(block):
+    """Strip any trailing characters after the closing </tool_call_security> tag."""
+    end_tag = "</tool_call_security>"
+    idx = block.find(end_tag)
+    if idx == -1:
+        return block
+    return block[:idx + len(end_tag)]
+
+
 def insert_security_blocks(content, security_blocks):
     """Insert <tool_call_security> blocks after </think> or before <tool_call>."""
     think_end = content.find("</think>")
@@ -53,7 +62,8 @@ def insert_security_blocks(content, security_blocks):
     if think_end == -1 and tool_call_start == -1:
         return content
 
-    security_text = "".join(security_blocks)
+    cleaned_blocks = [clean_security_block(block) for block in security_blocks]
+    security_text = "".join(cleaned_blocks)
 
     if think_end != -1:
         pos = think_end + len("</think>")
