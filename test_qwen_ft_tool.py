@@ -23,7 +23,7 @@ from peft import PeftModel
 os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 BASE_MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-8B"
-LORA_PATH       = "/home/qiangyu/Models/FineTune/Qwen/train_20260611/checkpoint-400"
+LORA_PATH       = "/home/qiangyu/Models/FineTune/Qwen/train_20260613"
 
 ################################################################################
 # load model and tokenizer
@@ -100,6 +100,25 @@ tools = [
                 },
                 "required": [
                     "words"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_task",
+            "description": "Search for a task by its name",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the task to search for"
+                    }
+                },
+                "required": [
+                    "name"
                 ]
             }
         }
