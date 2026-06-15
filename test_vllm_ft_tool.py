@@ -108,6 +108,814 @@ tools = [
                 ]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email",
+            "description": "Send an email to a recipient",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "description": "Recipient email address"
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Email subject"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Email body content"
+                    }
+                },
+                "required": [
+                    "to",
+                    "subject",
+                    "body"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City or address"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "description": "Temperature unit (celsius or fahrenheit)"
+                    }
+                },
+                "required": [
+                    "location"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_meeting",
+            "description": "Schedule a meeting with participants",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Meeting title"
+                    },
+                    "time": {
+                        "type": "string",
+                        "description": "Meeting time in ISO format"
+                    },
+                    "attendees": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "List of attendee emails"
+                    }
+                },
+                "required": [
+                    "title",
+                    "time",
+                    "attendees"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "translate_text",
+            "description": "Translate text into a target language",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Text to translate"
+                    },
+                    "target_language": {
+                        "type": "string",
+                        "description": "Target language code"
+                    }
+                },
+                "required": [
+                    "text",
+                    "target_language"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate_expression",
+            "description": "Evaluate a mathematical expression",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "Mathematical expression to evaluate"
+                    }
+                },
+                "required": [
+                    "expression"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_reminder",
+            "description": "Set a reminder for a specific time",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Reminder message"
+                    },
+                    "time": {
+                        "type": "string",
+                        "description": "Reminder time in ISO format"
+                    }
+                },
+                "required": [
+                    "message",
+                    "time"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_database",
+            "description": "Execute a read-only database query",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": "SQL SELECT statement"
+                    }
+                },
+                "required": [
+                    "sql"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_calendar_event",
+            "description": "Create a new calendar event",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Event title"
+                    },
+                    "start_time": {
+                        "type": "string",
+                        "description": "Start time in ISO format"
+                    },
+                    "end_time": {
+                        "type": "string",
+                        "description": "End time in ISO format"
+                    }
+                },
+                "required": [
+                    "title",
+                    "start_time",
+                    "end_time"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_sms",
+            "description": "Send an SMS message to a phone number",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone_number": {
+                        "type": "string",
+                        "description": "Recipient phone number"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "SMS content"
+                    }
+                },
+                "required": [
+                    "phone_number",
+                    "message"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_stock_price",
+            "description": "Get the latest stock price for a ticker",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticker": {
+                        "type": "string",
+                        "description": "Stock ticker symbol"
+                    }
+                },
+                "required": [
+                    "ticker"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "book_flight",
+            "description": "Book a flight ticket",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {
+                        "type": "string",
+                        "description": "Origin airport code"
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "Destination airport code"
+                    },
+                    "date": {
+                        "type": "string",
+                        "description": "Flight date in ISO format"
+                    }
+                },
+                "required": [
+                    "origin",
+                    "destination",
+                    "date"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reserve_hotel",
+            "description": "Reserve a hotel room",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hotel_name": {
+                        "type": "string",
+                        "description": "Hotel name"
+                    },
+                    "check_in": {
+                        "type": "string",
+                        "description": "Check-in date in ISO format"
+                    },
+                    "check_out": {
+                        "type": "string",
+                        "description": "Check-out date in ISO format"
+                    }
+                },
+                "required": [
+                    "hotel_name",
+                    "check_in",
+                    "check_out"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "order_food",
+            "description": "Order food from a restaurant",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restaurant": {
+                        "type": "string",
+                        "description": "Restaurant name"
+                    },
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "List of food items"
+                    },
+                    "address": {
+                        "type": "string",
+                        "description": "Delivery address"
+                    }
+                },
+                "required": [
+                    "restaurant",
+                    "items",
+                    "address"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "play_music",
+            "description": "Play a song or playlist",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Song name, artist, or playlist"
+                    }
+                },
+                "required": [
+                    "query"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "take_note",
+            "description": "Save a text note",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Note title"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Note content"
+                    }
+                },
+                "required": [
+                    "title",
+                    "content"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "summarize_document",
+            "description": "Summarize a long document",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document": {
+                        "type": "string",
+                        "description": "Document text to summarize"
+                    },
+                    "max_length": {
+                        "type": "integer",
+                        "description": "Maximum summary length in words"
+                    }
+                },
+                "required": [
+                    "document"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "extract_keywords",
+            "description": "Extract keywords from a text",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Input text"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of keywords to extract"
+                    }
+                },
+                "required": [
+                    "text"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "convert_currency",
+            "description": "Convert an amount between currencies",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amount": {
+                        "type": "number",
+                        "description": "Amount to convert"
+                    },
+                    "from_currency": {
+                        "type": "string",
+                        "description": "Source currency code"
+                    },
+                    "to_currency": {
+                        "type": "string",
+                        "description": "Target currency code"
+                    }
+                },
+                "required": [
+                    "amount",
+                    "from_currency",
+                    "to_currency"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_directions",
+            "description": "Get directions between two locations",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {
+                        "type": "string",
+                        "description": "Starting location"
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "Destination location"
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "Transportation mode"
+                    }
+                },
+                "required": [
+                    "origin",
+                    "destination"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_restaurant",
+            "description": "Find restaurants near a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "Location or address"
+                    },
+                    "cuisine": {
+                        "type": "string",
+                        "description": "Preferred cuisine type"
+                    }
+                },
+                "required": [
+                    "location"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "make_reservation",
+            "description": "Make a restaurant reservation",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restaurant": {
+                        "type": "string",
+                        "description": "Restaurant name"
+                    },
+                    "time": {
+                        "type": "string",
+                        "description": "Reservation time in ISO format"
+                    },
+                    "party_size": {
+                        "type": "integer",
+                        "description": "Number of people"
+                    }
+                },
+                "required": [
+                    "restaurant",
+                    "time",
+                    "party_size"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_password",
+            "description": "Generate a random password",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "length": {
+                        "type": "integer",
+                        "description": "Password length"
+                    },
+                    "include_symbols": {
+                        "type": "boolean",
+                        "description": "Include special symbols"
+                    }
+                },
+                "required": [
+                    "length"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scan_document",
+            "description": "Scan a document and return OCR text",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the document image"
+                    }
+                },
+                "required": [
+                    "file_path"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_invoice",
+            "description": "Create an invoice for a customer",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer": {
+                        "type": "string",
+                        "description": "Customer name"
+                    },
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object"
+                        },
+                        "description": "List of invoice line items"
+                    },
+                    "due_date": {
+                        "type": "string",
+                        "description": "Payment due date in ISO format"
+                    }
+                },
+                "required": [
+                    "customer",
+                    "items"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "track_package",
+            "description": "Track a shipping package",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tracking_number": {
+                        "type": "string",
+                        "description": "Package tracking number"
+                    }
+                },
+                "required": [
+                    "tracking_number"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_account_balance",
+            "description": "Check the balance of a bank account",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "account_id": {
+                        "type": "string",
+                        "description": "Account identifier"
+                    }
+                },
+                "required": [
+                    "account_id"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transfer_money",
+            "description": "Transfer money between accounts",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_account": {
+                        "type": "string",
+                        "description": "Source account identifier"
+                    },
+                    "to_account": {
+                        "type": "string",
+                        "description": "Destination account identifier"
+                    },
+                    "amount": {
+                        "type": "number",
+                        "description": "Amount to transfer"
+                    }
+                },
+                "required": [
+                    "from_account",
+                    "to_account",
+                    "amount"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_coupon",
+            "description": "Apply a coupon code to an order",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "description": "Order identifier"
+                    },
+                    "coupon_code": {
+                        "type": "string",
+                        "description": "Coupon code"
+                    }
+                },
+                "required": [
+                    "order_id",
+                    "coupon_code"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_profile",
+            "description": "Update a user profile field",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "field": {
+                        "type": "string",
+                        "description": "Profile field to update"
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "New value for the field"
+                    }
+                },
+                "required": [
+                    "field",
+                    "value"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_activity",
+            "description": "Log a user activity event",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "activity": {
+                        "type": "string",
+                        "description": "Activity description"
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Activity category"
+                    }
+                },
+                "required": [
+                    "activity",
+                    "category"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_news",
+            "description": "Fetch recent news articles by topic",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "News topic or keyword"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of articles to fetch"
+                    }
+                },
+                "required": [
+                    "topic"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_sentiment",
+            "description": "Analyze the sentiment of a text",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Input text"
+                    }
+                },
+                "required": [
+                    "text"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compare_products",
+            "description": "Compare two products by features",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_a": {
+                        "type": "string",
+                        "description": "First product name"
+                    },
+                    "product_b": {
+                        "type": "string",
+                        "description": "Second product name"
+                    }
+                },
+                "required": [
+                    "product_a",
+                    "product_b"
+                ]
+            }
+        }
     }
 ]
 
