@@ -66,11 +66,18 @@ def insert_security_blocks(content, security_blocks):
     security_text = "".join(cleaned_blocks)
 
     if think_end != -1:
-        pos = think_end + len("</think>")
+        insert_pos = think_end + len("</think>")
+        gap_end = insert_pos
+        while gap_end < len(content) and content[gap_end] == "\n":
+            gap_end += 1
+        new_content = content[:insert_pos] + security_text + content[gap_end:]
     else:
-        pos = tool_call_start
+        insert_pos = tool_call_start
+        gap_start = insert_pos
+        while gap_start > 0 and content[gap_start - 1] == "\n":
+            gap_start -= 1
+        new_content = content[:gap_start] + security_text + content[insert_pos:]
 
-    new_content = content[:pos] + security_text + content[pos:]
     return new_content
 
 
