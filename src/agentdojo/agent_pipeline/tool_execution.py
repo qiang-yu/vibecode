@@ -100,6 +100,10 @@ class ToolsExecutor(BasePipelineElement):
                 if isinstance(arg_v, str) and is_string_list(arg_v):
                     tool_call.args[arg_k] = literal_eval(arg_v)
 
+            print("==== Tool Exe Start ====")
+            print(f"{messages[-1]}")
+            print("==== Tool Exe End ====")
+
             tool_call_result, error = runtime.run_function(env, tool_call.function, tool_call.args)
             tool_call_id = tool_call.id
             formatted_tool_call_result = self.output_formatter(tool_call_result)
