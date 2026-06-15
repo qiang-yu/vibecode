@@ -1,6 +1,6 @@
 #!/bin/sh
 
-model_id="/home/qiangyu/Models/Qwen/Qwen3-8B"
+model_id="my-lora-model"
 
 log_dir="./runs/Qwen3-8B"
 mkdir -p ${log_dir}
