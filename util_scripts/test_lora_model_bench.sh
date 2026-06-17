@@ -1,7 +1,7 @@
 #!/bin/sh
 
-# model_id="/home/qiangyu/Models/Qwen/Qwen3-8B"
-model_id="my-lora-model"
+# model_id="Qwen3Base"
+model_id="lora-model"
 
 log_dir="./test/Qwen3-8B"
 rm -rf ./test

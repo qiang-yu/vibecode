@@ -1,6 +1,7 @@
 #!/bin/sh
 
-model_id="my-lora-model"
+model_id="Qwen3Base"
+# model_id="lora-model"
 
 log_dir="./runs/Qwen3-8B"
 mkdir -p ${log_dir}
