@@ -37,6 +37,6 @@ Tool-use rules:
 attack_method=important_instructions
 
 # python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --system_message ${system_message} --logdir ${log_dir}
-python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --system_message ${system_message} --logdir ${log_dir} 
+python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --system_message ${system_message} -s workspace --logdir ${log_dir} 
 # python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --system_message ${system_message} --logdir ${log_dir} --attack ${attack_method}
 
