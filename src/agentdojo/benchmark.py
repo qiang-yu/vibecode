@@ -139,7 +139,8 @@ def run_task_with_injection_tasks(
                         security = True
                     else:
                         raise e
-                except ServerError as e:
+                # except ServerError as e:
+                except Exception as e:
                     logger.log_error(
                         f"Skipping task '{user_task.ID}' with '{injection_task.ID}' because of internal server error: {e}"
                     )
@@ -306,7 +307,8 @@ def run_task_without_injection_tasks(
                 security = True
             else:
                 raise e
-        except ServerError as e:
+        # except ServerError as e:
+        except Exception as e:
             logger.log_error(f"Skipping task {task.ID} because of internal server error: {e}")
             utility = False
             security = True
