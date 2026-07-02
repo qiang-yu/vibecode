@@ -1,0 +1,1236 @@
+###
+# lora-8b.py
+#
+# A standalone LoRA fine-tuning script for causal language models such as
+# Qwen3, Llama, and Mistral. It reproduces the behavior of the original
+# LlamaFactory command used for Qwen3-8B SFT, while keeping every hyper-parameter
+# configurable through a YAML/JSON config file or command-line arguments.
+#
+# Supported features:
+#   - Multi-GPU training with configurable GPU visibility (e.g. "4,5,6,7")
+#   - DeepSpeed ZeRO-2 integration
+#   - Flash Attention 2 / SDPA / eager attention back-ends
+#   - ShareGPT-format datasets described by dataset_info.json
+#   - Turn-by-turn and whole-conversation training modes
+#   - Model-agnostic LoRA targeting (all-linear fallback + custom targets)
+#   - Loss plotting and checkpointing
+###
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import re
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from datetime import timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, get_origin, get_type_hints
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TrainingConfig:
+    """Holds every tunable option used during LoRA SFT."""
+
+    # Model and tokenizer
+    model_name_or_path: str = "/home/qiangyu/Models/Qwen/Qwen3-8B"
+    trust_remote_code: bool = True
+    torch_dtype: str = "bfloat16"  # LlamaFactory: pure_bf16 True
+    chat_template: Optional[str] = None  # override tokenizer.chat_template
+
+    # Attention back-end
+    flash_attn: str = "auto"  # auto | fa2 | sdpa | eager
+
+    # LoRA
+    finetuning_type: str = "lora"
+    lora_rank: int = 64
+    lora_alpha: int = 128
+    lora_dropout: float = 0.0
+    lora_target: str = "all"  # "all" targets all Linear layers; comma-list for custom modules
+    lora_bias: str = "none"
+    use_rslora: bool = False
+
+    # Dataset metadata and data loading
+    dataset_dir: str = "/home/qiangyu/Models/FineTune/Data"
+    dataset_info_path: str = "/home/qiangyu/Models/FineTune/Data/dataset_info.json"
+    datasets: List[str] = field(default_factory=lambda: ["no_inject_data", "simple_inject_data"])
+    conversation_mode: str = "turn_by_turn"  # turn_by_turn | whole
+    role_tag: str = "from"
+    content_tag: str = "value"
+    user_tag: str = "human"
+    assistant_tag: str = "gpt"
+    system_tag: str = "system"
+    observation_tag: str = "tool"
+    tool_role_in_template: str = "tool"  # tool | user; used when the chat template lacks a tool role
+    train_only_tag: Optional[str] = "tool_call_security"  # train only content inside this tag; null trains all assistant content
+    cutoff_len: int = 16384
+    max_samples: Optional[int] = 100000
+    preprocessing_num_workers: int = 16
+    shuffle_seed: int = 42
+    eval_data_ratio: float = 0.05
+
+    # Training hyper-parameters
+    stage: str = "sft"
+    do_train: bool = True
+    output_dir: str = "/home/qiangyu/Models/FineTune/Qwen/train_20260630"
+    overwrite_output_dir: bool = False
+    resume_from_checkpoint: Optional[str] = None  # e.g. output_dir/checkpoint-100
+    seed: int = 42
+    num_train_epochs: float = 6.0
+    per_device_train_batch_size: int = 1
+    per_device_eval_batch_size: int = 1
+    gradient_accumulation_steps: int = 8
+    learning_rate: float = 5e-05
+    lr_scheduler_type: str = "cosine"
+    warmup_steps: int = 0
+    max_grad_norm: float = 1.0
+    optim: str = "adamw_torch"
+    weight_decay: float = 0.0
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_epsilon: float = 1e-08
+    max_steps: int = -1  # -1 means use num_train_epochs
+
+    # Logging, evaluation and checkpointing
+    logging_steps: int = 10  # log loss every N steps
+    save_steps: int = 100
+    eval_strategy: str = "steps"  # no | steps | epoch
+    eval_steps: int = 100
+    save_total_limit: Optional[int] = None
+    logging_dir: Optional[str] = None
+    report_to: str = "none"  # none | tensorboard | wandb | ...
+    plot_loss: bool = True
+    plot_eval_loss: bool = True
+    eval_after_save: bool = True
+    final_eval: bool = True
+    include_num_input_tokens_seen: bool = True
+
+    # Distributed training
+    # GPU selection is controlled by CUDA_VISIBLE_DEVICES in run_lora.sh.
+    ddp_timeout: int = 180000000
+    deepspeed_config: Optional[str] = "ds_z2_config.json"
+    local_rank: int = -1  # automatically populated by torchrun/DeepSpeed
+
+    # Resource limits
+    per_device_max_memory_gb: Optional[float] = 70.0  # cap PyTorch memory per GPU; null disables the limit
+
+    # Qwen3-specific thinking mode
+    enable_thinking: bool = True
+
+    # Optional external config file (YAML or JSON)
+    config_file: Optional[str] = None
+
+
+def _add_argument(parser: argparse.ArgumentParser, name: str, default: Any, arg_type: Any) -> None:
+    """
+    Register a single CLI argument derived from a dataclass field.
+
+    ``default`` already merges config-file values over dataclass defaults, so it is
+    used directly as the argparse default. The ``type`` converters below only run on
+    strings supplied on the command line; the default (already a proper Python
+    value from YAML/JSON or the dataclass) is passed through untouched.
+    """
+    if arg_type == bool:
+        parser.add_argument(
+            f"--{name}",
+            type=lambda x: x.lower() in ("true", "1", "yes"),
+            default=default,
+        )
+    elif arg_type == list or get_origin(arg_type) is list:
+        parser.add_argument(
+            f"--{name}",
+            type=lambda x: [item.strip() for item in x.split(",") if item.strip()],
+            default=default,
+        )
+    elif arg_type == Optional[int]:
+        parser.add_argument(
+            f"--{name}",
+            type=lambda x: None if x.lower() in ("none", "null", "") else int(x),
+            default=default,
+        )
+    elif arg_type == Optional[str]:
+        parser.add_argument(
+            f"--{name}",
+            type=lambda x: None if x.lower() in ("none", "null", "") else x,
+            default=default,
+        )
+    elif arg_type == Optional[float]:
+        parser.add_argument(
+            f"--{name}",
+            type=lambda x: None if x.lower() in ("none", "null", "") else float(x),
+            default=default,
+        )
+    else:
+        parser.add_argument(f"--{name}", type=arg_type, default=default)
+
+
+def _load_config_file(path: str) -> Dict[str, Any]:
+    """Load a YAML or JSON config file into a plain dictionary."""
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    text = config_path.read_text(encoding="utf-8")
+    suffix = config_path.suffix.lower()
+    if suffix in (".yaml", ".yml"):
+        try:
+            import yaml
+            return yaml.safe_load(text) or {}
+        except ImportError as exc:
+            raise ImportError("PyYAML is required for YAML config files.") from exc
+    return json.loads(text)
+
+
+def parse_args() -> TrainingConfig:
+    """Build a TrainingConfig from defaults, config file and CLI overrides."""
+    defaults = TrainingConfig()
+    annotations = get_type_hints(TrainingConfig)
+
+    field_types: Dict[str, Any] = {}
+    for f in TrainingConfig.__dataclass_fields__.values():
+        if f.name in annotations:
+            field_types[f.name] = annotations[f.name]
+        elif isinstance(f.default, list):
+            field_types[f.name] = list
+        else:
+            field_types[f.name] = type(f.default)
+
+    # First pass: only read --config_file so it can supply defaults.
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config_file", type=str, default=None)
+    pre_args, _ = pre_parser.parse_known_args()
+
+    file_values: Dict[str, Any] = {}
+    if pre_args.config_file:
+        file_values = _load_config_file(pre_args.config_file)
+
+    # Second pass: full parser with config-file values as defaults.
+    parser = argparse.ArgumentParser(
+        description="LoRA SFT for causal language models.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--config_file", type=str, default=None,
+                        help="Path to a YAML or JSON config file whose values are used as defaults.")
+
+    for f_name, f_type in field_types.items():
+        if f_name == "config_file":
+            continue
+        default_value = file_values.get(f_name, getattr(defaults, f_name))
+        _add_argument(parser, f_name, default_value, f_type)
+
+    args = parser.parse_args()
+    kwargs = vars(args)
+    config_file = kwargs.pop("config_file", None)
+
+    config = TrainingConfig(**kwargs)
+    config.config_file = config_file
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Environment helpers
+# ---------------------------------------------------------------------------
+
+def set_per_device_memory_fraction(max_memory_gb: Optional[float], local_rank: int = -1) -> None:
+    """Cap the fraction of GPU memory that this PyTorch process may allocate."""
+    if max_memory_gb is None or max_memory_gb <= 0:
+        return
+
+    import torch
+    logger = logging.getLogger(__name__)
+    if not torch.cuda.is_available():
+        return
+
+    # Under a distributed launcher each process owns a single device
+    # (cuda:local_rank); only cap that one to avoid creating CUDA contexts on
+    # every visible GPU. Otherwise cap all visible devices.
+    if local_rank >= 0:
+        device_indices = [local_rank]
+    else:
+        device_indices = list(range(torch.cuda.device_count()))
+
+    for idx in device_indices:
+        props = torch.cuda.get_device_properties(idx)
+        total_gb = props.total_memory / (1024 ** 3)
+        fraction = min(max_memory_gb / total_gb, 1.0)
+        torch.cuda.set_per_process_memory_fraction(fraction, idx)
+        logger.info(
+            "GPU %d (total %.1f GB): limiting PyTorch allocation to %.1f GB (fraction %.3f)",
+            idx, total_gb, min(max_memory_gb, total_gb), fraction
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dataset helpers
+# ---------------------------------------------------------------------------
+
+def _apply_ct_ids(
+    tokenizer: Any,
+    messages: List[Dict[str, str]],
+    enable_thinking: bool,
+    add_generation_prompt: bool,
+) -> List[int]:
+    """Tokenize messages with the chat template, tolerating enable_thinking absence."""
+    kwargs = {"tokenize": True, "add_generation_prompt": add_generation_prompt}
+    if enable_thinking:
+        try:
+            return tokenizer.apply_chat_template(messages, enable_thinking=True, **kwargs)
+        except TypeError:
+            pass  # Tokenizer does not accept enable_thinking.
+    return tokenizer.apply_chat_template(messages, **kwargs)
+
+
+def _turn_char_span(
+    messages: List[Dict[str, str]],
+    target_idx: int,
+    tokenizer: Any,
+    full_text: str,
+    enable_thinking: bool,
+) -> Tuple[int, int]:
+    """
+    Return the [start, end) character span of ``target_idx``'s content in full_text.
+
+    The start is the decoded length of everything before the target turn (with the
+    assistant header opened), and the end is the decoded length up to and including
+    the target turn. This bounds tag searches to a single assistant turn so that
+    only that turn's tokens are trained.
+    """
+    head_ids = _apply_ct_ids(tokenizer, messages[:target_idx], enable_thinking, add_generation_prompt=True)
+    head_text = tokenizer.decode(head_ids, skip_special_tokens=False)
+    region_start = len(head_text)
+
+    upto_ids = _apply_ct_ids(tokenizer, messages[:target_idx + 1], enable_thinking, add_generation_prompt=False)
+    upto_text = tokenizer.decode(upto_ids, skip_special_tokens=False)
+    region_end = len(upto_text)
+
+    full_len = len(full_text)
+    region_start = max(0, min(region_start, full_len))
+    region_end = max(region_start, min(region_end, full_len))
+    return region_start, region_end
+
+
+def _mask_char_span(
+    input_ids: List[int],
+    labels: List[int],
+    full_text: str,
+    char_start: int,
+    char_end: int,
+    tokenizer: Any,
+) -> bool:
+    """
+    Mask the tokens that cover ``full_text[char_start:char_end]``.
+
+    Prefix-length matching converts character offsets to token offsets. Because
+    ``full_text`` is produced by decoding ``input_ids``, re-encoding a prefix of it
+    yields exactly the token count up to that character, even when BPE merges
+    characters across tag boundaries (e.g. ``><`` becoming one token).
+    """
+    prefix_ids = tokenizer.encode(full_text[:char_start], add_special_tokens=False)
+    end_ids = tokenizer.encode(full_text[:char_end], add_special_tokens=False)
+    start = len(prefix_ids)
+    end = min(len(end_ids), len(input_ids))
+    if start < end:
+        labels[start:end] = input_ids[start:end]
+        return True
+    return False
+
+
+def format_messages(
+    conversation: List[Dict[str, str]],
+    dataset_info: Dict[str, Any],
+    tool_role_in_template: str,
+) -> List[Dict[str, str]]:
+    """Convert a ShareGPT conversation into the chat-template message format."""
+    tags = dataset_info.get("tags", {})
+    role_tag = tags.get("role_tag", "from")
+    content_tag = tags.get("content_tag", "value")
+
+    role_map = {
+        tags.get("user_tag", "human"): "user",
+        tags.get("assistant_tag", "gpt"): "assistant",
+        tags.get("system_tag", "system"): "system",
+        tags.get("observation_tag", "tool"): "tool",
+    }
+
+    messages = []
+    for turn in conversation:
+        raw_role = turn.get(role_tag, "")
+        role = role_map.get(raw_role, raw_role)
+        if role == "tool" and tool_role_in_template == "user":
+            role = "user"
+        messages.append({"role": role, "content": turn.get(content_tag, "")})
+    return messages
+
+
+def _apply_chat_template_with_fallback(
+    tokenizer: Any,
+    messages: List[Dict[str, str]],
+    enable_thinking: bool,
+) -> Dict[str, Any]:
+    """Call apply_chat_template, gracefully disabling thinking for non-Qwen models."""
+    base_kwargs = {
+        "tokenize": True,
+        "return_tensors": None,
+        "return_dict": True,
+        "add_generation_prompt": False,
+    }
+
+    if enable_thinking:
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                **base_kwargs,
+                enable_thinking=True,
+            )
+        except TypeError:
+            pass  # Tokenizer does not accept enable_thinking; fall through.
+
+    return tokenizer.apply_chat_template(messages, **base_kwargs)
+
+
+def _mask_labels_for_assistant_turns(
+    input_ids: List[int],
+    messages: List[Dict[str, str]],
+    tokenizer: Any,
+    allowed_turn_indices: Optional[List[int]] = None,
+    train_only_tag: Optional[str] = None,
+    enable_thinking: bool = True,
+) -> Tuple[List[int], bool]:
+    """
+    Mask every token except the requested assistant turn content tokens.
+
+    When ``train_only_tag`` is provided, only content wrapped in that XML-like tag
+    is trained. Each assistant turn is located by its character span inside the
+    decoded text, and the tag is matched with a regex against that span, so a turn
+    without the tag is simply skipped. The function returns the label list together
+    with a flag indicating whether at least one assistant token was trained.
+    """
+    labels = [-100] * len(input_ids)
+    masked_any = False
+    logger = logging.getLogger(__name__)
+
+    assistant_indices = [i for i, msg in enumerate(messages) if msg["role"] == "assistant"]
+    if allowed_turn_indices is not None:
+        assistant_indices = [i for i in assistant_indices if i in allowed_turn_indices]
+
+    # Decode the token sequence once so character offsets map cleanly back to
+    # tokens (full_text always re-tokenizes to input_ids).
+    full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
+
+    tag_pattern = None
+    if train_only_tag is not None:
+        tag_pattern = re.compile(
+            rf"<{re.escape(train_only_tag)}>.*?</{re.escape(train_only_tag)}>", re.DOTALL
+        )
+
+    for turn_idx in assistant_indices:
+        content = messages[turn_idx]["content"]
+        region_start, region_end = _turn_char_span(
+            messages, turn_idx, tokenizer, full_text, enable_thinking
+        )
+
+        if tag_pattern is not None:
+            turn_found = False
+            for match in tag_pattern.finditer(full_text, region_start, region_end):
+                if _mask_char_span(input_ids, labels, full_text, match.start(), match.end(), tokenizer):
+                    turn_found = True
+            if turn_found:
+                masked_any = True
+            elif tag_pattern.search(content):
+                # The source turn carries the tag but it vanished from the tokenized
+                # text (e.g. altered by the chat template) — worth surfacing.
+                logger.warning(
+                    "Assistant turn %d contains <%s> in source but it was not found "
+                    "in the tokenized text.", turn_idx, train_only_tag,
+                )
+        else:
+            # Train the whole assistant turn content.
+            if _mask_char_span(input_ids, labels, full_text, region_start, region_end, tokenizer):
+                masked_any = True
+
+    # Train on the final EOS token if it is present and not already labeled.
+    if labels and labels[-1] == -100 and input_ids[-1] == tokenizer.eos_token_id:
+        labels[-1] = input_ids[-1]
+
+    return labels, masked_any
+
+
+def build_whole_conversation_sample(
+    messages: List[Dict[str, str]],
+    tokenizer: Any,
+    cutoff_len: int,
+    enable_thinking: bool,
+    train_only_tag: Optional[str] = None,
+) -> Dict[str, List[int]]:
+    """Create one training sample where every assistant turn is trained."""
+    result = _apply_chat_template_with_fallback(tokenizer, messages, enable_thinking)
+    input_ids = result["input_ids"]
+
+    labels, _ = _mask_labels_for_assistant_turns(
+        input_ids,
+        messages,
+        tokenizer,
+        train_only_tag=train_only_tag,
+        enable_thinking=enable_thinking,
+    )
+
+    # Keep the most recent tokens when truncation is required.
+    if len(input_ids) > cutoff_len:
+        input_ids = input_ids[-cutoff_len:]
+        labels = labels[-cutoff_len:]
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": [1] * len(input_ids),
+    }
+
+
+def build_turn_by_turn_samples(
+    messages: List[Dict[str, str]],
+    tokenizer: Any,
+    cutoff_len: int,
+    enable_thinking: bool,
+    train_only_tag: Optional[str] = None,
+) -> List[Dict[str, List[int]]]:
+    """Create one training sample per assistant turn, preserving prior context."""
+    samples = []
+    assistant_turn_indices = [i for i, msg in enumerate(messages) if msg["role"] == "assistant"]
+
+    for turn_idx in assistant_turn_indices:
+        prefix_messages = messages[:turn_idx + 1]
+        result = _apply_chat_template_with_fallback(tokenizer, prefix_messages, enable_thinking)
+        input_ids = result["input_ids"]
+
+        labels, masked_any = _mask_labels_for_assistant_turns(
+            input_ids,
+            prefix_messages,
+            tokenizer,
+            allowed_turn_indices=[turn_idx],
+            train_only_tag=train_only_tag,
+            enable_thinking=enable_thinking,
+        )
+
+        # Skip assistant turns that do not contain the requested tag.
+        if not masked_any:
+            continue
+
+        if len(input_ids) > cutoff_len:
+            input_ids = input_ids[-cutoff_len:]
+            labels = labels[-cutoff_len:]
+
+        samples.append({
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": [1] * len(input_ids),
+        })
+
+    return samples
+
+
+def make_preprocess_function(
+    tokenizer: Any,
+    dataset_info: Dict[str, Any],
+    config: TrainingConfig,
+) -> Any:
+    """Return a batched preprocessing function compatible with datasets.map."""
+    role_tag = dataset_info.get("tags", {}).get("role_tag", config.role_tag)
+    content_tag = dataset_info.get("tags", {}).get("content_tag", config.content_tag)
+    msg_column = dataset_info.get("columns", {}).get("messages", "conversations")
+
+    def preprocess(examples: Dict[str, List[Any]]) -> Dict[str, List[List[int]]]:
+        input_ids, labels, attention_mask = [], [], []
+
+        for conversation in examples.get(msg_column, []):
+            # Some datasets may already use the canonical keys.
+            messages = format_messages(
+                conversation,
+                dataset_info,
+                config.tool_role_in_template,
+            )
+
+            if config.conversation_mode == "turn_by_turn":
+                samples = build_turn_by_turn_samples(
+                    messages,
+                    tokenizer,
+                    config.cutoff_len,
+                    config.enable_thinking,
+                    config.train_only_tag,
+                )
+            else:
+                samples = [build_whole_conversation_sample(
+                    messages,
+                    tokenizer,
+                    config.cutoff_len,
+                    config.enable_thinking,
+                    config.train_only_tag,
+                )]
+
+            for sample in samples:
+                input_ids.append(sample["input_ids"])
+                labels.append(sample["labels"])
+                attention_mask.append(sample["attention_mask"])
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+        }
+
+    return preprocess
+
+
+def _interleave_datasets(datasets: List[Any], seed: int) -> Any:
+    """
+    Interleave multiple datasets proportionally.
+
+    For example, if dataset sizes are 5000 and 1000, the mixed dataset will
+    contain 5 samples from the first dataset followed by 1 sample from the
+    second dataset, repeating until all samples are consumed.
+    """
+    from datasets import Dataset
+
+    if len(datasets) == 1:
+        return datasets[0].shuffle(seed=seed)
+
+    lists = [ds.shuffle(seed=seed + idx).to_list() for idx, ds in enumerate(datasets)]
+    sizes = [len(lst) for lst in lists]
+    min_size = min(sizes)
+    ratios = [max(1, round(size / min_size)) for size in sizes]
+
+    indices = [0] * len(lists)
+    interleaved: List[Dict[str, Any]] = []
+    while any(indices[i] < len(lists[i]) for i in range(len(lists))):
+        for i in range(len(lists)):
+            end = min(indices[i] + ratios[i], len(lists[i]))
+            if end > indices[i]:
+                interleaved.extend(lists[i][indices[i]:end])
+                indices[i] = end
+
+    return Dataset.from_list(interleaved)
+
+
+def _tokenization_fingerprint(config: TrainingConfig, tokenizer: Any, split: str) -> str:
+    """
+    Build a deterministic fingerprint for a tokenized split.
+
+    Every rank must compute the same value so the ``.map()`` cache file is shared
+    across processes. The interleaved dataset is produced via ``Dataset.from_list``
+    and therefore carries an in-memory (per-process random) fingerprint; without a
+    deterministic cache name each rank re-tokenizes instead of reusing rank 0's
+    work, which is what produced the repeated "Tokenizing ..." progress bars.
+    """
+    payload = {
+        "split": split,
+        "datasets": list(config.datasets),
+        "conversation_mode": config.conversation_mode,
+        "cutoff_len": config.cutoff_len,
+        "train_only_tag": config.train_only_tag,
+        "enable_thinking": config.enable_thinking,
+        "max_samples": config.max_samples,
+        "eval_data_ratio": config.eval_data_ratio,
+        "shuffle_seed": config.shuffle_seed,
+        "tool_role_in_template": config.tool_role_in_template,
+        "role_tag": config.role_tag,
+        "content_tag": config.content_tag,
+        "user_tag": config.user_tag,
+        "assistant_tag": config.assistant_tag,
+        "system_tag": config.system_tag,
+        "observation_tag": config.observation_tag,
+        "model_name_or_path": config.model_name_or_path,
+        "vocab_size": len(tokenizer),
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def load_datasets(
+    config: TrainingConfig,
+    tokenizer: Any,
+    training_args: Any = None,
+) -> Any:
+    """Load, split, interleave, and tokenize all requested datasets."""
+    from datasets import load_dataset
+    from contextlib import nullcontext
+
+    dataset_dir = Path(config.dataset_dir)
+    with open(config.dataset_info_path, "r", encoding="utf-8") as f:
+        all_dataset_info = json.load(f)
+
+    requested_names = config.datasets
+    if not requested_names or (len(requested_names) == 1 and requested_names[0].lower() == "all"):
+        requested_names = list(all_dataset_info.keys())
+
+    logger = logging.getLogger(__name__)
+    raw_datasets = []
+    for name in requested_names:
+        if name not in all_dataset_info:
+            raise ValueError(f"Dataset '{name}' is not defined in {config.dataset_info_path}")
+
+        info = all_dataset_info[name]
+        file_name = info.get("file_name", f"{name}.json")
+        file_path = dataset_dir / file_name
+
+        if not file_path.exists():
+            raise FileNotFoundError(f"Dataset file not found: {file_path}")
+
+        raw = load_dataset("json", data_files=str(file_path), split="train")
+        logger.info("Loaded dataset '%s': %d samples", name, len(raw))
+        raw_datasets.append(raw)
+
+    # Split each dataset individually so every dataset contributes eval data.
+    train_splits = []
+    eval_splits = []
+    for raw in raw_datasets:
+        if config.eval_data_ratio and config.eval_data_ratio > 0:
+            split = raw.train_test_split(test_size=config.eval_data_ratio, seed=config.shuffle_seed)
+            train_splits.append(split["train"])
+            eval_splits.append(split["test"])
+        else:
+            train_splits.append(raw)
+
+    # Interleave train and eval splits proportionally.
+    logger.info("Interleaving train splits with ratios based on dataset sizes")
+    train_dataset = _interleave_datasets(train_splits, config.shuffle_seed)
+
+    eval_dataset = None
+    if eval_splits:
+        logger.info("Interleaving eval splits with ratios based on dataset sizes")
+        eval_dataset = _interleave_datasets(eval_splits, config.shuffle_seed)
+
+    if config.max_samples is not None and config.max_samples > 0:
+        max_samples = min(config.max_samples, len(train_dataset))
+        train_dataset = train_dataset.select(range(max_samples))
+        logger.info("Limited train dataset to %d samples", max_samples)
+
+    # Each dataset may define its own tags; use the first dataset's metadata for
+    # preprocessing. Mixed-tag datasets can be extended here if needed.
+    first_info = all_dataset_info[requested_names[0]]
+    preprocess_fn = make_preprocess_function(tokenizer, first_info, config)
+
+    # Under distributed training only the main process should tokenize; the other
+    # ranks then reuse the on-disk datasets cache instead of repeating the work
+    # (which is what produced multiple "Tokenizing ..." progress bars).
+    #
+    # The interleaved dataset lives in memory (Dataset.from_list), so .map() will
+    # not cache to disk unless we pass an explicit cache_file_name. We derive that
+    # name from a deterministic fingerprint of the tokenization config so every
+    # rank computes the SAME path: rank 0 writes it, the other ranks load it.
+    cache_dir = Path(config.output_dir) / "tokenized_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    train_cache_file = str(cache_dir / f"train-{_tokenization_fingerprint(config, tokenizer, 'train')}.arrow")
+    eval_cache_file = str(cache_dir / f"eval-{_tokenization_fingerprint(config, tokenizer, 'eval')}.arrow")
+
+    map_context = (
+        training_args.main_process_first(desc="dataset tokenization")
+        if training_args is not None
+        else nullcontext()
+    )
+
+    with map_context:
+        train_dataset = train_dataset.map(
+            preprocess_fn,
+            batched=True,
+            batch_size=1,
+            num_proc=config.preprocessing_num_workers,
+            remove_columns=train_dataset.column_names,
+            cache_file_name=train_cache_file,
+            desc="Tokenizing train dataset",
+        )
+
+        if eval_dataset is not None:
+            eval_dataset = eval_dataset.map(
+                preprocess_fn,
+                batched=True,
+                batch_size=1,
+                num_proc=config.preprocessing_num_workers,
+                remove_columns=eval_dataset.column_names,
+                cache_file_name=eval_cache_file,
+                desc="Tokenizing eval dataset",
+            )
+
+    return train_dataset, eval_dataset
+
+
+# ---------------------------------------------------------------------------
+# Model and LoRA helpers
+# ---------------------------------------------------------------------------
+
+def get_attn_implementation(config: TrainingConfig) -> str:
+    """Resolve the requested attention implementation."""
+    if config.flash_attn == "fa2":
+        return "flash_attention_2"
+    if config.flash_attn == "sdpa":
+        return "sdpa"
+    if config.flash_attn == "eager":
+        return "eager"
+
+    # auto: use flash_attention_2 if the package is available, otherwise SDPA.
+    try:
+        import flash_attn  # noqa: F401
+        return "flash_attention_2"
+    except ImportError:
+        return "sdpa"
+
+
+def get_lora_target_modules(config: TrainingConfig) -> Any:
+    """Resolve LoRA target modules in a model-agnostic way."""
+    if config.lora_target == "all":
+        return "all-linear"
+    if "," in config.lora_target:
+        return [module.strip() for module in config.lora_target.split(",") if module.strip()]
+    return config.lora_target
+
+
+def load_model_and_tokenizer(config: TrainingConfig) -> Any:
+    """Load the causal LM and tokenizer with the requested dtype and attention."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.model_name_or_path,
+        trust_remote_code=config.trust_remote_code,
+        padding_side="right",
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    if config.chat_template is not None:
+        tokenizer.chat_template = config.chat_template
+
+    if tokenizer.chat_template is None:
+        raise RuntimeError(
+            "The tokenizer has no chat_template. Provide one via --chat_template "
+            "or use a model whose tokenizer already defines a chat template."
+        )
+
+    attn_impl = get_attn_implementation(config)
+    torch_dtype = getattr(torch, config.torch_dtype, torch.bfloat16)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model_name_or_path,
+        trust_remote_code=config.trust_remote_code,
+        torch_dtype=torch_dtype,
+        attn_implementation=attn_impl,
+    )
+    model.config.use_cache = False
+
+    return model, tokenizer
+
+
+def setup_lora(model: Any, config: TrainingConfig) -> Any:
+    """Wrap the model with a PEFT LoRA configuration."""
+    from peft import LoraConfig, TaskType, get_peft_model
+
+    target_modules = get_lora_target_modules(config)
+    lora_config = LoraConfig(
+        r=config.lora_rank,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        target_modules=target_modules,
+        bias=config.lora_bias,
+        task_type=TaskType.CAUSAL_LM,
+        use_rslora=config.use_rslora,
+    )
+    model = get_peft_model(model, lora_config)
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Training utilities
+# ---------------------------------------------------------------------------
+
+class _BaseCallback:
+    """
+    Minimal Trainer callback base providing no-op defaults for every event.
+
+    transformers' CallbackHandler invokes ``getattr(callback, event)`` for all
+    ``on_*`` events, so a callback must respond to each one. Subclasses override
+    only the events they care about; every other event resolves to a no-op here.
+    Defining our own base keeps the heavy transformers import lazy (deferred until
+    after CUDA_VISIBLE_DEVICES is set in main()).
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("on_"):
+            return lambda *args, **kwargs: None
+        raise AttributeError(name)
+
+
+class LogMetricsCallback(_BaseCallback):
+    """
+    Route training/eval metrics through the logging module.
+
+    The Trainer's default PrinterCallback only ``print``s metrics to stdout, so
+    they never reach ``training.log``. This callback logs the same metric dicts via
+    the logger (which writes to both stdout and the file handler). Only the main
+    process logs, to avoid every rank duplicating the same lines.
+    """
+
+    def on_log(self, args: Any, state: Any, control: Any, logs: Optional[Dict[str, float]] = None, **kwargs: Any) -> Any:
+        if logs is None or not state.is_world_process_zero:
+            return control
+        logger = logging.getLogger(__name__)
+        if "eval_loss" in logs:
+            logger.info("Eval metrics at step %d: %s", state.global_step, logs)
+        elif "loss" in logs:
+            logger.info("Train metrics at step %d: %s", state.global_step, logs)
+        else:
+            logger.info("Metrics at step %d: %s", state.global_step, logs)
+        return control
+
+
+class PlotLossCallback(_BaseCallback):
+    """Collect losses during training and write PNG plots at the end."""
+
+    def __init__(self, output_dir: str, plot_eval_loss: bool = True):
+        self.output_dir = Path(output_dir)
+        self.plot_eval_loss = plot_eval_loss
+        self.train_steps: List[int] = []
+        self.train_losses: List[float] = []
+        self.eval_steps: List[int] = []
+        self.eval_losses: List[float] = []
+
+    def on_log(self, args: Any, state: Any, control: Any, logs: Optional[Dict[str, float]] = None, **kwargs: Any) -> None:
+        if logs is None:
+            return
+        if "loss" in logs:
+            self.train_steps.append(state.global_step)
+            self.train_losses.append(logs["loss"])
+        if "eval_loss" in logs:
+            self.eval_steps.append(state.global_step)
+            self.eval_losses.append(logs["eval_loss"])
+
+    def on_train_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        if not self.train_losses:
+            return
+
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            logging.warning("matplotlib is not installed; skipping loss plot.")
+            return
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Training loss plot.
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_steps, self.train_losses, label="train loss", linewidth=1.5)
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.title("Training Loss")
+        plt.legend()
+        plt.grid(True, linestyle="--", alpha=0.5)
+        train_plot_path = self.output_dir / "training_loss.png"
+        plt.savefig(train_plot_path, dpi=150)
+        plt.close()
+        logging.info("Training loss plot saved to %s", train_plot_path)
+
+        # Eval loss plot (either standalone or combined).
+        if self.plot_eval_loss and self.eval_losses:
+            plt.figure(figsize=(10, 6))
+            plt.plot(self.train_steps, self.train_losses, label="train loss", linewidth=1.5)
+            plt.plot(self.eval_steps, self.eval_losses, label="eval loss", linewidth=1.5, marker="o")
+            plt.xlabel("Step")
+            plt.ylabel("Loss")
+            plt.title("Training and Evaluation Loss")
+            plt.legend()
+            plt.grid(True, linestyle="--", alpha=0.5)
+            combined_plot_path = self.output_dir / "train_eval_loss.png"
+            plt.savefig(combined_plot_path, dpi=150)
+            plt.close()
+            logging.info("Train/eval loss plot saved to %s", combined_plot_path)
+
+            plt.figure(figsize=(10, 6))
+            plt.plot(self.eval_steps, self.eval_losses, label="eval loss", linewidth=1.5, marker="o", color="orange")
+            plt.xlabel("Step")
+            plt.ylabel("Loss")
+            plt.title("Evaluation Loss")
+            plt.legend()
+            plt.grid(True, linestyle="--", alpha=0.5)
+            eval_plot_path = self.output_dir / "eval_loss.png"
+            plt.savefig(eval_plot_path, dpi=150)
+            plt.close()
+            logging.info("Eval loss plot saved to %s", eval_plot_path)
+
+
+class EvaluateAfterSaveCallback(_BaseCallback):
+    """
+    Run evaluation immediately after a checkpoint is saved.
+
+    ``trainer.evaluate`` is a distributed collective: EVERY rank must call it, or
+    the ranks that skip it leave rank 0 waiting forever inside NCCL (this is the
+    hang observed right after the first checkpoint). Therefore all ranks call
+    ``evaluate`` together; only rank 0 logs the result.
+
+    When the Trainer's own step-based evaluation already ran at this step (e.g.
+    ``eval_steps == save_steps``), evaluating again is pure duplication, so we skip
+    it. ``on_evaluate`` records the step of the most recent evaluation and fires
+    before ``on_save`` within the same step, which makes the check version-agnostic.
+    """
+
+    def __init__(self, trainer: Any, eval_dataset: Any):
+        self.trainer = trainer
+        self.eval_dataset = eval_dataset
+        self._last_eval_step = -1
+
+    def on_evaluate(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        self._last_eval_step = state.global_step
+        return control
+
+    def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        if self.eval_dataset is None:
+            return control
+        # The Trainer already evaluated at this exact step; do not repeat it.
+        if state.global_step == self._last_eval_step:
+            return control
+        # All ranks must participate in this collective, so no rank-0 early return.
+        metrics = self.trainer.evaluate(eval_dataset=self.eval_dataset)
+        if state.is_world_process_zero:
+            eval_loss = metrics.get("eval_loss")
+            if eval_loss is not None:
+                logging.getLogger(__name__).info(
+                    "Eval loss after checkpoint at step %d: %.4f", state.global_step, eval_loss
+                )
+        return control
+
+
+def build_training_arguments(config: TrainingConfig) -> Any:
+    """Create transformers TrainingArguments from the user config."""
+    from transformers import TrainingArguments
+
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # -1 tells transformers to derive step count from num_train_epochs.
+    max_steps = config.max_steps if config.max_steps and config.max_steps > 0 else -1
+    eval_strategy = config.eval_strategy if config.eval_strategy != "no" else "no"
+
+    return TrainingArguments(
+        output_dir=config.output_dir,
+        seed=config.seed,
+        num_train_epochs=config.num_train_epochs,
+        max_steps=max_steps,
+        per_device_train_batch_size=config.per_device_train_batch_size,
+        per_device_eval_batch_size=config.per_device_eval_batch_size,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        learning_rate=config.learning_rate,
+        lr_scheduler_type=config.lr_scheduler_type,
+        warmup_steps=config.warmup_steps,
+        max_grad_norm=config.max_grad_norm,
+        optim=config.optim,
+        weight_decay=config.weight_decay,
+        adam_beta1=config.adam_beta1,
+        adam_beta2=config.adam_beta2,
+        adam_epsilon=config.adam_epsilon,
+        logging_steps=config.logging_steps,
+        save_steps=config.save_steps,
+        save_total_limit=config.save_total_limit,
+        logging_dir=config.logging_dir,
+        report_to=config.report_to or "none",
+        include_num_input_tokens_seen=config.include_num_input_tokens_seen,
+        ddp_timeout=config.ddp_timeout,
+        deepspeed=config.deepspeed_config,
+        bf16=config.torch_dtype == "bfloat16",
+        fp16=config.torch_dtype == "float16",
+        eval_strategy=eval_strategy,
+        eval_steps=config.eval_steps if eval_strategy != "no" else None,
+        remove_unused_columns=False,
+        load_best_model_at_end=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Run the full LoRA SFT pipeline."""
+    config = parse_args()
+
+    # GPU selection is handled entirely by CUDA_VISIBLE_DEVICES (see run_lora.sh).
+    # Under torchrun/deepspeed each process is pinned to a single GPU via
+    # LOCAL_RANK, so nothing to set here.
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    # Determine process rank so only the main process writes to the log file.
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    is_main_process = local_rank in (-1, 0)
+
+    # Prepare the output directory, then clear it if overwrite is requested. This
+    # must happen BEFORE the file handler opens training.log, otherwise we would
+    # delete the log file we just started writing.
+    output_dir = Path(config.output_dir)
+    cleared_output = False
+    if is_main_process and config.overwrite_output_dir and output_dir.exists():
+        import shutil
+        for item in output_dir.iterdir():
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        cleared_output = True
+    # Every rank ensures the directory exists so the file handler never fails.
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set up logging as early as possible so the very first messages are captured.
+    # mode="w" truncates training.log on every launch so runs never mix together.
+    log_format = "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    log_datefmt = "%Y-%m-%d %H:%M:%S"
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if is_main_process:
+        handlers.append(logging.FileHandler(output_dir / "training.log", mode="w", encoding="utf-8"))
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=log_format,
+        datefmt=log_datefmt,
+        handlers=handlers,
+        force=True,  # override any logging configured by earlier imports
+    )
+    logger = logging.getLogger(__name__)
+
+    if cleared_output:
+        logger.info("Cleared previous output directory: %s", output_dir)
+
+    logger.info("=" * 60)
+    logger.info("Starting LoRA SFT pipeline")
+    logger.info("Output directory: %s", config.output_dir)
+    logger.info("Log file: %s", output_dir / "training.log")
+    logger.info("Visible GPUs (CUDA_VISIBLE_DEVICES): %s", os.environ.get("CUDA_VISIBLE_DEVICES", "not set"))
+    logger.info("World size: %d | Local rank: %d", world_size, local_rank)
+    logger.info("Training config:\n%s", json.dumps(asdict(config), indent=2, ensure_ascii=False))
+    logger.info("=" * 60)
+
+    # Delay heavy ML imports until after CUDA_VISIBLE_DEVICES is set.
+    import torch
+    from transformers import DataCollatorForSeq2Seq, Trainer, set_seed
+
+    set_per_device_memory_fraction(config.per_device_max_memory_gb, local_rank)
+
+    set_seed(config.seed)
+    logger.info("Random seed set to %d", config.seed)
+
+    logger.info("Loading model and tokenizer from %s", config.model_name_or_path)
+    model, tokenizer = load_model_and_tokenizer(config)
+    logger.info("Model loaded successfully")
+    logger.info("Attention implementation: %s", get_attn_implementation(config))
+    logger.info("Tokenizer vocab size: %d", len(tokenizer))
+    logger.info("Pad token: %s (id=%s)", tokenizer.pad_token, tokenizer.pad_token_id)
+
+    if config.finetuning_type.lower() == "lora":
+        logger.info(
+            "Applying LoRA (rank=%d, alpha=%d, target=%s, dropout=%.3f)",
+            config.lora_rank,
+            config.lora_alpha,
+            config.lora_target,
+            config.lora_dropout,
+        )
+        model = setup_lora(model, config)
+        trainable_params, total_params = model.get_nb_trainable_parameters()
+        logger.info(
+            "Trainable parameters: %d / %d (%.4f%%)",
+            trainable_params,
+            total_params,
+            100 * trainable_params / total_params,
+        )
+    else:
+        raise ValueError(f"Unsupported finetuning_type: {config.finetuning_type}")
+
+    # Build training arguments before loading datasets so tokenization can run on
+    # the main process first (other ranks reuse the datasets cache).
+    training_args = build_training_arguments(config)
+
+    logger.info("Loading datasets defined in %s", config.dataset_info_path)
+    train_dataset, eval_dataset = load_datasets(config, tokenizer, training_args)
+    logger.info("Train samples: %d", len(train_dataset))
+    if eval_dataset is not None:
+        logger.info("Eval samples: %d", len(eval_dataset))
+
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        label_pad_token_id=-100,
+        padding="longest",
+    )
+    logger.info("Data collator initialized")
+
+    logger.info(
+        "Checkpoint will be saved every %d steps; loss will be logged every %d steps",
+        config.save_steps,
+        config.logging_steps,
+    )
+
+    # Always log metrics to the file; optionally add loss plotting on top.
+    callbacks: List[Any] = [LogMetricsCallback()]
+    if config.plot_loss:
+        callbacks.append(PlotLossCallback(config.output_dir, config.plot_eval_loss))
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        processing_class=tokenizer,
+        data_collator=data_collator,
+        callbacks=callbacks,
+    )
+    logger.info("Trainer initialized")
+
+    if config.eval_after_save and eval_dataset is not None:
+        eval_callback = EvaluateAfterSaveCallback(trainer, eval_dataset)
+        trainer.add_callback(eval_callback)
+        logger.info("Registered post-checkpoint evaluation callback")
+
+    if config.do_train:
+        if config.resume_from_checkpoint:
+            logger.info("Resuming training from checkpoint: %s", config.resume_from_checkpoint)
+        logger.info("Starting training for %.2f epochs", config.num_train_epochs)
+        start_time = time.time()
+        trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
+        elapsed = time.time() - start_time
+        logger.info("Training finished")
+
+        # Final evaluation if the last step is not already aligned with save_steps.
+        final_train_loss = None
+        for log in reversed(trainer.state.log_history):
+            if "loss" in log:
+                final_train_loss = log["loss"]
+                break
+        if final_train_loss is not None:
+            logger.info("Final train loss: %.4f", final_train_loss)
+
+        final_eval_loss = None
+        if config.final_eval and eval_dataset is not None and trainer.state.is_world_process_zero:
+            logger.info("Running final evaluation")
+            eval_metrics = trainer.evaluate()
+            final_eval_loss = eval_metrics.get("eval_loss")
+            if final_eval_loss is not None:
+                logger.info("Final eval loss: %.4f", final_eval_loss)
+
+        # Print training summary.
+        logger.info("=" * 60)
+        logger.info("Training summary")
+        logger.info("Total steps: %d", trainer.state.global_step)
+        logger.info("Total time: %s", str(timedelta(seconds=int(elapsed))))
+        logger.info("Final train loss: %s", final_train_loss)
+        logger.info("Final eval loss: %s", final_eval_loss)
+        logger.info("=" * 60)
+
+        logger.info("Saving final model to %s", config.output_dir)
+        trainer.save_model(config.output_dir)
+        trainer.save_state()
+        logger.info("Final model and trainer state saved to %s", config.output_dir)
+
+
+if __name__ == "__main__":
+    main()

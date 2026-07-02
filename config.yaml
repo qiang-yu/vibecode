@@ -1,0 +1,115 @@
+# Configuration for lora-8b.py
+# This file mirrors the original LlamaFactory command used to fine-tune Qwen3-8B.
+# All values can be overridden on the command line, e.g.:
+#   python lora-8b.py --config_file config.yaml --learning_rate 1e-5
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model_name_or_path: /home/qiangyu/Models/Qwen/Qwen3-8B
+trust_remote_code: true
+torch_dtype: bfloat16
+
+# ---------------------------------------------------------------------------
+# Attention
+# ---------------------------------------------------------------------------
+# auto | fa2 | sdpa | eager
+# NOTE: transformers 5.6.0 has a bug in its flash_attention_2 integration
+# (s_aux.to() on None for models without attention sinks like Qwen3), so fa2/auto
+# will crash. Use sdpa here; it is fast and memory-efficient on A800.
+flash_attn: sdpa
+
+# ---------------------------------------------------------------------------
+# LoRA
+# ---------------------------------------------------------------------------
+finetuning_type: lora
+lora_rank: 64
+lora_alpha: 128
+lora_dropout: 0.0
+lora_target: all
+lora_bias: none
+use_rslora: false
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+dataset_dir: /home/qiangyu/Models/FineTune/Data
+dataset_info_path: /home/qiangyu/Models/FineTune/Data/dataset_info.json
+datasets:
+  - no_inject_data
+  - simple_inject_data
+
+conversation_mode: turn_by_turn
+role_tag: from
+content_tag: value
+user_tag: human
+assistant_tag: gpt
+system_tag: system
+observation_tag: tool
+tool_role_in_template: tool
+
+# Only train content inside this XML-like tag. Set to null to train all assistant content.
+train_only_tag: tool_call_security
+
+cutoff_len: 16384
+max_samples: 100000
+preprocessing_num_workers: 16
+shuffle_seed: 42
+eval_data_ratio: 0.05
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+stage: sft
+do_train: true
+output_dir: /home/qiangyu/Models/FineTune/Qwen/train_20260702
+overwrite_output_dir: false
+resume_from_checkpoint: null  # e.g. /path/to/output_dir/checkpoint-100
+seed: 42
+num_train_epochs: 6.0
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 5.0e-05
+lr_scheduler_type: cosine
+warmup_steps: 0
+max_grad_norm: 1.0
+optim: adamw_torch
+weight_decay: 0.0
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-08
+max_steps: -1
+
+# ---------------------------------------------------------------------------
+# Logging / checkpointing / evaluation
+# ---------------------------------------------------------------------------
+logging_steps: 10  # log training loss every N steps
+save_steps: 100
+eval_strategy: steps
+eval_steps: 100
+save_total_limit: null
+logging_dir: null
+report_to: none
+plot_loss: true
+plot_eval_loss: true
+eval_after_save: true
+final_eval: true
+include_num_input_tokens_seen: true
+
+# ---------------------------------------------------------------------------
+# Distributed training
+# ---------------------------------------------------------------------------
+# GPU selection is controlled ENTIRELY by CUDA_VISIBLE_DEVICES in run_lora.sh.
+ddp_timeout: 180000000
+deepspeed_config: ds_z2_config.json
+
+# ---------------------------------------------------------------------------
+# Resource limits
+# ---------------------------------------------------------------------------
+per_device_max_memory_gb: 70.0  # cap PyTorch allocation per GPU; set to null to disable
+
+# ---------------------------------------------------------------------------
+# Qwen3 thinking mode
+# ---------------------------------------------------------------------------
+enable_thinking: true
