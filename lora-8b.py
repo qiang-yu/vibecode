@@ -13,6 +13,7 @@
 #   - ShareGPT-format datasets described by dataset_info.json
 #   - Turn-by-turn and whole-conversation training modes
 #   - Model-agnostic LoRA targeting (all-linear fallback + custom targets)
+#   - Per-tag weighted loss for XML-delimited assistant content
 #   - Loss plotting and checkpointing
 ###
 
@@ -30,6 +31,10 @@ from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, get_origin, get_type_hints
+
+# These classes are needed at module load time for subclassing. They import
+# transformers but do not allocate GPU memory; model loading stays deferred.
+from transformers import DataCollatorForSeq2Seq, Trainer
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +75,10 @@ class TrainingConfig:
     system_tag: str = "system"
     observation_tag: str = "tool"
     tool_role_in_template: str = "tool"  # tool | user; used when the chat template lacks a tool role
-    train_only_tag: Optional[str] = "tool_call_security"  # train only content inside this tag; null trains all assistant content
+    train_only_tag: Optional[str] = "tool_call_security"  # primary weighted tag; null trains all assistant content
+    train_only_tag_weight: float = 3.0  # loss weight for train_only_tag content
+    secondary_train_tag: Optional[str] = "tool_call"  # secondary weighted tag; null disables it
+    secondary_train_tag_weight: float = 1.0  # loss weight for secondary_train_tag content
     cutoff_len: int = 16384
     max_samples: Optional[int] = 100000
     preprocessing_num_workers: int = 16
@@ -320,13 +328,16 @@ def _turn_char_span(
 def _mask_char_span(
     input_ids: List[int],
     labels: List[int],
+    loss_weight: List[float],
     full_text: str,
     char_start: int,
     char_end: int,
     tokenizer: Any,
+    weight: float,
 ) -> bool:
     """
-    Mask the tokens that cover ``full_text[char_start:char_end]``.
+    Mask the tokens that cover ``full_text[char_start:char_end]`` and assign a
+    per-token loss weight.
 
     Prefix-length matching converts character offsets to token offsets. Because
     ``full_text`` is produced by decoding ``input_ids``, re-encoding a prefix of it
@@ -339,6 +350,7 @@ def _mask_char_span(
     end = min(len(end_ids), len(input_ids))
     if start < end:
         labels[start:end] = input_ids[start:end]
+        loss_weight[start:end] = [weight] * (end - start)
         return True
     return False
 
@@ -402,18 +414,24 @@ def _mask_labels_for_assistant_turns(
     tokenizer: Any,
     allowed_turn_indices: Optional[List[int]] = None,
     train_only_tag: Optional[str] = None,
+    train_only_tag_weight: float = 1.0,
+    secondary_train_tag: Optional[str] = None,
+    secondary_train_tag_weight: float = 1.0,
     enable_thinking: bool = True,
-) -> Tuple[List[int], bool]:
+) -> Tuple[List[int], List[float], bool]:
     """
     Mask every token except the requested assistant turn content tokens.
 
     When ``train_only_tag`` is provided, only content wrapped in that XML-like tag
-    is trained. Each assistant turn is located by its character span inside the
-    decoded text, and the tag is matched with a regex against that span, so a turn
-    without the tag is simply skipped. The function returns the label list together
-    with a flag indicating whether at least one assistant token was trained.
+    is trained. When ``secondary_train_tag`` is provided, that tag is also trained
+    with its own weight. Each assistant turn is located by its character span inside
+    the decoded text, and tags are matched with regexes against that span, so a turn
+    without any requested tag is simply skipped. The function returns the label list,
+    a per-token loss weight list, and a flag indicating whether at least one assistant
+    token was trained.
     """
     labels = [-100] * len(input_ids)
+    loss_weight = [0.0] * len(input_ids)
     masked_any = False
     logger = logging.getLogger(__name__)
 
@@ -425,11 +443,23 @@ def _mask_labels_for_assistant_turns(
     # tokens (full_text always re-tokenizes to input_ids).
     full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
 
-    tag_pattern = None
+    tag_patterns = []
     if train_only_tag is not None:
-        tag_pattern = re.compile(
-            rf"<{re.escape(train_only_tag)}>.*?</{re.escape(train_only_tag)}>", re.DOTALL
-        )
+        tag_patterns.append((
+            train_only_tag,
+            train_only_tag_weight,
+            re.compile(
+                rf"<{re.escape(train_only_tag)}>.*?</{re.escape(train_only_tag)}>", re.DOTALL
+            ),
+        ))
+    if secondary_train_tag is not None:
+        tag_patterns.append((
+            secondary_train_tag,
+            secondary_train_tag_weight,
+            re.compile(
+                rf"<{re.escape(secondary_train_tag)}>.*?</{re.escape(secondary_train_tag)}>", re.DOTALL
+            ),
+        ))
 
     for turn_idx in assistant_indices:
         content = messages[turn_idx]["content"]
@@ -437,30 +467,46 @@ def _mask_labels_for_assistant_turns(
             messages, turn_idx, tokenizer, full_text, enable_thinking
         )
 
-        if tag_pattern is not None:
+        if tag_patterns:
             turn_found = False
-            for match in tag_pattern.finditer(full_text, region_start, region_end):
-                if _mask_char_span(input_ids, labels, full_text, match.start(), match.end(), tokenizer):
-                    turn_found = True
+            found_tags = set()
+            for tag_name, weight, pattern in tag_patterns:
+                tag_found = False
+                for match in pattern.finditer(full_text, region_start, region_end):
+                    if _mask_char_span(
+                        input_ids, labels, loss_weight, full_text,
+                        match.start(), match.end(), tokenizer, weight,
+                    ):
+                        tag_found = True
+                        turn_found = True
+                if tag_found:
+                    found_tags.add(tag_name)
+
             if turn_found:
                 masked_any = True
-            elif tag_pattern.search(content):
-                # The source turn carries the tag but it vanished from the tokenized
-                # text (e.g. altered by the chat template) — worth surfacing.
-                logger.warning(
-                    "Assistant turn %d contains <%s> in source but it was not found "
-                    "in the tokenized text.", turn_idx, train_only_tag,
-                )
+
+            # Warn once per tag if the source turn carries it but it vanished from
+            # the tokenized text (e.g. altered by the chat template).
+            for tag_name, _, pattern in tag_patterns:
+                if pattern.search(content) and tag_name not in found_tags:
+                    logger.warning(
+                        "Assistant turn %d contains <%s> in source but it was not found "
+                        "in the tokenized text.", turn_idx, tag_name,
+                    )
         else:
-            # Train the whole assistant turn content.
-            if _mask_char_span(input_ids, labels, full_text, region_start, region_end, tokenizer):
+            # Train the whole assistant turn content with uniform weight.
+            if _mask_char_span(
+                input_ids, labels, loss_weight, full_text,
+                region_start, region_end, tokenizer, 1.0,
+            ):
                 masked_any = True
 
     # Train on the final EOS token if it is present and not already labeled.
     if labels and labels[-1] == -100 and input_ids[-1] == tokenizer.eos_token_id:
         labels[-1] = input_ids[-1]
+        loss_weight[-1] = 1.0
 
-    return labels, masked_any
+    return labels, loss_weight, masked_any
 
 
 def build_whole_conversation_sample(
@@ -469,16 +515,22 @@ def build_whole_conversation_sample(
     cutoff_len: int,
     enable_thinking: bool,
     train_only_tag: Optional[str] = None,
+    train_only_tag_weight: float = 1.0,
+    secondary_train_tag: Optional[str] = None,
+    secondary_train_tag_weight: float = 1.0,
 ) -> Dict[str, List[int]]:
     """Create one training sample where every assistant turn is trained."""
     result = _apply_chat_template_with_fallback(tokenizer, messages, enable_thinking)
     input_ids = result["input_ids"]
 
-    labels, _ = _mask_labels_for_assistant_turns(
+    labels, loss_weight, _ = _mask_labels_for_assistant_turns(
         input_ids,
         messages,
         tokenizer,
         train_only_tag=train_only_tag,
+        train_only_tag_weight=train_only_tag_weight,
+        secondary_train_tag=secondary_train_tag,
+        secondary_train_tag_weight=secondary_train_tag_weight,
         enable_thinking=enable_thinking,
     )
 
@@ -486,11 +538,13 @@ def build_whole_conversation_sample(
     if len(input_ids) > cutoff_len:
         input_ids = input_ids[-cutoff_len:]
         labels = labels[-cutoff_len:]
+        loss_weight = loss_weight[-cutoff_len:]
 
     return {
         "input_ids": input_ids,
         "labels": labels,
         "attention_mask": [1] * len(input_ids),
+        "loss_weight": loss_weight,
     }
 
 
@@ -500,6 +554,9 @@ def build_turn_by_turn_samples(
     cutoff_len: int,
     enable_thinking: bool,
     train_only_tag: Optional[str] = None,
+    train_only_tag_weight: float = 1.0,
+    secondary_train_tag: Optional[str] = None,
+    secondary_train_tag_weight: float = 1.0,
 ) -> List[Dict[str, List[int]]]:
     """Create one training sample per assistant turn, preserving prior context."""
     samples = []
@@ -510,27 +567,32 @@ def build_turn_by_turn_samples(
         result = _apply_chat_template_with_fallback(tokenizer, prefix_messages, enable_thinking)
         input_ids = result["input_ids"]
 
-        labels, masked_any = _mask_labels_for_assistant_turns(
+        labels, loss_weight, masked_any = _mask_labels_for_assistant_turns(
             input_ids,
             prefix_messages,
             tokenizer,
             allowed_turn_indices=[turn_idx],
             train_only_tag=train_only_tag,
+            train_only_tag_weight=train_only_tag_weight,
+            secondary_train_tag=secondary_train_tag,
+            secondary_train_tag_weight=secondary_train_tag_weight,
             enable_thinking=enable_thinking,
         )
 
-        # Skip assistant turns that do not contain the requested tag.
+        # Skip assistant turns that do not contain any requested tag.
         if not masked_any:
             continue
 
         if len(input_ids) > cutoff_len:
             input_ids = input_ids[-cutoff_len:]
             labels = labels[-cutoff_len:]
+            loss_weight = loss_weight[-cutoff_len:]
 
         samples.append({
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": [1] * len(input_ids),
+            "loss_weight": loss_weight,
         })
 
     return samples
@@ -547,7 +609,7 @@ def make_preprocess_function(
     msg_column = dataset_info.get("columns", {}).get("messages", "conversations")
 
     def preprocess(examples: Dict[str, List[Any]]) -> Dict[str, List[List[int]]]:
-        input_ids, labels, attention_mask = [], [], []
+        input_ids, labels, attention_mask, loss_weight = [], [], [], []
 
         for conversation in examples.get(msg_column, []):
             # Some datasets may already use the canonical keys.
@@ -564,6 +626,9 @@ def make_preprocess_function(
                     config.cutoff_len,
                     config.enable_thinking,
                     config.train_only_tag,
+                    config.train_only_tag_weight,
+                    config.secondary_train_tag,
+                    config.secondary_train_tag_weight,
                 )
             else:
                 samples = [build_whole_conversation_sample(
@@ -572,17 +637,22 @@ def make_preprocess_function(
                     config.cutoff_len,
                     config.enable_thinking,
                     config.train_only_tag,
+                    config.train_only_tag_weight,
+                    config.secondary_train_tag,
+                    config.secondary_train_tag_weight,
                 )]
 
             for sample in samples:
                 input_ids.append(sample["input_ids"])
                 labels.append(sample["labels"])
                 attention_mask.append(sample["attention_mask"])
+                loss_weight.append(sample["loss_weight"])
 
         return {
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": attention_mask,
+            "loss_weight": loss_weight,
         }
 
     return preprocess
@@ -634,6 +704,9 @@ def _tokenization_fingerprint(config: TrainingConfig, tokenizer: Any, split: str
         "conversation_mode": config.conversation_mode,
         "cutoff_len": config.cutoff_len,
         "train_only_tag": config.train_only_tag,
+        "train_only_tag_weight": config.train_only_tag_weight,
+        "secondary_train_tag": config.secondary_train_tag,
+        "secondary_train_tag_weight": config.secondary_train_tag_weight,
         "enable_thinking": config.enable_thinking,
         "max_samples": config.max_samples,
         "eval_data_ratio": config.eval_data_ratio,
@@ -1004,6 +1077,91 @@ class EvaluateAfterSaveCallback(_BaseCallback):
         return control
 
 
+class WeightedDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
+    """
+    Pad ``loss_weight`` alongside the standard seq2seq fields.
+
+    The parent collator does not know how to pad a float weight array, so we
+    remove ``loss_weight`` before padding, let the parent collator handle the
+    remaining fields, then pad the weights ourselves with zeros (masked tokens).
+    """
+
+    def torch_call(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        weights = [f.pop("loss_weight", None) for f in features]
+        try:
+            batch = super().torch_call(features)
+        finally:
+            for feature, weight in zip(features, weights):
+                if weight is not None:
+                    feature["loss_weight"] = weight
+
+        if weights[0] is not None:
+            import torch
+
+            max_length = batch["input_ids"].shape[1]
+            padded_weights = []
+            for weight in weights:
+                weight_list = list(weight)
+                if len(weight_list) < max_length:
+                    weight_list.extend([0.0] * (max_length - len(weight_list)))
+                else:
+                    weight_list = weight_list[:max_length]
+                padded_weights.append(weight_list)
+            batch["loss_weight"] = torch.tensor(padded_weights, dtype=torch.float32)
+
+        return batch
+
+
+class WeightedLossTrainer(Trainer):
+    """
+    Trainer that computes a per-token weighted cross-entropy loss.
+
+    Tokens inside ``<tool_call_security>`` and ``<tool_call>`` contribute to the
+    loss according to their configured weights; all other assistant tokens are
+    masked with weight 0. This lets the security reasoning tokens receive a
+    higher gradient emphasis than the raw tool-call JSON.
+    """
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs: Any):
+        import torch
+        import torch.nn.functional as F
+
+        if "loss_weight" not in inputs:
+            return super().compute_loss(model, inputs, return_outputs, num_items_in_batch=num_items_in_batch, **kwargs)
+
+        labels = inputs.pop("labels")
+        loss_weight = inputs.pop("loss_weight")
+
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        # Shift so that each position predicts the next token. Cast to float32 for
+        # numerical stability, matching the internal causal-LM loss computation.
+        shift_logits = logits[..., :-1, :].contiguous().float()
+        shift_labels = labels[..., 1:].contiguous()
+        shift_weight = loss_weight[..., 1:].contiguous()
+
+        per_token_loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            reduction="none",
+        )
+
+        weighted_sum = (per_token_loss * shift_weight.view(-1)).sum()
+        weight_sum = shift_weight.sum()
+
+        if num_items_in_batch is not None:
+            # Recent transformers versions expect the total batch loss; they
+            # normalize by num_items_in_batch themselves.
+            loss = weighted_sum
+        else:
+            # Older versions: normalize by the sum of weights to keep scale stable.
+            loss = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
+
+        outputs.loss = loss
+        return (loss, outputs) if return_outputs else loss
+
+
 def build_training_arguments(config: TrainingConfig) -> Any:
     """Create transformers TrainingArguments from the user config."""
     from transformers import TrainingArguments
@@ -1113,7 +1271,7 @@ def main() -> None:
 
     # Delay heavy ML imports until after CUDA_VISIBLE_DEVICES is set.
     import torch
-    from transformers import DataCollatorForSeq2Seq, Trainer, set_seed
+    from transformers import set_seed
 
     set_per_device_memory_fraction(config.per_device_max_memory_gb, local_rank)
 
@@ -1156,11 +1314,18 @@ def main() -> None:
     if eval_dataset is not None:
         logger.info("Eval samples: %d", len(eval_dataset))
 
-    data_collator = DataCollatorForSeq2Seq(
+    data_collator = WeightedDataCollatorForSeq2Seq(
         tokenizer=tokenizer,
         model=model,
         label_pad_token_id=-100,
         padding="longest",
+    )
+    logger.info(
+        "Training on weighted tags: <%s> weight=%.2f, <%s> weight=%.2f",
+        config.train_only_tag or "none",
+        config.train_only_tag_weight,
+        config.secondary_train_tag or "none",
+        config.secondary_train_tag_weight,
     )
     logger.info("Data collator initialized")
 
@@ -1175,7 +1340,7 @@ def main() -> None:
     if config.plot_loss:
         callbacks.append(PlotLossCallback(config.output_dir, config.plot_eval_loss))
 
-    trainer = Trainer(
+    trainer = WeightedLossTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -1210,26 +1375,34 @@ def main() -> None:
             logger.info("Final train loss: %.4f", final_train_loss)
 
         final_eval_loss = None
-        if config.final_eval and eval_dataset is not None and trainer.state.is_world_process_zero:
-            logger.info("Running final evaluation")
+        if config.final_eval and eval_dataset is not None:
+            # trainer.evaluate() is a distributed collective: EVERY rank must call
+            # it together. Guarding the call with is_world_process_zero makes only
+            # rank 0 enter the collective while the others move on, leaving rank 0
+            # hung forever inside NCCL. So all ranks evaluate; only rank 0 logs.
+            if trainer.state.is_world_process_zero:
+                logger.info("Running final evaluation")
             eval_metrics = trainer.evaluate()
             final_eval_loss = eval_metrics.get("eval_loss")
-            if final_eval_loss is not None:
+            if final_eval_loss is not None and trainer.state.is_world_process_zero:
                 logger.info("Final eval loss: %.4f", final_eval_loss)
 
-        # Print training summary.
-        logger.info("=" * 60)
-        logger.info("Training summary")
-        logger.info("Total steps: %d", trainer.state.global_step)
-        logger.info("Total time: %s", str(timedelta(seconds=int(elapsed))))
-        logger.info("Final train loss: %s", final_train_loss)
-        logger.info("Final eval loss: %s", final_eval_loss)
-        logger.info("=" * 60)
+        # Print training summary (main process only, to avoid duplicated lines).
+        if trainer.state.is_world_process_zero:
+            logger.info("=" * 60)
+            logger.info("Training summary")
+            logger.info("Total steps: %d", trainer.state.global_step)
+            logger.info("Total time: %s", str(timedelta(seconds=int(elapsed))))
+            logger.info("Final train loss: %s", final_train_loss)
+            logger.info("Final eval loss: %s", final_eval_loss)
+            logger.info("=" * 60)
 
+        # save_model / save_state must run on all ranks (collective under DeepSpeed).
         logger.info("Saving final model to %s", config.output_dir)
         trainer.save_model(config.output_dir)
         trainer.save_state()
-        logger.info("Final model and trainer state saved to %s", config.output_dir)
+        if trainer.state.is_world_process_zero:
+            logger.info("Final model and trainer state saved to %s", config.output_dir)
 
 
 if __name__ == "__main__":
