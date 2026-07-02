@@ -75,10 +75,12 @@ class TrainingConfig:
     system_tag: str = "system"
     observation_tag: str = "tool"
     tool_role_in_template: str = "tool"  # tool | user; used when the chat template lacks a tool role
-    train_only_tag: Optional[str] = "tool_call_security"  # primary weighted tag; null trains all assistant content
-    train_only_tag_weight: float = 3.0  # loss weight for train_only_tag content
-    secondary_train_tag: Optional[str] = "tool_call"  # secondary weighted tag; null disables it
-    secondary_train_tag_weight: float = 1.0  # loss weight for secondary_train_tag content
+    loss_calc_tag_tool_call_security: Optional[str] = "tool_call_security"  # primary weighted tag; gates whether an assistant turn is trained
+    loss_calc_tag_tool_call_security_weight: float = 3.0  # loss weight for tool_call_security content
+    loss_calc_tag_think: Optional[str] = "think"  # think block is trained only when tool_call_security is present
+    loss_calc_tag_think_weight: float = 1.0  # loss weight for think content
+    loss_calc_tag_tool_call: Optional[str] = "tool_call"  # secondary weighted tag; trained only when tool_call_security is present
+    loss_calc_tag_tool_call_weight: float = 1.0  # loss weight for tool_call content
     cutoff_len: int = 16384
     max_samples: Optional[int] = 100000
     preprocessing_num_workers: int = 16
@@ -413,22 +415,27 @@ def _mask_labels_for_assistant_turns(
     messages: List[Dict[str, str]],
     tokenizer: Any,
     allowed_turn_indices: Optional[List[int]] = None,
-    train_only_tag: Optional[str] = None,
-    train_only_tag_weight: float = 1.0,
-    secondary_train_tag: Optional[str] = None,
-    secondary_train_tag_weight: float = 1.0,
+    loss_calc_tag_tool_call_security: Optional[str] = None,
+    loss_calc_tag_tool_call_security_weight: float = 1.0,
+    loss_calc_tag_think: Optional[str] = None,
+    loss_calc_tag_think_weight: float = 1.0,
+    loss_calc_tag_tool_call: Optional[str] = None,
+    loss_calc_tag_tool_call_weight: float = 1.0,
     enable_thinking: bool = True,
 ) -> Tuple[List[int], List[float], bool]:
     """
-    Mask every token except the requested assistant turn content tokens.
+    Mask assistant turn tokens according to the configured XML tags.
 
-    When ``train_only_tag`` is provided, only content wrapped in that XML-like tag
-    is trained. When ``secondary_train_tag`` is provided, that tag is also trained
-    with its own weight. Each assistant turn is located by its character span inside
-    the decoded text, and tags are matched with regexes against that span, so a turn
-    without any requested tag is simply skipped. The function returns the label list,
-    a per-token loss weight list, and a flag indicating whether at least one assistant
-    token was trained.
+    When ``loss_calc_tag_tool_call_security`` is provided, an assistant turn is only
+    trained if its raw content contains that tag. In that case the three blocks
+    ``<tool_call_security>...</tool_call_security>``, ``<think>...</think>`` and
+    ``<tool_call>...</tool_call>`` are all trained with their respective weights,
+    including the opening and closing XML tags themselves. Turns without the
+    security tag are skipped entirely. When the security tag is not configured, the
+    whole assistant turn content is trained with uniform weight.
+
+    The function returns the label list, a per-token loss weight list, and a flag
+    indicating whether at least one assistant token was trained.
     """
     labels = [-100] * len(input_ids)
     loss_weight = [0.0] * len(input_ids)
@@ -443,63 +450,88 @@ def _mask_labels_for_assistant_turns(
     # tokens (full_text always re-tokenizes to input_ids).
     full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
 
-    tag_patterns = []
-    if train_only_tag is not None:
-        tag_patterns.append((
-            train_only_tag,
-            train_only_tag_weight,
-            re.compile(
-                rf"<{re.escape(train_only_tag)}>.*?</{re.escape(train_only_tag)}>", re.DOTALL
-            ),
-        ))
-    if secondary_train_tag is not None:
-        tag_patterns.append((
-            secondary_train_tag,
-            secondary_train_tag_weight,
-            re.compile(
-                rf"<{re.escape(secondary_train_tag)}>.*?</{re.escape(secondary_train_tag)}>", re.DOTALL
-            ),
-        ))
-
     for turn_idx in assistant_indices:
         content = messages[turn_idx]["content"]
         region_start, region_end = _turn_char_span(
             messages, turn_idx, tokenizer, full_text, enable_thinking
         )
 
-        if tag_patterns:
-            turn_found = False
-            found_tags = set()
-            for tag_name, weight, pattern in tag_patterns:
-                tag_found = False
-                for match in pattern.finditer(full_text, region_start, region_end):
-                    if _mask_char_span(
-                        input_ids, labels, loss_weight, full_text,
-                        match.start(), match.end(), tokenizer, weight,
-                    ):
-                        tag_found = True
-                        turn_found = True
-                if tag_found:
-                    found_tags.add(tag_name)
-
-            if turn_found:
-                masked_any = True
-
-            # Warn once per tag if the source turn carries it but it vanished from
-            # the tokenized text (e.g. altered by the chat template).
-            for tag_name, _, pattern in tag_patterns:
-                if pattern.search(content) and tag_name not in found_tags:
-                    logger.warning(
-                        "Assistant turn %d contains <%s> in source but it was not found "
-                        "in the tokenized text.", turn_idx, tag_name,
-                    )
-        else:
-            # Train the whole assistant turn content with uniform weight.
+        if loss_calc_tag_tool_call_security is None:
+            # No security tag configured: train the whole assistant turn.
             if _mask_char_span(
                 input_ids, labels, loss_weight, full_text,
                 region_start, region_end, tokenizer, 1.0,
             ):
                 masked_any = True
+            continue
+
+        # Gate: the assistant turn must contain the security tag in its raw content.
+        security_open = f"<{loss_calc_tag_tool_call_security}>"
+        security_close = f"</{loss_calc_tag_tool_call_security}>"
+        if security_open not in content or security_close not in content:
+            continue
+
+        # Also require the security tag to survive tokenization; if the chat template
+        # altered it, skip this turn rather than training on partial/wrong spans.
+        security_pattern = re.compile(
+            rf"<{re.escape(loss_calc_tag_tool_call_security)}>.*?</{re.escape(loss_calc_tag_tool_call_security)}>", re.DOTALL
+        )
+        if not security_pattern.search(full_text, region_start, region_end):
+            logger.warning(
+                "Assistant turn %d contains <%s> in source but it was not found "
+                "in the tokenized text; skipping the turn.",
+                turn_idx, loss_calc_tag_tool_call_security,
+            )
+            continue
+
+        tag_patterns = []
+        tag_patterns.append((
+            loss_calc_tag_tool_call_security,
+            loss_calc_tag_tool_call_security_weight,
+            security_pattern,
+        ))
+        if loss_calc_tag_think is not None:
+            tag_patterns.append((
+                loss_calc_tag_think,
+                loss_calc_tag_think_weight,
+                re.compile(
+                    rf"<{re.escape(loss_calc_tag_think)}>.*?</{re.escape(loss_calc_tag_think)}>", re.DOTALL
+                ),
+            ))
+        if loss_calc_tag_tool_call is not None:
+            tag_patterns.append((
+                loss_calc_tag_tool_call,
+                loss_calc_tag_tool_call_weight,
+                re.compile(
+                    rf"<{re.escape(loss_calc_tag_tool_call)}>.*?</{re.escape(loss_calc_tag_tool_call)}>", re.DOTALL
+                ),
+            ))
+
+        turn_found = False
+        found_tags = set()
+        for tag_name, weight, pattern in tag_patterns:
+            tag_found = False
+            for match in pattern.finditer(full_text, region_start, region_end):
+                if _mask_char_span(
+                    input_ids, labels, loss_weight, full_text,
+                    match.start(), match.end(), tokenizer, weight,
+                ):
+                    tag_found = True
+                    turn_found = True
+            if tag_found:
+                found_tags.add(tag_name)
+
+        if turn_found:
+            masked_any = True
+
+        # Warn once per tag if the source turn carries it but it vanished from
+        # the tokenized text (e.g. altered by the chat template).
+        for tag_name, _, pattern in tag_patterns:
+            if pattern.search(content) and tag_name not in found_tags:
+                logger.warning(
+                    "Assistant turn %d contains <%s> in source but it was not found "
+                    "in the tokenized text.", turn_idx, tag_name,
+                )
 
     # Train on the final EOS token if it is present and not already labeled.
     if labels and labels[-1] == -100 and input_ids[-1] == tokenizer.eos_token_id:
@@ -514,12 +546,14 @@ def build_whole_conversation_sample(
     tokenizer: Any,
     cutoff_len: int,
     enable_thinking: bool,
-    train_only_tag: Optional[str] = None,
-    train_only_tag_weight: float = 1.0,
-    secondary_train_tag: Optional[str] = None,
-    secondary_train_tag_weight: float = 1.0,
+    loss_calc_tag_tool_call_security: Optional[str] = None,
+    loss_calc_tag_tool_call_security_weight: float = 1.0,
+    loss_calc_tag_think: Optional[str] = None,
+    loss_calc_tag_think_weight: float = 1.0,
+    loss_calc_tag_tool_call: Optional[str] = None,
+    loss_calc_tag_tool_call_weight: float = 1.0,
 ) -> Dict[str, List[int]]:
-    """Create one training sample where every assistant turn is trained."""
+    """Create one training sample; assistant turns without the security tag are skipped."""
     result = _apply_chat_template_with_fallback(tokenizer, messages, enable_thinking)
     input_ids = result["input_ids"]
 
@@ -527,10 +561,12 @@ def build_whole_conversation_sample(
         input_ids,
         messages,
         tokenizer,
-        train_only_tag=train_only_tag,
-        train_only_tag_weight=train_only_tag_weight,
-        secondary_train_tag=secondary_train_tag,
-        secondary_train_tag_weight=secondary_train_tag_weight,
+        loss_calc_tag_tool_call_security=loss_calc_tag_tool_call_security,
+        loss_calc_tag_tool_call_security_weight=loss_calc_tag_tool_call_security_weight,
+        loss_calc_tag_think=loss_calc_tag_think,
+        loss_calc_tag_think_weight=loss_calc_tag_think_weight,
+        loss_calc_tag_tool_call=loss_calc_tag_tool_call,
+        loss_calc_tag_tool_call_weight=loss_calc_tag_tool_call_weight,
         enable_thinking=enable_thinking,
     )
 
@@ -553,10 +589,12 @@ def build_turn_by_turn_samples(
     tokenizer: Any,
     cutoff_len: int,
     enable_thinking: bool,
-    train_only_tag: Optional[str] = None,
-    train_only_tag_weight: float = 1.0,
-    secondary_train_tag: Optional[str] = None,
-    secondary_train_tag_weight: float = 1.0,
+    loss_calc_tag_tool_call_security: Optional[str] = None,
+    loss_calc_tag_tool_call_security_weight: float = 1.0,
+    loss_calc_tag_think: Optional[str] = None,
+    loss_calc_tag_think_weight: float = 1.0,
+    loss_calc_tag_tool_call: Optional[str] = None,
+    loss_calc_tag_tool_call_weight: float = 1.0,
 ) -> List[Dict[str, List[int]]]:
     """Create one training sample per assistant turn, preserving prior context."""
     samples = []
@@ -572,14 +610,17 @@ def build_turn_by_turn_samples(
             prefix_messages,
             tokenizer,
             allowed_turn_indices=[turn_idx],
-            train_only_tag=train_only_tag,
-            train_only_tag_weight=train_only_tag_weight,
-            secondary_train_tag=secondary_train_tag,
-            secondary_train_tag_weight=secondary_train_tag_weight,
+            loss_calc_tag_tool_call_security=loss_calc_tag_tool_call_security,
+            loss_calc_tag_tool_call_security_weight=loss_calc_tag_tool_call_security_weight,
+            loss_calc_tag_think=loss_calc_tag_think,
+            loss_calc_tag_think_weight=loss_calc_tag_think_weight,
+            loss_calc_tag_tool_call=loss_calc_tag_tool_call,
+            loss_calc_tag_tool_call_weight=loss_calc_tag_tool_call_weight,
             enable_thinking=enable_thinking,
         )
 
-        # Skip assistant turns that do not contain any requested tag.
+        # Skip assistant turns that do not contain the security tag (or whose
+        # security tag did not survive tokenization).
         if not masked_any:
             continue
 
@@ -625,10 +666,12 @@ def make_preprocess_function(
                     tokenizer,
                     config.cutoff_len,
                     config.enable_thinking,
-                    config.train_only_tag,
-                    config.train_only_tag_weight,
-                    config.secondary_train_tag,
-                    config.secondary_train_tag_weight,
+                    config.loss_calc_tag_tool_call_security,
+                    config.loss_calc_tag_tool_call_security_weight,
+                    config.loss_calc_tag_think,
+                    config.loss_calc_tag_think_weight,
+                    config.loss_calc_tag_tool_call,
+                    config.loss_calc_tag_tool_call_weight,
                 )
             else:
                 samples = [build_whole_conversation_sample(
@@ -636,10 +679,12 @@ def make_preprocess_function(
                     tokenizer,
                     config.cutoff_len,
                     config.enable_thinking,
-                    config.train_only_tag,
-                    config.train_only_tag_weight,
-                    config.secondary_train_tag,
-                    config.secondary_train_tag_weight,
+                    config.loss_calc_tag_tool_call_security,
+                    config.loss_calc_tag_tool_call_security_weight,
+                    config.loss_calc_tag_think,
+                    config.loss_calc_tag_think_weight,
+                    config.loss_calc_tag_tool_call,
+                    config.loss_calc_tag_tool_call_weight,
                 )]
 
             for sample in samples:
@@ -703,10 +748,12 @@ def _tokenization_fingerprint(config: TrainingConfig, tokenizer: Any, split: str
         "datasets": list(config.datasets),
         "conversation_mode": config.conversation_mode,
         "cutoff_len": config.cutoff_len,
-        "train_only_tag": config.train_only_tag,
-        "train_only_tag_weight": config.train_only_tag_weight,
-        "secondary_train_tag": config.secondary_train_tag,
-        "secondary_train_tag_weight": config.secondary_train_tag_weight,
+        "loss_calc_tag_tool_call_security": config.loss_calc_tag_tool_call_security,
+        "loss_calc_tag_tool_call_security_weight": config.loss_calc_tag_tool_call_security_weight,
+        "loss_calc_tag_think": config.loss_calc_tag_think,
+        "loss_calc_tag_think_weight": config.loss_calc_tag_think_weight,
+        "loss_calc_tag_tool_call": config.loss_calc_tag_tool_call,
+        "loss_calc_tag_tool_call_weight": config.loss_calc_tag_tool_call_weight,
         "enable_thinking": config.enable_thinking,
         "max_samples": config.max_samples,
         "eval_data_ratio": config.eval_data_ratio,
@@ -1116,10 +1163,13 @@ class WeightedLossTrainer(Trainer):
     """
     Trainer that computes a per-token weighted cross-entropy loss.
 
-    Tokens inside ``<tool_call_security>`` and ``<tool_call>`` contribute to the
-    loss according to their configured weights; all other assistant tokens are
-    masked with weight 0. This lets the security reasoning tokens receive a
-    higher gradient emphasis than the raw tool-call JSON.
+    Tokens inside ``<tool_call_security>...</tool_call_security>``,
+    ``<think>...</think>`` and ``<tool_call>...</tool_call>`` contribute to
+    the loss according to their configured weights, including the opening and closing
+    XML tags themselves; all other assistant tokens are masked with weight 0. Assistant
+    turns that do not contain ``<tool_call_security>`` are skipped entirely. This lets
+    the security reasoning tokens receive a higher gradient emphasis than the raw
+    tool-call JSON.
     """
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs: Any):
@@ -1321,11 +1371,13 @@ def main() -> None:
         padding="longest",
     )
     logger.info(
-        "Training on weighted tags: <%s> weight=%.2f, <%s> weight=%.2f",
-        config.train_only_tag or "none",
-        config.train_only_tag_weight,
-        config.secondary_train_tag or "none",
-        config.secondary_train_tag_weight,
+        "Training on weighted tags: <%s> weight=%.2f, <%s> weight=%.2f, <%s> weight=%.2f",
+        config.loss_calc_tag_tool_call_security or "none",
+        config.loss_calc_tag_tool_call_security_weight,
+        config.loss_calc_tag_think or "none",
+        config.loss_calc_tag_think_weight,
+        config.loss_calc_tag_tool_call or "none",
+        config.loss_calc_tag_tool_call_weight,
     )
     logger.info("Data collator initialized")
 
