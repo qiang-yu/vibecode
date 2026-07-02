@@ -8,6 +8,7 @@ log_dir="./runs/Qwen3-8B"
 mkdir -p ${log_dir}
 
 export LOCAL_LLM_PORT=19000
+export MAX_INFERENCE_TOKENS=1024
 
 system_message="Tool-use rules: In any single turn, you may invoke at most one tool. Never request multiple tool invocations in the same response."
 # system_message="Tool-use rules: 1. In any single turn, you may invoke at most one tool. Never request multiple tool invocations in the same response. 2. for each tool call, you must generate <tool_call_security>...</tool_call_security> block before generate tool call."
