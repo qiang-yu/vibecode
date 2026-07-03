@@ -51,3 +51,30 @@ def analyze(path):
 
 if __name__ == "__main__":
     analyze(sys.argv[1])
+    if len(sys.argv) > 2 and sys.argv[2] == "--sample":
+        print("\n\n===== 未被tag覆盖的游离文本样例 =====")
+        sample_uncovered(sys.argv[1])
+
+
+def sample_uncovered(path, n=5):
+    """打印几条 gated turn 中，未被任何 tag 覆盖的具体文本，方便肉眼检查"""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    shown = 0
+    for sample in data:
+        for turn in sample.get("conversations", sample.get("conversation", [])):
+            if turn.get("from") != "gpt":
+                continue
+            content = turn.get("value", "")
+            if "<tool_call_security>" not in content or "</tool_call_security>" not in content:
+                continue
+            stripped = content
+            for pat in (SECURITY_RE, THINK_RE, TOOLCALL_RE):
+                stripped = pat.sub("", stripped)
+            stripped = stripped.strip()
+            if len(stripped) > 20:  # 只看明显游离文本较多的样本
+                print("=" * 60)
+                print(repr(stripped[:500]))
+                shown += 1
+                if shown >= n:
+                    return
