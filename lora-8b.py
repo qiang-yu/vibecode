@@ -1200,13 +1200,11 @@ class WeightedLossTrainer(Trainer):
         weighted_sum = (per_token_loss * shift_weight.view(-1)).sum()
         weight_sum = shift_weight.sum()
 
-        if num_items_in_batch is not None:
-            # Recent transformers versions expect the total batch loss; they
-            # normalize by num_items_in_batch themselves.
-            loss = weighted_sum
-        else:
-            # Older versions: normalize by the sum of weights to keep scale stable.
-            loss = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
+        # Normalize by the sum of weights so the returned loss is a weighted average
+        # per-token cross-entropy, on the same scale as the model's default loss.
+        # The Trainer logs this value directly; returning the unnormalized sum would
+        # produce loss numbers that scale with batch size and sequence length.
+        loss = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
 
         outputs.loss = loss
         return (loss, outputs) if return_outputs else loss
