@@ -1202,9 +1202,14 @@ class WeightedLossTrainer(Trainer):
 
         # Normalize by the sum of weights so the returned loss is a weighted average
         # per-token cross-entropy, on the same scale as the model's default loss.
-        # The Trainer logs this value directly; returning the unnormalized sum would
-        # produce loss numbers that scale with batch size and sequence length.
         loss = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
+
+        # Newer transformers versions pass num_items_in_batch and skip the division
+        # by gradient_accumulation_steps in training_step. If we do not divide here,
+        # the logged loss and the accumulated gradients are both amplified by the
+        # number of accumulation steps.
+        if num_items_in_batch is not None and self.args.gradient_accumulation_steps > 1:
+            loss = loss / self.args.gradient_accumulation_steps
 
         outputs.loss = loss
         return (loss, outputs) if return_outputs else loss
