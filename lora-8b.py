@@ -13,7 +13,8 @@
 #   - ShareGPT-format datasets described by dataset_info.json
 #   - Turn-by-turn and whole-conversation training modes
 #   - Model-agnostic LoRA targeting (all-linear fallback + custom targets)
-#   - Per-tag weighted loss for XML-delimited assistant content
+#   - Per-tag weighted loss for all assistant content; default weight for untagged text
+#   - Gradient checkpointing for long-sequence training
 #   - Loss plotting and checkpointing
 ###
 
@@ -75,11 +76,12 @@ class TrainingConfig:
     system_tag: str = "system"
     observation_tag: str = "tool"
     tool_role_in_template: str = "tool"  # tool | user; used when the chat template lacks a tool role
-    loss_calc_tag_tool_call_security: Optional[str] = "tool_call_security"  # primary weighted tag; gates whether an assistant turn is trained
-    loss_calc_tag_tool_call_security_weight: float = 3.0  # loss weight for tool_call_security content
-    loss_calc_tag_think: Optional[str] = "think"  # think block is trained only when tool_call_security is present
+    loss_calc_default_weight: float = 1.0  # loss weight for assistant content outside special tags
+    loss_calc_tag_tool_call_security: Optional[str] = "tool_call_security"  # weighted security-analysis tag
+    loss_calc_tag_tool_call_security_weight: float = 2.0  # loss weight for tool_call_security content
+    loss_calc_tag_think: Optional[str] = "think"  # weighted think block
     loss_calc_tag_think_weight: float = 1.0  # loss weight for think content
-    loss_calc_tag_tool_call: Optional[str] = "tool_call"  # secondary weighted tag; trained only when tool_call_security is present
+    loss_calc_tag_tool_call: Optional[str] = "tool_call"  # weighted tool-call JSON block
     loss_calc_tag_tool_call_weight: float = 1.0  # loss weight for tool_call content
     cutoff_len: int = 16384
     max_samples: Optional[int] = 100000
@@ -94,7 +96,7 @@ class TrainingConfig:
     overwrite_output_dir: bool = False
     resume_from_checkpoint: Optional[str] = None  # e.g. output_dir/checkpoint-100
     seed: int = 42
-    num_train_epochs: float = 6.0
+    num_train_epochs: float = 3.0
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
     gradient_accumulation_steps: int = 8
@@ -108,6 +110,7 @@ class TrainingConfig:
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-08
     max_steps: int = -1  # -1 means use num_train_epochs
+    gradient_checkpointing: bool = True  # trade compute for memory; required for long sequences
 
     # Logging, evaluation and checkpointing
     logging_steps: int = 10  # log loss every N steps
@@ -415,6 +418,7 @@ def _mask_labels_for_assistant_turns(
     messages: List[Dict[str, str]],
     tokenizer: Any,
     allowed_turn_indices: Optional[List[int]] = None,
+    loss_calc_default_weight: float = 1.0,
     loss_calc_tag_tool_call_security: Optional[str] = None,
     loss_calc_tag_tool_call_security_weight: float = 1.0,
     loss_calc_tag_think: Optional[str] = None,
@@ -424,15 +428,14 @@ def _mask_labels_for_assistant_turns(
     enable_thinking: bool = True,
 ) -> Tuple[List[int], List[float], bool]:
     """
-    Mask assistant turn tokens according to the configured XML tags.
+    Mask assistant turn tokens for supervised fine-tuning.
 
-    When ``loss_calc_tag_tool_call_security`` is provided, an assistant turn is only
-    trained if its raw content contains that tag. In that case the three blocks
+    Every assistant turn is trained. Tokens outside the configured XML tags receive
+    ``loss_calc_default_weight`` (default 1.0). Tokens inside the configured tags
     ``<tool_call_security>...</tool_call_security>``, ``<think>...</think>`` and
-    ``<tool_call>...</tool_call>`` are all trained with their respective weights,
-    including the opening and closing XML tags themselves. Turns without the
-    security tag are skipped entirely. When the security tag is not configured, the
-    whole assistant turn content is trained with uniform weight.
+    ``<tool_call>...</tool_call>`` are trained with their respective weights,
+    including the opening and closing XML tags themselves. When no XML tags are
+    configured, the whole assistant turn content is trained with the default weight.
 
     The function returns the label list, a per-token loss weight list, and a flag
     indicating whether at least one assistant token was trained.
@@ -450,87 +453,78 @@ def _mask_labels_for_assistant_turns(
     # tokens (full_text always re-tokenizes to input_ids).
     full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
 
+    # Build the list of configured XML tags, their weights, and compiled patterns.
+    tag_configs = []
+    if loss_calc_tag_tool_call_security is not None:
+        tag_configs.append((
+            loss_calc_tag_tool_call_security,
+            loss_calc_tag_tool_call_security_weight,
+            re.compile(
+                rf"<{re.escape(loss_calc_tag_tool_call_security)}>.*?</{re.escape(loss_calc_tag_tool_call_security)}>", re.DOTALL
+            ),
+        ))
+    if loss_calc_tag_think is not None:
+        tag_configs.append((
+            loss_calc_tag_think,
+            loss_calc_tag_think_weight,
+            re.compile(
+                rf"<{re.escape(loss_calc_tag_think)}>.*?</{re.escape(loss_calc_tag_think)}>", re.DOTALL
+            ),
+        ))
+    if loss_calc_tag_tool_call is not None:
+        tag_configs.append((
+            loss_calc_tag_tool_call,
+            loss_calc_tag_tool_call_weight,
+            re.compile(
+                rf"<{re.escape(loss_calc_tag_tool_call)}>.*?</{re.escape(loss_calc_tag_tool_call)}>", re.DOTALL
+            ),
+        ))
+
     for turn_idx in assistant_indices:
         content = messages[turn_idx]["content"]
         region_start, region_end = _turn_char_span(
             messages, turn_idx, tokenizer, full_text, enable_thinking
         )
 
-        if loss_calc_tag_tool_call_security is None:
-            # No security tag configured: train the whole assistant turn.
+        if not tag_configs:
+            # No XML tags configured: train the whole assistant turn with the
+            # default weight.
             if _mask_char_span(
                 input_ids, labels, loss_weight, full_text,
-                region_start, region_end, tokenizer, 1.0,
+                region_start, region_end, tokenizer, loss_calc_default_weight,
             ):
                 masked_any = True
             continue
 
-        # Gate: the assistant turn must contain the security tag in its raw content.
-        security_open = f"<{loss_calc_tag_tool_call_security}>"
-        security_close = f"</{loss_calc_tag_tool_call_security}>"
-        if security_open not in content or security_close not in content:
-            continue
-
-        # Also require the security tag to survive tokenization; if the chat template
-        # altered it, skip this turn rather than training on partial/wrong spans.
-        security_pattern = re.compile(
-            rf"<{re.escape(loss_calc_tag_tool_call_security)}>.*?</{re.escape(loss_calc_tag_tool_call_security)}>", re.DOTALL
+        # Train the entire assistant turn with the default weight first; special
+        # tag regions will be overridden with their specific weights afterwards.
+        turn_masked = _mask_char_span(
+            input_ids, labels, loss_weight, full_text,
+            region_start, region_end, tokenizer, loss_calc_default_weight,
         )
-        if not security_pattern.search(full_text, region_start, region_end):
-            logger.warning(
-                "Assistant turn %d contains <%s> in source but it was not found "
-                "in the tokenized text; skipping the turn.",
-                turn_idx, loss_calc_tag_tool_call_security,
-            )
-            continue
+        if turn_masked:
+            masked_any = True
 
-        tag_patterns = []
-        tag_patterns.append((
-            loss_calc_tag_tool_call_security,
-            loss_calc_tag_tool_call_security_weight,
-            security_pattern,
-        ))
-        if loss_calc_tag_think is not None:
-            tag_patterns.append((
-                loss_calc_tag_think,
-                loss_calc_tag_think_weight,
-                re.compile(
-                    rf"<{re.escape(loss_calc_tag_think)}>.*?</{re.escape(loss_calc_tag_think)}>", re.DOTALL
-                ),
-            ))
-        if loss_calc_tag_tool_call is not None:
-            tag_patterns.append((
-                loss_calc_tag_tool_call,
-                loss_calc_tag_tool_call_weight,
-                re.compile(
-                    rf"<{re.escape(loss_calc_tag_tool_call)}>.*?</{re.escape(loss_calc_tag_tool_call)}>", re.DOTALL
-                ),
-            ))
-
-        turn_found = False
         found_tags = set()
-        for tag_name, weight, pattern in tag_patterns:
+        for tag_name, weight, pattern in tag_configs:
             tag_found = False
             for match in pattern.finditer(full_text, region_start, region_end):
-                if _mask_char_span(
+                _mask_char_span(
                     input_ids, labels, loss_weight, full_text,
                     match.start(), match.end(), tokenizer, weight,
-                ):
-                    tag_found = True
-                    turn_found = True
+                )
+                tag_found = True
             if tag_found:
                 found_tags.add(tag_name)
 
-        if turn_found:
-            masked_any = True
-
         # Warn once per tag if the source turn carries it but it vanished from
         # the tokenized text (e.g. altered by the chat template).
-        for tag_name, _, pattern in tag_patterns:
+        for tag_name, _, pattern in tag_configs:
             if pattern.search(content) and tag_name not in found_tags:
                 logger.warning(
                     "Assistant turn %d contains <%s> in source but it was not found "
-                    "in the tokenized text.", turn_idx, tag_name,
+                    "in the tokenized text; the turn is still trained with the default weight.",
+                    turn_idx, tag_name,
                 )
 
     # Train on the final EOS token if it is present and not already labeled.
@@ -546,6 +540,7 @@ def build_whole_conversation_sample(
     tokenizer: Any,
     cutoff_len: int,
     enable_thinking: bool,
+    loss_calc_default_weight: float = 1.0,
     loss_calc_tag_tool_call_security: Optional[str] = None,
     loss_calc_tag_tool_call_security_weight: float = 1.0,
     loss_calc_tag_think: Optional[str] = None,
@@ -553,7 +548,7 @@ def build_whole_conversation_sample(
     loss_calc_tag_tool_call: Optional[str] = None,
     loss_calc_tag_tool_call_weight: float = 1.0,
 ) -> Dict[str, List[int]]:
-    """Create one training sample; assistant turns without the security tag are skipped."""
+    """Create one training sample from the full conversation."""
     result = _apply_chat_template_with_fallback(tokenizer, messages, enable_thinking)
     input_ids = result["input_ids"]
 
@@ -561,6 +556,7 @@ def build_whole_conversation_sample(
         input_ids,
         messages,
         tokenizer,
+        loss_calc_default_weight=loss_calc_default_weight,
         loss_calc_tag_tool_call_security=loss_calc_tag_tool_call_security,
         loss_calc_tag_tool_call_security_weight=loss_calc_tag_tool_call_security_weight,
         loss_calc_tag_think=loss_calc_tag_think,
@@ -589,6 +585,7 @@ def build_turn_by_turn_samples(
     tokenizer: Any,
     cutoff_len: int,
     enable_thinking: bool,
+    loss_calc_default_weight: float = 1.0,
     loss_calc_tag_tool_call_security: Optional[str] = None,
     loss_calc_tag_tool_call_security_weight: float = 1.0,
     loss_calc_tag_think: Optional[str] = None,
@@ -610,6 +607,7 @@ def build_turn_by_turn_samples(
             prefix_messages,
             tokenizer,
             allowed_turn_indices=[turn_idx],
+            loss_calc_default_weight=loss_calc_default_weight,
             loss_calc_tag_tool_call_security=loss_calc_tag_tool_call_security,
             loss_calc_tag_tool_call_security_weight=loss_calc_tag_tool_call_security_weight,
             loss_calc_tag_think=loss_calc_tag_think,
@@ -619,8 +617,7 @@ def build_turn_by_turn_samples(
             enable_thinking=enable_thinking,
         )
 
-        # Skip assistant turns that do not contain the security tag (or whose
-        # security tag did not survive tokenization).
+        # Skip assistant turns that produced no trainable tokens (e.g. empty content).
         if not masked_any:
             continue
 
@@ -666,6 +663,7 @@ def make_preprocess_function(
                     tokenizer,
                     config.cutoff_len,
                     config.enable_thinking,
+                    config.loss_calc_default_weight,
                     config.loss_calc_tag_tool_call_security,
                     config.loss_calc_tag_tool_call_security_weight,
                     config.loss_calc_tag_think,
@@ -679,6 +677,7 @@ def make_preprocess_function(
                     tokenizer,
                     config.cutoff_len,
                     config.enable_thinking,
+                    config.loss_calc_default_weight,
                     config.loss_calc_tag_tool_call_security,
                     config.loss_calc_tag_tool_call_security_weight,
                     config.loss_calc_tag_think,
@@ -748,6 +747,7 @@ def _tokenization_fingerprint(config: TrainingConfig, tokenizer: Any, split: str
         "datasets": list(config.datasets),
         "conversation_mode": config.conversation_mode,
         "cutoff_len": config.cutoff_len,
+        "loss_calc_default_weight": config.loss_calc_default_weight,
         "loss_calc_tag_tool_call_security": config.loss_calc_tag_tool_call_security,
         "loss_calc_tag_tool_call_security_weight": config.loss_calc_tag_tool_call_security_weight,
         "loss_calc_tag_think": config.loss_calc_tag_think,
@@ -1163,13 +1163,13 @@ class WeightedLossTrainer(Trainer):
     """
     Trainer that computes a per-token weighted cross-entropy loss.
 
-    Tokens inside ``<tool_call_security>...</tool_call_security>``,
-    ``<think>...</think>`` and ``<tool_call>...</tool_call>`` contribute to
-    the loss according to their configured weights, including the opening and closing
-    XML tags themselves; all other assistant tokens are masked with weight 0. Assistant
-    turns that do not contain ``<tool_call_security>`` are skipped entirely. This lets
-    the security reasoning tokens receive a higher gradient emphasis than the raw
-    tool-call JSON.
+    Every assistant turn contributes to the loss. Tokens outside the configured XML
+    tags use ``loss_calc_default_weight``, while tokens inside
+    ``<tool_call_security>...</tool_call_security>``,
+    ``<think>...</think>`` and ``<tool_call>...</tool_call>`` use their
+    configured weights, including the opening and closing XML tags themselves. This
+    lets the security reasoning tokens receive a higher gradient emphasis than the
+    raw tool-call JSON and the rest of the assistant content.
     """
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs: Any):
@@ -1185,20 +1185,31 @@ class WeightedLossTrainer(Trainer):
         outputs = model(**inputs)
         logits = outputs.logits
 
-        # Shift so that each position predicts the next token. Cast to float32 for
-        # numerical stability, matching the internal causal-LM loss computation.
-        shift_logits = logits[..., :-1, :].contiguous().float()
+        # Shift so that each position predicts the next token.
+        shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         shift_weight = loss_weight[..., 1:].contiguous()
 
-        per_token_loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            reduction="none",
-        )
+        # Only compute cross-entropy on positions that are not masked. This avoids
+        # materializing a full float32 [seq_len, vocab_size] matrix for padding and
+        # for user/system/tool tokens, which drastically reduces peak GPU memory.
+        active_mask = shift_labels != -100
+        if active_mask.any():
+            active_logits = shift_logits[active_mask].float()
+            active_labels = shift_labels[active_mask]
+            active_weights = shift_weight[active_mask]
 
-        weighted_sum = (per_token_loss * shift_weight.view(-1)).sum()
-        weight_sum = shift_weight.sum()
+            per_token_loss = F.cross_entropy(
+                active_logits,
+                active_labels,
+                reduction="none",
+            )
+
+            weighted_sum = (per_token_loss * active_weights).sum()
+            weight_sum = active_weights.sum()
+        else:
+            weighted_sum = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+            weight_sum = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
 
         # Normalize by the sum of weights so the returned loss is a weighted average
         # per-token cross-entropy, on the same scale as the model's default loss.
@@ -1257,6 +1268,8 @@ def build_training_arguments(config: TrainingConfig) -> Any:
         eval_steps=config.eval_steps if eval_strategy != "no" else None,
         remove_unused_columns=False,
         load_best_model_at_end=False,
+        gradient_checkpointing=config.gradient_checkpointing,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
 
@@ -1347,6 +1360,9 @@ def main() -> None:
             config.lora_dropout,
         )
         model = setup_lora(model, config)
+        if config.gradient_checkpointing:
+            model.enable_input_require_grads()
+            logger.info("Gradient checkpointing enabled; input tensors now require gradients")
         trainable_params, total_params = model.get_nb_trainable_parameters()
         logger.info(
             "Trainable parameters: %d / %d (%.4f%%)",
@@ -1374,7 +1390,8 @@ def main() -> None:
         padding="longest",
     )
     logger.info(
-        "Training on weighted tags: <%s> weight=%.2f, <%s> weight=%.2f, <%s> weight=%.2f",
+        "Training on weighted tags: default weight=%.2f, <%s> weight=%.2f, <%s> weight=%.2f, <%s> weight=%.2f",
+        config.loss_calc_default_weight,
         config.loss_calc_tag_tool_call_security or "none",
         config.loss_calc_tag_tool_call_security_weight,
         config.loss_calc_tag_think or "none",
