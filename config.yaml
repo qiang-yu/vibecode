@@ -74,7 +74,7 @@ output_dir: /home/qiangyu/Models/FineTune/Qwen/train_20260704
 overwrite_output_dir: false
 resume_from_checkpoint: null  # e.g. /path/to/output_dir/checkpoint-100
 seed: 42
-num_train_epochs: 3.0
+num_train_epochs: 6.0
 gradient_checkpointing: true
 per_device_train_batch_size: 1
 per_device_eval_batch_size: 1

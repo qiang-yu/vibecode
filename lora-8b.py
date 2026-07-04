@@ -97,7 +97,7 @@ class TrainingConfig:
     overwrite_output_dir: bool = False
     resume_from_checkpoint: Optional[str] = None  # e.g. output_dir/checkpoint-100
     seed: int = 42
-    num_train_epochs: float = 3.0
+    num_train_epochs: float = 6.0
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
     gradient_accumulation_steps: int = 8
