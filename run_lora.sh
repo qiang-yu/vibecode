@@ -35,4 +35,4 @@ torchrun \
     --master_port=29500 \
     lora-8b.py \
     --config_file config.yaml \
-    --per_device_max_memory_gb 70.0
+    --per_device_max_memory_gb 78.0

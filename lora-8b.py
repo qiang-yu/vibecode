@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import time
+import torch
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -59,7 +60,7 @@ class TrainingConfig:
     finetuning_type: str = "lora"
     lora_rank: int = 64
     lora_alpha: int = 128
-    lora_dropout: float = 0.0
+    lora_dropout: float = 0.05
     lora_target: str = "all"  # "all" targets all Linear layers; comma-list for custom modules
     lora_bias: str = "none"
     use_rslora: bool = False
@@ -76,11 +77,11 @@ class TrainingConfig:
     system_tag: str = "system"
     observation_tag: str = "tool"
     tool_role_in_template: str = "tool"  # tool | user; used when the chat template lacks a tool role
-    loss_calc_default_weight: float = 1.0  # loss weight for assistant content outside special tags
+    loss_calc_default_weight: float = 0.0  # loss weight for assistant content outside special tags (0 = no CE loss)
     loss_calc_tag_tool_call_security: Optional[str] = "tool_call_security"  # weighted security-analysis tag
     loss_calc_tag_tool_call_security_weight: float = 2.0  # loss weight for tool_call_security content
     loss_calc_tag_think: Optional[str] = "think"  # weighted think block
-    loss_calc_tag_think_weight: float = 1.0  # loss weight for think content
+    loss_calc_tag_think_weight: float = 0.0  # loss weight for think content (0 = no CE loss)
     loss_calc_tag_tool_call: Optional[str] = "tool_call"  # weighted tool-call JSON block
     loss_calc_tag_tool_call_weight: float = 1.0  # loss weight for tool_call content
     cutoff_len: int = 16384
@@ -137,6 +138,12 @@ class TrainingConfig:
 
     # Qwen3-specific thinking mode
     enable_thinking: bool = True
+
+    # KL anchoring against the frozen base weights inside the LoRA model.
+    # disable_adapter() is used during training to obtain reference logits, so no
+    # separate reference model is loaded.
+    kl_anchoring_enabled: bool = False
+    kl_anchoring_alpha: float = 0.2
 
     # Optional external config file (YAML or JSON)
     config_file: Optional[str] = None
@@ -426,19 +433,22 @@ def _mask_labels_for_assistant_turns(
     loss_calc_tag_tool_call: Optional[str] = None,
     loss_calc_tag_tool_call_weight: float = 1.0,
     enable_thinking: bool = True,
-) -> Tuple[List[int], List[float], bool]:
+) -> Tuple[List[int], List[float], List[float], bool]:
     """
     Mask assistant turn tokens for supervised fine-tuning.
 
-    Every assistant turn is trained. Tokens outside the configured XML tags receive
-    ``loss_calc_default_weight`` (default 1.0). Tokens inside the configured tags
-    ``<tool_call_security>...</tool_call_security>``, ``<think>...</think>`` and
-    ``<tool_call>...</tool_call>`` are trained with their respective weights,
-    including the opening and closing XML tags themselves. When no XML tags are
-    configured, the whole assistant turn content is trained with the default weight.
+    Tokens outside the configured XML tags receive ``loss_calc_default_weight``.
+    Tokens inside ``<tool_call_security>...</tool_call_security>``,
+    ``<think>...</think>`` and ``<tool_call>...</tool_call>`` are trained with their
+    respective weights, including the opening and closing XML tags themselves.
 
-    The function returns the label list, a per-token loss weight list, and a flag
-    indicating whether at least one assistant token was trained.
+    The returned ``kl_weight`` is derived directly from ``loss_weight``: KL anchoring
+    is applied exactly where CE loss is disabled (``loss_weight == 0.0``), so the two
+    objectives are mutually exclusive at the token level.
+
+    The function returns the label list, the per-token CE loss weight list, the
+    per-token KL anchor weight list, and a flag indicating whether at least one
+    assistant token was trained.
     """
     labels = [-100] * len(input_ids)
     loss_weight = [0.0] * len(input_ids)
@@ -486,16 +496,6 @@ def _mask_labels_for_assistant_turns(
             messages, turn_idx, tokenizer, full_text, enable_thinking
         )
 
-        if not tag_configs:
-            # No XML tags configured: train the whole assistant turn with the
-            # default weight.
-            if _mask_char_span(
-                input_ids, labels, loss_weight, full_text,
-                region_start, region_end, tokenizer, loss_calc_default_weight,
-            ):
-                masked_any = True
-            continue
-
         # Train the entire assistant turn with the default weight first; special
         # tag regions will be overridden with their specific weights afterwards.
         turn_masked = _mask_char_span(
@@ -532,7 +532,14 @@ def _mask_labels_for_assistant_turns(
         labels[-1] = input_ids[-1]
         loss_weight[-1] = 1.0
 
-    return labels, loss_weight, masked_any
+    # KL anchoring is mutually exclusive with CE loss: only assistant-turn tokens
+    # that do not contribute to CE loss are anchored to the base model.
+    kl_weight = [
+        1.0 if (label != -100 and w == 0.0) else 0.0
+        for label, w in zip(labels, loss_weight)
+    ]
+
+    return labels, loss_weight, kl_weight, masked_any
 
 
 def build_whole_conversation_sample(
@@ -552,7 +559,7 @@ def build_whole_conversation_sample(
     result = _apply_chat_template_with_fallback(tokenizer, messages, enable_thinking)
     input_ids = result["input_ids"]
 
-    labels, loss_weight, _ = _mask_labels_for_assistant_turns(
+    labels, loss_weight, kl_weight, _ = _mask_labels_for_assistant_turns(
         input_ids,
         messages,
         tokenizer,
@@ -571,12 +578,14 @@ def build_whole_conversation_sample(
         input_ids = input_ids[-cutoff_len:]
         labels = labels[-cutoff_len:]
         loss_weight = loss_weight[-cutoff_len:]
+        kl_weight = kl_weight[-cutoff_len:]
 
     return {
         "input_ids": input_ids,
         "labels": labels,
         "attention_mask": [1] * len(input_ids),
         "loss_weight": loss_weight,
+        "kl_weight": kl_weight,
     }
 
 
@@ -602,7 +611,7 @@ def build_turn_by_turn_samples(
         result = _apply_chat_template_with_fallback(tokenizer, prefix_messages, enable_thinking)
         input_ids = result["input_ids"]
 
-        labels, loss_weight, masked_any = _mask_labels_for_assistant_turns(
+        labels, loss_weight, kl_weight, masked_any = _mask_labels_for_assistant_turns(
             input_ids,
             prefix_messages,
             tokenizer,
@@ -625,12 +634,14 @@ def build_turn_by_turn_samples(
             input_ids = input_ids[-cutoff_len:]
             labels = labels[-cutoff_len:]
             loss_weight = loss_weight[-cutoff_len:]
+            kl_weight = kl_weight[-cutoff_len:]
 
         samples.append({
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": [1] * len(input_ids),
             "loss_weight": loss_weight,
+            "kl_weight": kl_weight,
         })
 
     return samples
@@ -647,7 +658,7 @@ def make_preprocess_function(
     msg_column = dataset_info.get("columns", {}).get("messages", "conversations")
 
     def preprocess(examples: Dict[str, List[Any]]) -> Dict[str, List[List[int]]]:
-        input_ids, labels, attention_mask, loss_weight = [], [], [], []
+        input_ids, labels, attention_mask, loss_weight, kl_weight = [], [], [], [], []
 
         for conversation in examples.get(msg_column, []):
             # Some datasets may already use the canonical keys.
@@ -691,12 +702,14 @@ def make_preprocess_function(
                 labels.append(sample["labels"])
                 attention_mask.append(sample["attention_mask"])
                 loss_weight.append(sample["loss_weight"])
+                kl_weight.append(sample["kl_weight"])
 
         return {
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": attention_mask,
             "loss_weight": loss_weight,
+            "kl_weight": kl_weight,
         }
 
     return preprocess
@@ -755,6 +768,7 @@ def _tokenization_fingerprint(config: TrainingConfig, tokenizer: Any, split: str
         "loss_calc_tag_tool_call": config.loss_calc_tag_tool_call,
         "loss_calc_tag_tool_call_weight": config.loss_calc_tag_tool_call_weight,
         "enable_thinking": config.enable_thinking,
+        "kl_anchoring_enabled": config.kl_anchoring_enabled,
         "max_samples": config.max_samples,
         "eval_data_ratio": config.eval_data_ratio,
         "shuffle_seed": config.shuffle_seed,
@@ -1126,21 +1140,24 @@ class EvaluateAfterSaveCallback(_BaseCallback):
 
 class WeightedDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     """
-    Pad ``loss_weight`` alongside the standard seq2seq fields.
+    Pad ``loss_weight`` and ``kl_weight`` alongside the standard seq2seq fields.
 
-    The parent collator does not know how to pad a float weight array, so we
-    remove ``loss_weight`` before padding, let the parent collator handle the
-    remaining fields, then pad the weights ourselves with zeros (masked tokens).
+    The parent collator does not know how to pad float weight arrays, so we
+    remove them before padding, let the parent collator handle the remaining
+    fields, then pad the weights ourselves with zeros (masked tokens).
     """
 
     def torch_call(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         weights = [f.pop("loss_weight", None) for f in features]
+        kl_weights = [f.pop("kl_weight", None) for f in features]
         try:
             batch = super().torch_call(features)
         finally:
-            for feature, weight in zip(features, weights):
+            for feature, weight, kl_weight in zip(features, weights, kl_weights):
                 if weight is not None:
                     feature["loss_weight"] = weight
+                if kl_weight is not None:
+                    feature["kl_weight"] = kl_weight
 
         if weights[0] is not None:
             import torch
@@ -1156,12 +1173,27 @@ class WeightedDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 padded_weights.append(weight_list)
             batch["loss_weight"] = torch.tensor(padded_weights, dtype=torch.float32)
 
+        if kl_weights[0] is not None:
+            import torch
+
+            max_length = batch["input_ids"].shape[1]
+            padded_kl_weights = []
+            for kl_weight in kl_weights:
+                kl_list = list(kl_weight)
+                if len(kl_list) < max_length:
+                    kl_list.extend([0.0] * (max_length - len(kl_list)))
+                else:
+                    kl_list = kl_list[:max_length]
+                padded_kl_weights.append(kl_list)
+            batch["kl_weight"] = torch.tensor(padded_kl_weights, dtype=torch.float32)
+
         return batch
 
 
 class WeightedLossTrainer(Trainer):
     """
-    Trainer that computes a per-token weighted cross-entropy loss.
+    Trainer that computes a per-token weighted cross-entropy loss with optional
+    KL anchoring against the frozen base weights.
 
     Every assistant turn contributes to the loss. Tokens outside the configured XML
     tags use ``loss_calc_default_weight``, while tokens inside
@@ -1170,7 +1202,18 @@ class WeightedLossTrainer(Trainer):
     configured weights, including the opening and closing XML tags themselves. This
     lets the security reasoning tokens receive a higher gradient emphasis than the
     raw tool-call JSON and the rest of the assistant content.
+
+    When KL anchoring is enabled, tokens whose CE loss weight is zero (i.e. assistant
+    content outside ``<tool_call_security>`` and ``<tool_call>``) are anchored to the
+    base model via ``KL(current || reference)``. The reference logits are obtained by
+    disabling the LoRA adapter on the same model, so no separate reference model is
+    loaded.
     """
+
+    def __init__(self, kl_alpha: float = 1.0, kl_anchoring_enabled: bool = False, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.kl_alpha = kl_alpha
+        self.kl_anchoring_enabled = kl_anchoring_enabled
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs: Any):
         import torch
@@ -1181,6 +1224,7 @@ class WeightedLossTrainer(Trainer):
 
         labels = inputs.pop("labels")
         loss_weight = inputs.pop("loss_weight")
+        kl_weight = inputs.pop("kl_weight", None)
 
         outputs = model(**inputs)
         logits = outputs.logits
@@ -1213,7 +1257,39 @@ class WeightedLossTrainer(Trainer):
 
         # Normalize by the sum of weights so the returned loss is a weighted average
         # per-token cross-entropy, on the same scale as the model's default loss.
-        loss = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
+        ce_loss = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
+        loss = ce_loss
+
+        # KL anchoring: keep <think>, <tool_call> and ordinary assistant content
+        # close to the frozen base model distribution. The reference logits come from
+        # the same model with the LoRA adapter disabled.
+        kl_loss = None
+        if self.kl_anchoring_enabled and kl_weight is not None and model.training:
+            shift_kl_weight = kl_weight[..., 1:].contiguous()
+            kl_mask = shift_kl_weight > 0
+            if kl_mask.any():
+                unwrapped = self.accelerator.unwrap_model(model)
+                if not hasattr(unwrapped, "disable_adapter"):
+                    raise RuntimeError(
+                        "KL anchoring requires a PEFT model with disable_adapter(). "
+                        "Make sure finetuning_type is lora."
+                    )
+                with torch.no_grad(), unwrapped.disable_adapter():
+                    ref_outputs = unwrapped(**inputs)
+                ref_shift_logits = ref_outputs.logits[..., :-1, :].contiguous()
+
+                # Cast to float32 for stable log-softmax / KL computation.
+                log_p = F.log_softmax(shift_logits[kl_mask].float(), dim=-1)
+                log_p_ref = F.log_softmax(ref_shift_logits[kl_mask].float(), dim=-1)
+
+                # KL(current || reference) = sum_v p_current(v) * log(p_current(v) / p_ref(v))
+                kl_per_token = (log_p.exp() * (log_p - log_p_ref)).sum(dim=-1)
+
+                kl_weighted_sum = (kl_per_token * shift_kl_weight[kl_mask]).sum()
+                kl_weight_sum = shift_kl_weight[kl_mask].sum()
+                kl_loss = kl_weighted_sum / kl_weight_sum if kl_weight_sum > 0 else kl_weighted_sum
+
+                loss = loss + self.kl_alpha * kl_loss
 
         # Newer transformers versions pass num_items_in_batch and skip the division
         # by gradient_accumulation_steps in training_step. If we do not divide here,
@@ -1223,6 +1299,12 @@ class WeightedLossTrainer(Trainer):
             loss = loss / self.args.gradient_accumulation_steps
 
         outputs.loss = loss
+
+        # Log CE and KL separately so alpha tuning can be monitored.
+        if model.training:
+            self.log("ce_loss", ce_loss.detach())
+            self.log("kl_loss", kl_loss.detach() if kl_loss is not None else torch.tensor(0.0, device=loss.device))
+
         return (loss, outputs) if return_outputs else loss
 
 
@@ -1373,6 +1455,12 @@ def main() -> None:
     else:
         raise ValueError(f"Unsupported finetuning_type: {config.finetuning_type}")
 
+    if config.kl_anchoring_enabled:
+        logger.info(
+            "KL anchoring enabled (alpha=%.3f); reference logits obtained via disable_adapter()",
+            config.kl_anchoring_alpha,
+        )
+
     # Build training arguments before loading datasets so tokenization can run on
     # the main process first (other ranks reuse the datasets cache).
     training_args = build_training_arguments(config)
@@ -1414,6 +1502,8 @@ def main() -> None:
 
     trainer = WeightedLossTrainer(
         model=model,
+        kl_alpha=config.kl_anchoring_alpha,
+        kl_anchoring_enabled=config.kl_anchoring_enabled,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
