@@ -70,7 +70,7 @@ eval_data_ratio: 0.05
 # ---------------------------------------------------------------------------
 stage: sft
 do_train: true
-output_dir: /home/qiangyu/Models/FineTune/Qwen/train_20260704
+output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260705
 overwrite_output_dir: false
 resume_from_checkpoint: null  # e.g. /path/to/output_dir/checkpoint-100
 seed: 42
