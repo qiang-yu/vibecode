@@ -1,5 +1,5 @@
 ###
-# lora-8b.py
+# lora-ce-kl-8b.py
 #
 # A standalone LoRA fine-tuning script for causal language models such as
 # Qwen3, Llama, and Mistral. It reproduces the behavior of the original
@@ -128,7 +128,7 @@ class TrainingConfig:
     include_num_input_tokens_seen: bool = True
 
     # Distributed training
-    # GPU selection is controlled by CUDA_VISIBLE_DEVICES in run_lora.sh.
+    # GPU selection is controlled by CUDA_VISIBLE_DEVICES in run-lora-ce-kl-8b.sh.
     ddp_timeout: int = 180000000
     deepspeed_config: Optional[str] = "ds_z2_config.json"
     local_rank: int = -1  # automatically populated by torchrun/DeepSpeed
@@ -1312,10 +1312,25 @@ class WeightedLossTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs: Dict[str, float], start_step: bool = False) -> None:
-        """Inject averaged CE/KL into the default training loss log."""
+        """Inject globally averaged CE/KL into the default training loss log."""
         if "loss" in logs and self._accum_count > 0:
-            logs["ce_loss"] = self._ce_loss_sum / self._accum_count
-            logs["kl_loss"] = self._kl_loss_sum / self._accum_count
+            import torch
+            import torch.distributed as dist
+
+            ce = self._ce_loss_sum / self._accum_count
+            kl = self._kl_loss_sum / self._accum_count
+
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                ce_tensor = torch.tensor(ce, device=device)
+                kl_tensor = torch.tensor(kl, device=device)
+                dist.all_reduce(ce_tensor, op=dist.ReduceOp.AVG)
+                dist.all_reduce(kl_tensor, op=dist.ReduceOp.AVG)
+                ce = ce_tensor.item()
+                kl = kl_tensor.item()
+
+            logs["ce_loss"] = ce
+            logs["kl_loss"] = kl
             self._ce_loss_sum = 0.0
             self._kl_loss_sum = 0.0
             self._accum_count = 0
@@ -1377,7 +1392,7 @@ def main() -> None:
     """Run the full LoRA SFT pipeline."""
     config = parse_args()
 
-    # GPU selection is handled entirely by CUDA_VISIBLE_DEVICES (see run_lora.sh).
+    # GPU selection is handled entirely by CUDA_VISIBLE_DEVICES (see run-lora-ce-kl-8b.sh).
     # Under torchrun/deepspeed each process is pinned to a single GPU via
     # LOCAL_RANK, so nothing to set here.
     world_size = int(os.environ.get("WORLD_SIZE", 1))

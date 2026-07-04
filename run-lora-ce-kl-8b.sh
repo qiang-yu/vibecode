@@ -3,7 +3,7 @@
 # Launch multi-GPU LoRA SFT with torchrun (one process per GPU).
 #
 # DeepSpeed / multi-GPU training REQUIRES a distributed launcher. Running
-# "python lora-8b.py" directly on several visible GPUs falls back to
+# "python lora-ce-kl-8b.py" directly on several visible GPUs falls back to
 # nn.DataParallel, which conflicts with DeepSpeed and fails with device errors.
 #
 # CUDA_VISIBLE_DEVICES selects the physical GPUs; --nproc_per_node must equal the
@@ -14,7 +14,7 @@
 ###
 
 # Physical GPUs to use (must match nproc_per_node below).
-export CUDA_VISIBLE_DEVICES=1,3,6,7
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 # Number of processes = number of GPUs above.
 NPROC=4
@@ -33,6 +33,6 @@ export NCCL_DEBUG=INFO           # set to INFO for verbose NCCL diagnostics, def
 torchrun \
     --nproc_per_node=${NPROC} \
     --master_port=29500 \
-    lora-8b.py \
+    lora-ce-kl-8b.py \
     --config_file config.yaml \
     --per_device_max_memory_gb 78.0

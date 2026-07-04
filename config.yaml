@@ -1,7 +1,7 @@
-# Configuration for lora-8b.py
+# Configuration for lora-ce-kl-8b.py
 # This file mirrors the original LlamaFactory command used to fine-tune Qwen3-8B.
 # All values can be overridden on the command line, e.g.:
-#   python lora-8b.py --config_file config.yaml --learning_rate 1e-5
+#   python lora-ce-kl-8b.py --config_file config.yaml --learning_rate 1e-5
 
 # ---------------------------------------------------------------------------
 # Model
@@ -109,7 +109,7 @@ include_num_input_tokens_seen: true
 # ---------------------------------------------------------------------------
 # Distributed training
 # ---------------------------------------------------------------------------
-# GPU selection is controlled ENTIRELY by CUDA_VISIBLE_DEVICES in run_lora.sh.
+# GPU selection is controlled ENTIRELY by CUDA_VISIBLE_DEVICES in run-lora-ce-kl-8b.sh.
 ddp_timeout: 180000000
 deepspeed_config: ds_z2_config.json
 
