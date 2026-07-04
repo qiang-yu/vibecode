@@ -1214,6 +1214,9 @@ class WeightedLossTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.kl_alpha = kl_alpha
         self.kl_anchoring_enabled = kl_anchoring_enabled
+        self._ce_loss_sum = 0.0
+        self._kl_loss_sum = 0.0
+        self._accum_count = 0
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs: Any):
         import torch
@@ -1300,12 +1303,23 @@ class WeightedLossTrainer(Trainer):
 
         outputs.loss = loss
 
-        # Log CE and KL separately so alpha tuning can be monitored.
+        # Accumulate CE/KL for the next logging event.
         if model.training:
-            self.log("ce_loss", ce_loss.detach())
-            self.log("kl_loss", kl_loss.detach() if kl_loss is not None else torch.tensor(0.0, device=loss.device))
+            self._ce_loss_sum += ce_loss.detach().item()
+            self._kl_loss_sum += kl_loss.detach().item() if kl_loss is not None else 0.0
+            self._accum_count += 1
 
         return (loss, outputs) if return_outputs else loss
+
+    def log(self, logs: Dict[str, float], start_step: bool = False) -> None:
+        """Inject averaged CE/KL into the default training loss log."""
+        if "loss" in logs and self._accum_count > 0:
+            logs["ce_loss"] = self._ce_loss_sum / self._accum_count
+            logs["kl_loss"] = self._kl_loss_sum / self._accum_count
+            self._ce_loss_sum = 0.0
+            self._kl_loss_sum = 0.0
+            self._accum_count = 0
+        super().log(logs, start_step)
 
 
 def build_training_arguments(config: TrainingConfig) -> Any:
