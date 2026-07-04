@@ -128,7 +128,7 @@ class TrainingConfig:
     include_num_input_tokens_seen: bool = True
 
     # Distributed training
-    # GPU selection is controlled by CUDA_VISIBLE_DEVICES in run-lora-ce-kl-8b.sh.
+    # GPU selection is controlled by CUDA_VISIBLE_DEVICES in lora-ce-kl-8b-run.sh.
     ddp_timeout: int = 180000000
     deepspeed_config: Optional[str] = "ds_z2_config.json"
     local_rank: int = -1  # automatically populated by torchrun/DeepSpeed
@@ -1392,7 +1392,7 @@ def main() -> None:
     """Run the full LoRA SFT pipeline."""
     config = parse_args()
 
-    # GPU selection is handled entirely by CUDA_VISIBLE_DEVICES (see run-lora-ce-kl-8b.sh).
+    # GPU selection is handled entirely by CUDA_VISIBLE_DEVICES (see lora-ce-kl-8b-run.sh).
     # Under torchrun/deepspeed each process is pinned to a single GPU via
     # LOCAL_RANK, so nothing to set here.
     world_size = int(os.environ.get("WORLD_SIZE", 1))

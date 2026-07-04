@@ -10,7 +10,7 @@
 # number of GPUs listed. The script detects the launcher and will NOT override
 # CUDA_VISIBLE_DEVICES, so each process is correctly pinned to one GPU. This is
 # the ONLY place that decides which GPUs are used; the visible_gpus value in
-# config.yaml is a fallback that only applies to a plain single-process run.
+# lora-ce-kl-8b-config.yaml is a fallback that only applies to a plain single-process run.
 ###
 
 # Physical GPUs to use (must match nproc_per_node below).
@@ -34,5 +34,5 @@ torchrun \
     --nproc_per_node=${NPROC} \
     --master_port=29500 \
     lora-ce-kl-8b.py \
-    --config_file config.yaml \
+    --config_file lora-ce-kl-8b-config.yaml \
     --per_device_max_memory_gb 78.0
