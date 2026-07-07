@@ -69,7 +69,6 @@ class TrainingConfig:
     dataset_dir: str = "/home/qiangyu/Models/FineTune/Data"
     dataset_info_path: str = "/home/qiangyu/Models/FineTune/Data/dataset_info.json"
     datasets: List[str] = field(default_factory=lambda: ["no_inject_data", "simple_inject_data"])
-    conversation_mode: str = "turn_by_turn"  # turn_by_turn | whole
     role_tag: str = "from"
     content_tag: str = "value"
     user_tag: str = "human"
@@ -77,13 +76,14 @@ class TrainingConfig:
     system_tag: str = "system"
     observation_tag: str = "tool"
     tool_role_in_template: str = "tool"  # tool | user; used when the chat template lacks a tool role
-    loss_calc_default_weight: float = 0.0  # loss weight for assistant content outside special tags (0 = no CE loss)
-    loss_calc_tag_tool_call_security: Optional[str] = "tool_call_security"  # weighted security-analysis tag
-    loss_calc_tag_tool_call_security_weight: float = 2.0  # loss weight for tool_call_security content
-    loss_calc_tag_think: Optional[str] = "think"  # weighted think block
-    loss_calc_tag_think_weight: float = 0.0  # loss weight for think content (0 = no CE loss)
-    loss_calc_tag_tool_call: Optional[str] = "tool_call"  # weighted tool-call JSON block
-    loss_calc_tag_tool_call_weight: float = 1.0  # loss weight for tool_call content
+    loss_calc_ce_default_with_security_weight: float = 1.0  # default CE weight for untagged assistant content in security turns
+    loss_calc_ce_tool_call_security_tag: Optional[str] = "tool_call_security"  # weighted security-analysis tag
+    loss_calc_ce_tool_call_security_with_security_weight: float = 2.0  # loss weight for tool_call_security content
+    loss_calc_ce_think_with_security_tag: Optional[str] = "think"  # weighted think block
+    loss_calc_ce_think_with_security_weight: float = 1.0  # loss weight for think content in turns with tool_call_security
+    loss_calc_ce_tool_call_with_security_tag: Optional[str] = "tool_call"  # weighted tool-call JSON block
+    loss_calc_ce_tool_call_with_security_weight: float = 1.0  # loss weight for tool_call content in turns with tool_call_security
+    loss_calc_ce_default_without_security_weight: float = 1.0  # uniform loss weight for all assistant tokens in turns without tool_call_security
     cutoff_len: int = 16384
     max_samples: Optional[int] = 100000
     preprocessing_num_workers: int = 16
@@ -95,7 +95,6 @@ class TrainingConfig:
     do_train: bool = True
     output_dir: str = "/home/qiangyu/Models/FineTune/Qwen/train_20260630"
     overwrite_output_dir: bool = False
-    resume_from_checkpoint: Optional[str] = None  # e.g. output_dir/checkpoint-100
     seed: int = 42
     num_train_epochs: float = 6.0
     per_device_train_batch_size: int = 1
@@ -142,8 +141,11 @@ class TrainingConfig:
     # KL anchoring against the frozen base weights inside the LoRA model.
     # disable_adapter() is used during training to obtain reference logits, so no
     # separate reference model is loaded.
-    kl_anchoring_enabled: bool = False
-    kl_anchoring_alpha: float = 0.2
+    loss_calc_kl_enabled: bool = False
+    loss_calc_kl_alpha: float = 0.2
+    loss_calc_kl_think_with_security_alpha: float = 0.1  # KL coefficient for <think> in security turns when enabled
+    loss_calc_kl_enable_without_security: bool = False  # enable KL for assistant turns without tool_call_security
+    loss_calc_kl_enable_with_security: bool = False  # enable KL for assistant turns that contain tool_call_security (background + think, excluding tool_call blocks)
 
     # Optional external config file (YAML or JSON)
     config_file: Optional[str] = None
@@ -292,79 +294,217 @@ def set_per_device_memory_fraction(max_memory_gb: Optional[float], local_rank: i
 # Dataset helpers
 # ---------------------------------------------------------------------------
 
-def _apply_ct_ids(
-    tokenizer: Any,
-    messages: List[Dict[str, str]],
-    enable_thinking: bool,
-    add_generation_prompt: bool,
-) -> List[int]:
-    """Tokenize messages with the chat template, tolerating enable_thinking absence."""
-    kwargs = {"tokenize": True, "add_generation_prompt": add_generation_prompt}
-    if enable_thinking:
-        try:
-            return tokenizer.apply_chat_template(messages, enable_thinking=True, **kwargs)
-        except TypeError:
-            pass  # Tokenizer does not accept enable_thinking.
-    return tokenizer.apply_chat_template(messages, **kwargs)
+def _build_whitespace_flexible_pattern(text: str) -> str:
+    """Build a regex pattern that matches ``text`` but treats whitespace as flexible."""
+    parts = []
+    for char in text:
+        if char.isspace():
+            if not parts or parts[-1] != r"\s+":
+                parts.append(r"\s+")
+        else:
+            parts.append(re.escape(char))
+    return "".join(parts)
 
 
-def _turn_char_span(
-    messages: List[Dict[str, str]],
-    target_idx: int,
-    tokenizer: Any,
-    full_text: str,
-    enable_thinking: bool,
-) -> Tuple[int, int]:
+def _find_content_span_flexible(
+    text: str,
+    content: str,
+    search_start: int = 0,
+) -> Optional[Tuple[int, int]]:
+    """Find ``content`` in ``text`` allowing whitespace differences. Return (start, end) or None."""
+    if not content:
+        return None
+    pattern = _build_whitespace_flexible_pattern(content)
+    match = re.search(pattern, text[search_start:])
+    if match:
+        return match.start() + search_start, match.end() + search_start
+    return None
+
+
+def _find_content_span_whitespace_robust(
+    text: str,
+    content: str,
+    search_start: int = 0,
+) -> Optional[Tuple[int, int]]:
     """
-    Return the [start, end) character span of ``target_idx``'s content in full_text.
+    Find ``content`` in ``text`` ignoring all whitespace differences.
 
-    The start is the decoded length of everything before the target turn (with the
-    assistant header opened), and the end is the decoded length up to and including
-    the target turn. This bounds tag searches to a single assistant turn so that
-    only that turn's tokens are trained.
+    Returns the character span in the *original* ``text``.
     """
-    head_ids = _apply_ct_ids(tokenizer, messages[:target_idx], enable_thinking, add_generation_prompt=True)
-    head_text = tokenizer.decode(head_ids, skip_special_tokens=False)
-    region_start = len(head_text)
+    if not content:
+        return None
 
-    upto_ids = _apply_ct_ids(tokenizer, messages[:target_idx + 1], enable_thinking, add_generation_prompt=False)
-    upto_text = tokenizer.decode(upto_ids, skip_special_tokens=False)
-    region_end = len(upto_text)
+    def normalize_with_map(s: str) -> Tuple[str, List[int]]:
+        norm_chars = []
+        index_map = []
+        for i, char in enumerate(s):
+            if not char.isspace():
+                norm_chars.append(char)
+                index_map.append(i)
+        return "".join(norm_chars), index_map
 
-    full_len = len(full_text)
-    region_start = max(0, min(region_start, full_len))
-    region_end = max(region_start, min(region_end, full_len))
-    return region_start, region_end
+    norm_full, full_map = normalize_with_map(text[search_start:])
+    norm_content, _ = normalize_with_map(content)
+
+    pos = norm_full.find(norm_content)
+    if pos == -1:
+        return None
+
+    # Map back to original character positions.
+    orig_start = full_map[pos] + search_start
+    orig_end = full_map[pos + len(norm_content) - 1] + 1 + search_start
+    return orig_start, orig_end
 
 
-def _mask_char_span(
+def _find_assistant_content_spans(
     input_ids: List[int],
-    labels: List[int],
-    loss_weight: List[float],
-    full_text: str,
+    messages: List[Dict[str, str]],
+    tokenizer: Any,
+    tag_patterns: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[int, int, int]]:
+    """
+    Return a list of (turn_idx, tok_start, tok_end) for every assistant turn.
+
+    The span is derived by searching for the assistant's raw ``content`` string
+    inside the decoded ``full_text`` and converting the character span back to a
+    token span. This avoids both chat-template prefix-stability problems and
+    BPE-context tokenization mismatches (the same string can tokenize differently
+    in isolation vs. inside a longer sequence).
+
+    The returned span covers only the assistant's content (not the assistant
+    header added by the chat template). If a content sequence cannot be found,
+    ``tok_start`` and ``tok_end`` are both -1.
+    """
+    full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
+    assistant_indices = [i for i, msg in enumerate(messages) if msg["role"] == "assistant"]
+    spans: List[Tuple[int, int, int]] = []
+    search_start = 0
+    logger = logging.getLogger(__name__)
+
+    for turn_idx in assistant_indices:
+        content = messages[turn_idx]["content"]
+        if not content:
+            spans.append((turn_idx, -1, -1))
+            continue
+
+        char_start = -1
+        char_end = -1
+
+        # Attempt 1: exact substring match.
+        char_start = full_text.find(content, search_start)
+        if char_start != -1:
+            char_end = char_start + len(content)
+
+        # Attempt 2: exact match from beginning (handles overlapping content).
+        if char_start == -1:
+            char_start = full_text.find(content, 0)
+            if char_start != -1:
+                char_end = char_start + len(content)
+
+        # Attempt 3: whitespace-robust match. Chat templates often insert or remove
+        # blank lines between XML tags (e.g. </think>\n\n<tool_call_security> vs
+        # </think><tool_call_security>), so exact matching fails even though the
+        # content is otherwise preserved.
+        if char_start == -1:
+            robust_span = _find_content_span_whitespace_robust(full_text, content, search_start)
+            if robust_span is None:
+                robust_span = _find_content_span_whitespace_robust(full_text, content, 0)
+            if robust_span is not None:
+                char_start, char_end = robust_span
+
+        # Attempt 4: regex-based whitespace-flexible match as a safety net.
+        if char_start == -1:
+            flex_span = _find_content_span_flexible(full_text, content, search_start)
+            if flex_span is None:
+                flex_span = _find_content_span_flexible(full_text, content, 0)
+            if flex_span is not None:
+                char_start, char_end = flex_span
+
+        # Attempt 5: Qwen3's chat template extracts the text inside
+        # <think>...</think> as reasoning_content. For assistant turns before the
+        # final user query it outputs only the text after </think> (with leading
+        # newlines stripped), so the raw content can never be found verbatim. Match
+        # the post-think text instead.
+        if char_start == -1 and "</think>" in content:
+            no_think = content.split("</think>")[-1].lstrip("\n")
+            if no_think:
+                for start_pos in (search_start, 0):
+                    no_think_start = full_text.find(no_think, start_pos)
+                    if no_think_start != -1:
+                        char_start, char_end = no_think_start, no_think_start + len(no_think)
+                        break
+
+        # Attempt 6: whitespace-robust match on the post-think text. Chat templates
+        # may collapse or insert blank lines between XML tags, so exact matching of
+        # the stripped text can still fail even though the characters are present.
+        if char_start == -1 and "</think>" in content:
+            no_think = content.split("</think>")[-1].lstrip("\n")
+            if no_think:
+                for start_pos in (search_start, 0):
+                    robust_span = _find_content_span_whitespace_robust(full_text, no_think, start_pos)
+                    if robust_span is not None:
+                        char_start, char_end = robust_span
+                        break
+
+        # Attempt 7: search for any configured XML tag block in the content after
+        # the previous turn. This is a last-resort anchor for security turns where
+        # <tool_call_security> is likely preserved even if the surrounding text was
+        # rewritten.
+        if char_start == -1 and tag_patterns is not None:
+            best_start = -1
+            best_end = -1
+            for pattern in tag_patterns.values():
+                for match in pattern.finditer(full_text, search_start):
+                    if best_start == -1 or match.start() < best_start:
+                        best_start, best_end = match.start(), match.end()
+            if best_start != -1:
+                char_start, char_end = best_start, best_end
+
+        if char_start == -1:
+            logger.warning(
+                "Assistant turn %d: content (len=%d chars) not found in decoded "
+                "conversation; this turn will be skipped.",
+                turn_idx, len(content),
+            )
+            spans.append((turn_idx, -1, -1))
+            continue
+
+        # Convert character offsets to token offsets by re-encoding prefixes.
+        prefix_ids = tokenizer.encode(full_text[:char_start], add_special_tokens=False)
+        end_ids = tokenizer.encode(full_text[:char_end], add_special_tokens=False)
+        tok_start = len(prefix_ids)
+        tok_end = min(len(end_ids), len(input_ids))
+
+        spans.append((turn_idx, tok_start, tok_end))
+        search_start = char_end
+
+    return spans
+
+
+def _decode_turn_text(
+    input_ids: List[int],
+    tok_start: int,
+    tok_end: int,
+    tokenizer: Any,
+) -> str:
+    """Decode a token span back to text for tag searching."""
+    if tok_start < 0 or tok_end <= tok_start:
+        return ""
+    return tokenizer.decode(input_ids[tok_start:tok_end], skip_special_tokens=False)
+
+
+def _turn_text_char_span_to_token_span(
+    turn_text: str,
     char_start: int,
     char_end: int,
     tokenizer: Any,
-    weight: float,
-) -> bool:
-    """
-    Mask the tokens that cover ``full_text[char_start:char_end]`` and assign a
-    per-token loss weight.
-
-    Prefix-length matching converts character offsets to token offsets. Because
-    ``full_text`` is produced by decoding ``input_ids``, re-encoding a prefix of it
-    yields exactly the token count up to that character, even when BPE merges
-    characters across tag boundaries (e.g. ``><`` becoming one token).
-    """
-    prefix_ids = tokenizer.encode(full_text[:char_start], add_special_tokens=False)
-    end_ids = tokenizer.encode(full_text[:char_end], add_special_tokens=False)
-    start = len(prefix_ids)
-    end = min(len(end_ids), len(input_ids))
-    if start < end:
-        labels[start:end] = input_ids[start:end]
-        loss_weight[start:end] = [weight] * (end - start)
-        return True
-    return False
+) -> Tuple[int, int]:
+    """Convert a character span inside ``turn_text`` to a token span inside ``turn_text``."""
+    if char_start < 0 or char_end <= char_start:
+        return 0, 0
+    prefix_ids = tokenizer.encode(turn_text[:char_start], add_special_tokens=False)
+    end_ids = tokenizer.encode(turn_text[:char_end], add_special_tokens=False)
+    return len(prefix_ids), len(end_ids)
 
 
 def format_messages(
@@ -425,29 +565,53 @@ def _mask_labels_for_assistant_turns(
     messages: List[Dict[str, str]],
     tokenizer: Any,
     allowed_turn_indices: Optional[List[int]] = None,
-    loss_calc_default_weight: float = 1.0,
-    loss_calc_tag_tool_call_security: Optional[str] = None,
-    loss_calc_tag_tool_call_security_weight: float = 1.0,
-    loss_calc_tag_think: Optional[str] = None,
-    loss_calc_tag_think_weight: float = 1.0,
-    loss_calc_tag_tool_call: Optional[str] = None,
-    loss_calc_tag_tool_call_weight: float = 1.0,
+    loss_calc_ce_default_with_security_weight: float = 1.0,
+    loss_calc_ce_default_without_security_weight: float = 1.0,
+    loss_calc_ce_tool_call_security_tag: Optional[str] = None,
+    loss_calc_ce_tool_call_security_with_security_weight: float = 1.0,
+    loss_calc_ce_think_with_security_tag: Optional[str] = None,
+    loss_calc_ce_think_with_security_weight: float = 1.0,
+    loss_calc_ce_tool_call_with_security_tag: Optional[str] = None,
+    loss_calc_ce_tool_call_with_security_weight: float = 1.0,
+    loss_calc_kl_alpha: float = 0.2,
+    loss_calc_kl_think_with_security_alpha: float = 0.1,
+    loss_calc_kl_enable_without_security: bool = False,
+    loss_calc_kl_enable_with_security: bool = False,
     enable_thinking: bool = True,
-) -> Tuple[List[int], List[float], List[float], bool]:
+) -> Tuple[List[int], List[float], List[float], List[float], List[int], bool, bool]:
     """
     Mask assistant turn tokens for supervised fine-tuning.
 
-    Tokens outside the configured XML tags receive ``loss_calc_default_weight``.
-    Tokens inside ``<tool_call_security>...</tool_call_security>``,
-    ``<think>...</think>`` and ``<tool_call>...</tool_call>`` are trained with their
-    respective weights, including the opening and closing XML tags themselves.
+    Assistant turns are located by searching for each assistant's raw ``content``
+    string inside the decoded ``full_text`` and converting the character span back
+    to a token span. This avoids both chat-template prefix-stability problems and
+    BPE-context tokenization mismatches (the same string can tokenize differently
+    in isolation vs. inside a longer sequence). The masked span covers the
+    assistant's content (not the assistant header added by the chat template).
 
-    The returned ``kl_weight`` is derived directly from ``loss_weight``: KL anchoring
-    is applied exactly where CE loss is disabled (``loss_weight == 0.0``), so the two
-    objectives are mutually exclusive at the token level.
+    Tokens in assistant turns without ``<tool_call_security>`` receive a uniform
+    ``loss_calc_ce_default_without_security_weight``. Tokens outside the configured XML tags in
+    security turns receive ``loss_calc_ce_default_with_security_weight``. Tokens inside
+    ``<tool_call_security>...</tool_call_security>`` always use
+    ``loss_calc_ce_tool_call_security_with_security_weight``. Tokens inside
+    ``<tool_call>...</tool_call>`` and ``<think>...</think>`` use different
+    weights depending on whether the assistant turn contains a security block.
 
-    The function returns the label list, the per-token CE loss weight list, the
-    per-token KL anchor weight list, and a flag indicating whether at least one
+    KL anchoring is controlled independently of CE loss by two flags:
+
+    * ``loss_calc_kl_enable_without_security``: enables KL for all non-think
+      assistant tokens in turns that do not contain a
+      ``<tool_call_security>...</tool_call_security>`` block.
+    * ``loss_calc_kl_enable_with_security``: enables KL for assistant turns that
+      contain a ``<tool_call_security>...</tool_call_security>`` block. Inside
+      those turns, ``<think>...</think>`` receives think KL,
+      ``<tool_call_security>...</tool_call_security>`` and
+      ``<tool_call>...</tool_call>`` are excluded from KL, and all other
+      assistant tokens receive background KL.
+
+    The function returns the label list, the per-token CE loss weight list, the two
+    per-token KL weight lists, a per-token security-turn mask, a flag indicating
+    whether a security block was found, and a flag indicating whether at least one
     assistant token was trained.
     """
     labels = [-100] * len(input_ids)
@@ -455,138 +619,191 @@ def _mask_labels_for_assistant_turns(
     masked_any = False
     logger = logging.getLogger(__name__)
 
-    assistant_indices = [i for i, msg in enumerate(messages) if msg["role"] == "assistant"]
+    tag_patterns: Dict[str, Any] = {}
+    if loss_calc_ce_tool_call_security_tag is not None:
+        tag_patterns[loss_calc_ce_tool_call_security_tag] = re.compile(
+            rf"<{re.escape(loss_calc_ce_tool_call_security_tag)}>.*?</{re.escape(loss_calc_ce_tool_call_security_tag)}>", re.DOTALL
+        )
+    if loss_calc_ce_think_with_security_tag is not None:
+        tag_patterns[loss_calc_ce_think_with_security_tag] = re.compile(
+            rf"<{re.escape(loss_calc_ce_think_with_security_tag)}>.*?</{re.escape(loss_calc_ce_think_with_security_tag)}>", re.DOTALL
+        )
+    if loss_calc_ce_tool_call_with_security_tag is not None:
+        tag_patterns[loss_calc_ce_tool_call_with_security_tag] = re.compile(
+            rf"<{re.escape(loss_calc_ce_tool_call_with_security_tag)}>.*?</{re.escape(loss_calc_ce_tool_call_with_security_tag)}>", re.DOTALL
+        )
+
+    security_pattern = tag_patterns.get(loss_calc_ce_tool_call_security_tag)
+
+    # Find each assistant turn's content token span by searching for the raw
+    # content token sequence inside input_ids. This avoids all chat-template
+    # prefix-stability assumptions.
+    turn_spans = _find_assistant_content_spans(input_ids, messages, tokenizer, tag_patterns)
     if allowed_turn_indices is not None:
-        assistant_indices = [i for i in assistant_indices if i in allowed_turn_indices]
+        turn_spans = [
+            (turn_idx, tok_start, tok_end)
+            for turn_idx, tok_start, tok_end in turn_spans
+            if turn_idx in allowed_turn_indices
+        ]
 
-    # Decode the token sequence once so character offsets map cleanly back to
-    # tokens (full_text always re-tokenizes to input_ids).
-    full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
+    turn_token_spans: List[Tuple[int, int]] = []
+    turn_texts: List[str] = []
+    turn_has_security_list: List[bool] = []
+    has_security = False
+    for turn_idx, tok_start, tok_end in turn_spans:
+        turn_token_spans.append((tok_start, tok_end))
+        turn_texts.append(_decode_turn_text(input_ids, tok_start, tok_end, tokenizer))
 
-    # Build the list of configured XML tags, their weights, and compiled patterns.
-    tag_configs = []
-    if loss_calc_tag_tool_call_security is not None:
-        tag_configs.append((
-            loss_calc_tag_tool_call_security,
-            loss_calc_tag_tool_call_security_weight,
-            re.compile(
-                rf"<{re.escape(loss_calc_tag_tool_call_security)}>.*?</{re.escape(loss_calc_tag_tool_call_security)}>", re.DOTALL
-            ),
-        ))
-    if loss_calc_tag_think is not None:
-        tag_configs.append((
-            loss_calc_tag_think,
-            loss_calc_tag_think_weight,
-            re.compile(
-                rf"<{re.escape(loss_calc_tag_think)}>.*?</{re.escape(loss_calc_tag_think)}>", re.DOTALL
-            ),
-        ))
-    if loss_calc_tag_tool_call is not None:
-        tag_configs.append((
-            loss_calc_tag_tool_call,
-            loss_calc_tag_tool_call_weight,
-            re.compile(
-                rf"<{re.escape(loss_calc_tag_tool_call)}>.*?</{re.escape(loss_calc_tag_tool_call)}>", re.DOTALL
-            ),
-        ))
-
-    for turn_idx in assistant_indices:
         content = messages[turn_idx]["content"]
-        region_start, region_end = _turn_char_span(
-            messages, turn_idx, tokenizer, full_text, enable_thinking
+        turn_has_security = (
+            security_pattern is not None and security_pattern.search(content) is not None
         )
+        turn_has_security_list.append(turn_has_security)
+        if turn_has_security:
+            has_security = True
 
-        # Train the entire assistant turn with the default weight first; special
-        # tag regions will be overridden with their specific weights afterwards.
-        turn_masked = _mask_char_span(
-            input_ids, labels, loss_weight, full_text,
-            region_start, region_end, tokenizer, loss_calc_default_weight,
-        )
-        if turn_masked:
+    for turn_pos, (turn_idx, tok_start, tok_end) in enumerate(turn_spans):
+        turn_text = turn_texts[turn_pos]
+        tok_start, tok_end = turn_token_spans[turn_pos]
+        turn_has_security = turn_has_security_list[turn_pos]
+        content = messages[turn_idx]["content"]
+
+        if tok_start >= tok_end:
+            continue
+
+        if turn_has_security:
+            labels[tok_start:tok_end] = input_ids[tok_start:tok_end]
+            loss_weight[tok_start:tok_end] = [loss_calc_ce_default_with_security_weight] * (tok_end - tok_start)
             masked_any = True
 
-        found_tags = set()
-        for tag_name, weight, pattern in tag_configs:
-            tag_found = False
-            for match in pattern.finditer(full_text, region_start, region_end):
-                _mask_char_span(
-                    input_ids, labels, loss_weight, full_text,
-                    match.start(), match.end(), tokenizer, weight,
+            found_tags = set()
+            for tag_name, pattern in tag_patterns.items():
+                if tag_name == loss_calc_ce_tool_call_security_tag:
+                    weight = loss_calc_ce_tool_call_security_with_security_weight
+                elif tag_name == loss_calc_ce_think_with_security_tag:
+                    weight = loss_calc_ce_think_with_security_weight
+                elif tag_name == loss_calc_ce_tool_call_with_security_tag:
+                    weight = loss_calc_ce_tool_call_with_security_weight
+                else:
+                    continue
+
+                tag_found = False
+                for match in pattern.finditer(turn_text):
+                    rel_start, rel_end = _turn_text_char_span_to_token_span(
+                        turn_text, match.start(), match.end(), tokenizer
+                    )
+                    abs_start = tok_start + rel_start
+                    abs_end = tok_start + rel_end
+                    if abs_start < abs_end:
+                        labels[abs_start:abs_end] = input_ids[abs_start:abs_end]
+                        loss_weight[abs_start:abs_end] = [weight] * (abs_end - abs_start)
+                        tag_found = True
+                if tag_found:
+                    found_tags.add(tag_name)
+
+            for tag_name, pattern in tag_patterns.items():
+                if pattern.search(content) and tag_name not in found_tags:
+                    # When enable_thinking=True, Qwen3's chat template rewrites
+                    # <think>...</think> into special tokens, so the literal tag is
+                    # not present in the decoded text. Suppress the warning for
+                    # think tags in that mode.
+                    if tag_name == loss_calc_ce_think_with_security_tag and enable_thinking:
+                        continue
+                    logger.warning(
+                        "Assistant turn %d contains <%s> in source but it was not found "
+                        "in the tokenized text; the turn is still trained with the default weight.",
+                        turn_idx, tag_name,
+                    )
+        else:
+            labels[tok_start:tok_end] = input_ids[tok_start:tok_end]
+            loss_weight[tok_start:tok_end] = [loss_calc_ce_default_without_security_weight] * (tok_end - tok_start)
+            masked_any = True
+
+    # Some chat templates append a trailing newline (or other formatting tokens)
+    # after the EOS token, so the last sequence token is not always the EOS id.
+    # Force the EOS token inside every assistant turn to weight 1.0 so that no
+    # matter where formatting tokens land, the turn's closing EOS is trained.
+    for tok_start, tok_end in turn_token_spans:
+        for idx in range(tok_end - 1, tok_start - 1, -1):
+            if input_ids[idx] == tokenizer.eos_token_id:
+                labels[idx] = input_ids[idx]
+                loss_weight[idx] = 1.0
+                break
+
+    # Mark which tokens belong to think blocks, security turns, and the XML
+    # blocks that should be excluded from KL anchoring in security turns.
+    is_think_token = [False] * len(input_ids)
+    is_security_turn_token = [False] * len(input_ids)
+    is_tool_call_security_token = [False] * len(input_ids)
+    is_tool_call_token = [False] * len(input_ids)
+    think_pattern = tag_patterns.get(loss_calc_ce_think_with_security_tag)
+    tool_call_security_pattern = tag_patterns.get(loss_calc_ce_tool_call_security_tag)
+    tool_call_pattern = tag_patterns.get(loss_calc_ce_tool_call_with_security_tag)
+    for turn_pos, (tok_start, tok_end), turn_has_sec in zip(
+        range(len(turn_token_spans)), turn_token_spans, turn_has_security_list
+    ):
+        turn_text = turn_texts[turn_pos]
+
+        if think_pattern is not None:
+            for match in think_pattern.finditer(turn_text):
+                rel_start, rel_end = _turn_text_char_span_to_token_span(
+                    turn_text, match.start(), match.end(), tokenizer
                 )
-                tag_found = True
-            if tag_found:
-                found_tags.add(tag_name)
+                for idx in range(tok_start + rel_start, tok_start + rel_end):
+                    is_think_token[idx] = True
 
-        # Warn once per tag if the source turn carries it but it vanished from
-        # the tokenized text (e.g. altered by the chat template).
-        for tag_name, _, pattern in tag_configs:
-            if pattern.search(content) and tag_name not in found_tags:
-                logger.warning(
-                    "Assistant turn %d contains <%s> in source but it was not found "
-                    "in the tokenized text; the turn is still trained with the default weight.",
-                    turn_idx, tag_name,
+        if tool_call_security_pattern is not None and turn_has_sec:
+            for match in tool_call_security_pattern.finditer(turn_text):
+                rel_start, rel_end = _turn_text_char_span_to_token_span(
+                    turn_text, match.start(), match.end(), tokenizer
                 )
+                for idx in range(tok_start + rel_start, tok_start + rel_end):
+                    is_tool_call_security_token[idx] = True
 
-    # Train on the final EOS token if it is present and not already labeled.
-    if labels and labels[-1] == -100 and input_ids[-1] == tokenizer.eos_token_id:
-        labels[-1] = input_ids[-1]
-        loss_weight[-1] = 1.0
+        if tool_call_pattern is not None and turn_has_sec:
+            for match in tool_call_pattern.finditer(turn_text):
+                rel_start, rel_end = _turn_text_char_span_to_token_span(
+                    turn_text, match.start(), match.end(), tokenizer
+                )
+                for idx in range(tok_start + rel_start, tok_start + rel_end):
+                    is_tool_call_token[idx] = True
 
-    # KL anchoring is mutually exclusive with CE loss: only assistant-turn tokens
-    # that do not contribute to CE loss are anchored to the base model.
-    kl_weight = [
-        1.0 if (label != -100 and w == 0.0) else 0.0
-        for label, w in zip(labels, loss_weight)
-    ]
+        if turn_has_sec:
+            for idx in range(tok_start, tok_end):
+                is_security_turn_token[idx] = True
 
-    return labels, loss_weight, kl_weight, masked_any
+    security_turn_mask = [1 if flag else 0 for flag in is_security_turn_token]
+    kl_weight_background = [0.0] * len(input_ids)
+    kl_weight_think_with_security = [0.0] * len(input_ids)
+    for idx, (label, think_flag, sec_turn, tc_sec_flag, tc_flag) in enumerate(
+        zip(
+            labels,
+            is_think_token,
+            is_security_turn_token,
+            is_tool_call_security_token,
+            is_tool_call_token,
+        )
+    ):
+        if label == -100:
+            continue
 
+        # tool_call_security and tool_call blocks never participate in KL anchoring,
+        # regardless of whether KL is enabled for the turn.
+        if tc_sec_flag or tc_flag:
+            continue
 
-def build_whole_conversation_sample(
-    messages: List[Dict[str, str]],
-    tokenizer: Any,
-    cutoff_len: int,
-    enable_thinking: bool,
-    loss_calc_default_weight: float = 1.0,
-    loss_calc_tag_tool_call_security: Optional[str] = None,
-    loss_calc_tag_tool_call_security_weight: float = 1.0,
-    loss_calc_tag_think: Optional[str] = None,
-    loss_calc_tag_think_weight: float = 1.0,
-    loss_calc_tag_tool_call: Optional[str] = None,
-    loss_calc_tag_tool_call_weight: float = 1.0,
-) -> Dict[str, List[int]]:
-    """Create one training sample from the full conversation."""
-    result = _apply_chat_template_with_fallback(tokenizer, messages, enable_thinking)
-    input_ids = result["input_ids"]
+        if think_flag:
+            if sec_turn and loss_calc_kl_enable_with_security:
+                kl_weight_think_with_security[idx] = loss_calc_kl_think_with_security_alpha
+            elif not sec_turn and loss_calc_kl_enable_without_security:
+                kl_weight_think_with_security[idx] = loss_calc_kl_alpha
+        else:
+            if sec_turn and loss_calc_kl_enable_with_security:
+                kl_weight_background[idx] = 1.0
+            elif not sec_turn and loss_calc_kl_enable_without_security:
+                kl_weight_background[idx] = 1.0
 
-    labels, loss_weight, kl_weight, _ = _mask_labels_for_assistant_turns(
-        input_ids,
-        messages,
-        tokenizer,
-        loss_calc_default_weight=loss_calc_default_weight,
-        loss_calc_tag_tool_call_security=loss_calc_tag_tool_call_security,
-        loss_calc_tag_tool_call_security_weight=loss_calc_tag_tool_call_security_weight,
-        loss_calc_tag_think=loss_calc_tag_think,
-        loss_calc_tag_think_weight=loss_calc_tag_think_weight,
-        loss_calc_tag_tool_call=loss_calc_tag_tool_call,
-        loss_calc_tag_tool_call_weight=loss_calc_tag_tool_call_weight,
-        enable_thinking=enable_thinking,
-    )
-
-    # Keep the most recent tokens when truncation is required.
-    if len(input_ids) > cutoff_len:
-        input_ids = input_ids[-cutoff_len:]
-        labels = labels[-cutoff_len:]
-        loss_weight = loss_weight[-cutoff_len:]
-        kl_weight = kl_weight[-cutoff_len:]
-
-    return {
-        "input_ids": input_ids,
-        "labels": labels,
-        "attention_mask": [1] * len(input_ids),
-        "loss_weight": loss_weight,
-        "kl_weight": kl_weight,
-    }
+    return labels, loss_weight, kl_weight_background, kl_weight_think_with_security, security_turn_mask, has_security, masked_any
 
 
 def build_turn_by_turn_samples(
@@ -594,14 +811,19 @@ def build_turn_by_turn_samples(
     tokenizer: Any,
     cutoff_len: int,
     enable_thinking: bool,
-    loss_calc_default_weight: float = 1.0,
-    loss_calc_tag_tool_call_security: Optional[str] = None,
-    loss_calc_tag_tool_call_security_weight: float = 1.0,
-    loss_calc_tag_think: Optional[str] = None,
-    loss_calc_tag_think_weight: float = 1.0,
-    loss_calc_tag_tool_call: Optional[str] = None,
-    loss_calc_tag_tool_call_weight: float = 1.0,
-) -> List[Dict[str, List[int]]]:
+    loss_calc_ce_default_with_security_weight: float = 1.0,
+    loss_calc_ce_default_without_security_weight: float = 1.0,
+    loss_calc_ce_tool_call_security_tag: Optional[str] = None,
+    loss_calc_ce_tool_call_security_with_security_weight: float = 1.0,
+    loss_calc_ce_think_with_security_tag: Optional[str] = None,
+    loss_calc_ce_think_with_security_weight: float = 1.0,
+    loss_calc_ce_tool_call_with_security_tag: Optional[str] = None,
+    loss_calc_ce_tool_call_with_security_weight: float = 1.0,
+    loss_calc_kl_alpha: float = 0.2,
+    loss_calc_kl_think_with_security_alpha: float = 0.1,
+    loss_calc_kl_enable_without_security: bool = False,
+    loss_calc_kl_enable_with_security: bool = False,
+) -> List[Dict[str, List[Any]]]:
     """Create one training sample per assistant turn, preserving prior context."""
     samples = []
     assistant_turn_indices = [i for i, msg in enumerate(messages) if msg["role"] == "assistant"]
@@ -611,18 +833,23 @@ def build_turn_by_turn_samples(
         result = _apply_chat_template_with_fallback(tokenizer, prefix_messages, enable_thinking)
         input_ids = result["input_ids"]
 
-        labels, loss_weight, kl_weight, masked_any = _mask_labels_for_assistant_turns(
+        labels, loss_weight, kl_weight_background, kl_weight_think_with_security, security_turn_mask, has_security, masked_any = _mask_labels_for_assistant_turns(
             input_ids,
             prefix_messages,
             tokenizer,
             allowed_turn_indices=[turn_idx],
-            loss_calc_default_weight=loss_calc_default_weight,
-            loss_calc_tag_tool_call_security=loss_calc_tag_tool_call_security,
-            loss_calc_tag_tool_call_security_weight=loss_calc_tag_tool_call_security_weight,
-            loss_calc_tag_think=loss_calc_tag_think,
-            loss_calc_tag_think_weight=loss_calc_tag_think_weight,
-            loss_calc_tag_tool_call=loss_calc_tag_tool_call,
-            loss_calc_tag_tool_call_weight=loss_calc_tag_tool_call_weight,
+            loss_calc_ce_default_with_security_weight=loss_calc_ce_default_with_security_weight,
+            loss_calc_ce_default_without_security_weight=loss_calc_ce_default_without_security_weight,
+            loss_calc_ce_tool_call_security_tag=loss_calc_ce_tool_call_security_tag,
+            loss_calc_ce_tool_call_security_with_security_weight=loss_calc_ce_tool_call_security_with_security_weight,
+            loss_calc_ce_think_with_security_tag=loss_calc_ce_think_with_security_tag,
+            loss_calc_ce_think_with_security_weight=loss_calc_ce_think_with_security_weight,
+            loss_calc_ce_tool_call_with_security_tag=loss_calc_ce_tool_call_with_security_tag,
+            loss_calc_ce_tool_call_with_security_weight=loss_calc_ce_tool_call_with_security_weight,
+            loss_calc_kl_alpha=loss_calc_kl_alpha,
+            loss_calc_kl_think_with_security_alpha=loss_calc_kl_think_with_security_alpha,
+            loss_calc_kl_enable_without_security=loss_calc_kl_enable_without_security,
+            loss_calc_kl_enable_with_security=loss_calc_kl_enable_with_security,
             enable_thinking=enable_thinking,
         )
 
@@ -634,14 +861,19 @@ def build_turn_by_turn_samples(
             input_ids = input_ids[-cutoff_len:]
             labels = labels[-cutoff_len:]
             loss_weight = loss_weight[-cutoff_len:]
-            kl_weight = kl_weight[-cutoff_len:]
+            kl_weight_background = kl_weight_background[-cutoff_len:]
+            kl_weight_think_with_security = kl_weight_think_with_security[-cutoff_len:]
+            security_turn_mask = security_turn_mask[-cutoff_len:]
 
         samples.append({
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": [1] * len(input_ids),
             "loss_weight": loss_weight,
-            "kl_weight": kl_weight,
+            "kl_weight_background": kl_weight_background,
+            "kl_weight_think_with_security": kl_weight_think_with_security,
+            "security_turn_mask": security_turn_mask,
+            "has_security_block": has_security,
         })
 
     return samples
@@ -658,7 +890,8 @@ def make_preprocess_function(
     msg_column = dataset_info.get("columns", {}).get("messages", "conversations")
 
     def preprocess(examples: Dict[str, List[Any]]) -> Dict[str, List[List[int]]]:
-        input_ids, labels, attention_mask, loss_weight, kl_weight = [], [], [], [], []
+        input_ids, labels, attention_mask, loss_weight = [], [], [], []
+        kl_weight_background, kl_weight_think_with_security, security_turn_mask, has_security_block = [], [], [], []
 
         for conversation in examples.get(msg_column, []):
             # Some datasets may already use the canonical keys.
@@ -668,48 +901,44 @@ def make_preprocess_function(
                 config.tool_role_in_template,
             )
 
-            if config.conversation_mode == "turn_by_turn":
-                samples = build_turn_by_turn_samples(
-                    messages,
-                    tokenizer,
-                    config.cutoff_len,
-                    config.enable_thinking,
-                    config.loss_calc_default_weight,
-                    config.loss_calc_tag_tool_call_security,
-                    config.loss_calc_tag_tool_call_security_weight,
-                    config.loss_calc_tag_think,
-                    config.loss_calc_tag_think_weight,
-                    config.loss_calc_tag_tool_call,
-                    config.loss_calc_tag_tool_call_weight,
-                )
-            else:
-                samples = [build_whole_conversation_sample(
-                    messages,
-                    tokenizer,
-                    config.cutoff_len,
-                    config.enable_thinking,
-                    config.loss_calc_default_weight,
-                    config.loss_calc_tag_tool_call_security,
-                    config.loss_calc_tag_tool_call_security_weight,
-                    config.loss_calc_tag_think,
-                    config.loss_calc_tag_think_weight,
-                    config.loss_calc_tag_tool_call,
-                    config.loss_calc_tag_tool_call_weight,
-                )]
+            samples = build_turn_by_turn_samples(
+                messages,
+                tokenizer,
+                config.cutoff_len,
+                config.enable_thinking,
+                config.loss_calc_ce_default_with_security_weight,
+                config.loss_calc_ce_default_without_security_weight,
+                config.loss_calc_ce_tool_call_security_tag,
+                config.loss_calc_ce_tool_call_security_with_security_weight,
+                config.loss_calc_ce_think_with_security_tag,
+                config.loss_calc_ce_think_with_security_weight,
+                config.loss_calc_ce_tool_call_with_security_tag,
+                config.loss_calc_ce_tool_call_with_security_weight,
+                config.loss_calc_kl_alpha,
+                config.loss_calc_kl_think_with_security_alpha,
+                config.loss_calc_kl_enable_without_security,
+                config.loss_calc_kl_enable_with_security,
+            )
 
             for sample in samples:
                 input_ids.append(sample["input_ids"])
                 labels.append(sample["labels"])
                 attention_mask.append(sample["attention_mask"])
                 loss_weight.append(sample["loss_weight"])
-                kl_weight.append(sample["kl_weight"])
+                kl_weight_background.append(sample["kl_weight_background"])
+                kl_weight_think_with_security.append(sample["kl_weight_think_with_security"])
+                security_turn_mask.append(sample["security_turn_mask"])
+                has_security_block.append(sample["has_security_block"])
 
         return {
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": attention_mask,
             "loss_weight": loss_weight,
-            "kl_weight": kl_weight,
+            "kl_weight_background": kl_weight_background,
+            "kl_weight_think_with_security": kl_weight_think_with_security,
+            "security_turn_mask": security_turn_mask,
+            "has_security_block": has_security_block,
         }
 
     return preprocess
@@ -758,17 +987,21 @@ def _tokenization_fingerprint(config: TrainingConfig, tokenizer: Any, split: str
     payload = {
         "split": split,
         "datasets": list(config.datasets),
-        "conversation_mode": config.conversation_mode,
         "cutoff_len": config.cutoff_len,
-        "loss_calc_default_weight": config.loss_calc_default_weight,
-        "loss_calc_tag_tool_call_security": config.loss_calc_tag_tool_call_security,
-        "loss_calc_tag_tool_call_security_weight": config.loss_calc_tag_tool_call_security_weight,
-        "loss_calc_tag_think": config.loss_calc_tag_think,
-        "loss_calc_tag_think_weight": config.loss_calc_tag_think_weight,
-        "loss_calc_tag_tool_call": config.loss_calc_tag_tool_call,
-        "loss_calc_tag_tool_call_weight": config.loss_calc_tag_tool_call_weight,
+        "loss_calc_ce_default_with_security_weight": config.loss_calc_ce_default_with_security_weight,
+        "loss_calc_ce_default_without_security_weight": config.loss_calc_ce_default_without_security_weight,
+        "loss_calc_ce_tool_call_security_tag": config.loss_calc_ce_tool_call_security_tag,
+        "loss_calc_ce_tool_call_security_with_security_weight": config.loss_calc_ce_tool_call_security_with_security_weight,
+        "loss_calc_ce_think_with_security_tag": config.loss_calc_ce_think_with_security_tag,
+        "loss_calc_ce_think_with_security_weight": config.loss_calc_ce_think_with_security_weight,
+        "loss_calc_ce_tool_call_with_security_tag": config.loss_calc_ce_tool_call_with_security_tag,
+        "loss_calc_ce_tool_call_with_security_weight": config.loss_calc_ce_tool_call_with_security_weight,
         "enable_thinking": config.enable_thinking,
-        "kl_anchoring_enabled": config.kl_anchoring_enabled,
+        "loss_calc_kl_enabled": config.loss_calc_kl_enabled,
+        "loss_calc_kl_alpha": config.loss_calc_kl_alpha,
+        "loss_calc_kl_think_with_security_alpha": config.loss_calc_kl_think_with_security_alpha,
+        "loss_calc_kl_enable_without_security": config.loss_calc_kl_enable_without_security,
+        "loss_calc_kl_enable_with_security": config.loss_calc_kl_enable_with_security,
         "max_samples": config.max_samples,
         "eval_data_ratio": config.eval_data_ratio,
         "shuffle_seed": config.shuffle_seed,
@@ -1140,29 +1373,42 @@ class EvaluateAfterSaveCallback(_BaseCallback):
 
 class WeightedDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     """
-    Pad ``loss_weight`` and ``kl_weight`` alongside the standard seq2seq fields.
+    Pad ``loss_weight``, ``kl_weight_background``, ``kl_weight_think_with_security``,
+    ``security_turn_mask`` and ``has_security_block`` alongside the standard seq2seq fields.
 
-    The parent collator does not know how to pad float weight arrays, so we
-    remove them before padding, let the parent collator handle the remaining
-    fields, then pad the weights ourselves with zeros (masked tokens).
+    The parent collator does not know how to pad float weight arrays or the
+    per-sample security flag, so we remove them before padding, let the parent
+    collator handle the remaining fields, then pad the weights ourselves with
+    zeros (masked tokens) and stack the security flag as a 1-D tensor.
     """
 
     def torch_call(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         weights = [f.pop("loss_weight", None) for f in features]
-        kl_weights = [f.pop("kl_weight", None) for f in features]
+        kl_bg_weights = [f.pop("kl_weight_background", None) for f in features]
+        kl_think_weights = [f.pop("kl_weight_think_with_security", None) for f in features]
+        security_masks = [f.pop("security_turn_mask", None) for f in features]
+        has_security_flags = [f.pop("has_security_block", False) for f in features]
         try:
             batch = super().torch_call(features)
         finally:
-            for feature, weight, kl_weight in zip(features, weights, kl_weights):
+            for feature, weight, kl_bg, kl_think, sec_mask, flag in zip(
+                features, weights, kl_bg_weights, kl_think_weights, security_masks, has_security_flags
+            ):
                 if weight is not None:
                     feature["loss_weight"] = weight
-                if kl_weight is not None:
-                    feature["kl_weight"] = kl_weight
+                if kl_bg is not None:
+                    feature["kl_weight_background"] = kl_bg
+                if kl_think is not None:
+                    feature["kl_weight_think_with_security"] = kl_think
+                if sec_mask is not None:
+                    feature["security_turn_mask"] = sec_mask
+                feature["has_security_block"] = flag
+
+        max_length = batch["input_ids"].shape[1]
 
         if weights[0] is not None:
             import torch
 
-            max_length = batch["input_ids"].shape[1]
             padded_weights = []
             for weight in weights:
                 weight_list = list(weight)
@@ -1173,19 +1419,48 @@ class WeightedDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 padded_weights.append(weight_list)
             batch["loss_weight"] = torch.tensor(padded_weights, dtype=torch.float32)
 
-        if kl_weights[0] is not None:
+        if kl_bg_weights[0] is not None:
             import torch
 
-            max_length = batch["input_ids"].shape[1]
             padded_kl_weights = []
-            for kl_weight in kl_weights:
+            for kl_weight in kl_bg_weights:
                 kl_list = list(kl_weight)
                 if len(kl_list) < max_length:
                     kl_list.extend([0.0] * (max_length - len(kl_list)))
                 else:
                     kl_list = kl_list[:max_length]
                 padded_kl_weights.append(kl_list)
-            batch["kl_weight"] = torch.tensor(padded_kl_weights, dtype=torch.float32)
+            batch["kl_weight_background"] = torch.tensor(padded_kl_weights, dtype=torch.float32)
+
+        if kl_think_weights[0] is not None:
+            import torch
+
+            padded_kl_weights = []
+            for kl_weight in kl_think_weights:
+                kl_list = list(kl_weight)
+                if len(kl_list) < max_length:
+                    kl_list.extend([0.0] * (max_length - len(kl_list)))
+                else:
+                    kl_list = kl_list[:max_length]
+                padded_kl_weights.append(kl_list)
+            batch["kl_weight_think_with_security"] = torch.tensor(padded_kl_weights, dtype=torch.float32)
+
+        if security_masks[0] is not None:
+            import torch
+
+            padded_security_masks = []
+            for sec_mask in security_masks:
+                mask_list = list(sec_mask)
+                if len(mask_list) < max_length:
+                    mask_list.extend([0] * (max_length - len(mask_list)))
+                else:
+                    mask_list = mask_list[:max_length]
+                padded_security_masks.append(mask_list)
+            batch["security_turn_mask"] = torch.tensor(padded_security_masks, dtype=torch.int64)
+
+        batch["has_security_block"] = torch.tensor(
+            [bool(flag) for flag in has_security_flags], dtype=torch.int64
+        )
 
         return batch
 
@@ -1195,28 +1470,68 @@ class WeightedLossTrainer(Trainer):
     Trainer that computes a per-token weighted cross-entropy loss with optional
     KL anchoring against the frozen base weights.
 
-    Every assistant turn contributes to the loss. Tokens outside the configured XML
-    tags use ``loss_calc_default_weight``, while tokens inside
-    ``<tool_call_security>...</tool_call_security>``,
-    ``<think>...</think>`` and ``<tool_call>...</tool_call>`` use their
-    configured weights, including the opening and closing XML tags themselves. This
-    lets the security reasoning tokens receive a higher gradient emphasis than the
-    raw tool-call JSON and the rest of the assistant content.
+    In assistant turns that contain ``<tool_call_security>...</tool_call_security>``,
+    tokens outside the configured XML tags use ``loss_calc_ce_default_with_security_weight``, while
+    tokens inside ``<tool_call_security>...</tool_call_security>``,
+    ``<tool_call>...</tool_call>`` and ``<think>...</think>`` use their configured
+    weights, including the opening and closing XML tags themselves.
 
-    When KL anchoring is enabled, tokens whose CE loss weight is zero (i.e. assistant
-    content outside ``<tool_call_security>`` and ``<tool_call>``) are anchored to the
-    base model via ``KL(current || reference)``. The reference logits are obtained by
-    disabling the LoRA adapter on the same model, so no separate reference model is
-    loaded.
+    In assistant turns without a security block, all assistant tokens use the uniform
+    ``loss_calc_ce_default_without_security_weight`` instead of the per-tag weights.
+
+    When a turn contains ``<tool_call_security>...</tool_call_security>`` and
+    ``loss_calc_kl_enable_with_security`` is set, the ``<think>...</think>`` block
+    is anchored with ``loss_calc_kl_think_with_security_alpha`` (think KL), all
+    other assistant tokens except ``<tool_call_security>...</tool_call_security>``
+    and ``<tool_call>...</tool_call>`` are anchored with ``loss_calc_kl_alpha``
+    (background KL). Assistant turns without a security block participate in KL
+    anchoring when ``loss_calc_kl_enable_without_security`` is set.
+
+    KL anchoring is logged in two separate metrics:
+
+    * ``kl_loss_background`` for non-think assistant tokens inside turns where
+      background KL is enabled.
+    * ``kl_loss_think_with_security`` for every token inside a
+      ``<think>...</think>`` block where think KL is enabled.
+
+    Additionally, a separate ``ce_loss_with_security`` metric is logged: the average
+    CE loss over non-zero CE positions that sit inside a security turn. This metric
+    does not affect the optimized loss; it is provided for monitoring. The number of
+    samples with and without a security block is also reported for each logging
+    interval.
+
+    The reference logits are obtained by disabling the LoRA adapter on the same
+    model, so no separate reference model is loaded.
     """
 
-    def __init__(self, kl_alpha: float = 1.0, kl_anchoring_enabled: bool = False, *args, **kwargs):
+    def __init__(
+        self,
+        loss_calc_kl_alpha: float = 0.2,
+        loss_calc_kl_think_with_security_alpha: float = 0.1,
+        loss_calc_kl_enabled: bool = False,
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        self.kl_alpha = kl_alpha
-        self.kl_anchoring_enabled = kl_anchoring_enabled
+        self.loss_calc_kl_alpha = loss_calc_kl_alpha
+        self.loss_calc_kl_think_with_security_alpha = loss_calc_kl_think_with_security_alpha
+        self.loss_calc_kl_enabled = loss_calc_kl_enabled
         self._ce_loss_sum = 0.0
-        self._kl_loss_sum = 0.0
+        self._kl_bg_sum = 0.0
+        self._kl_think_sum = 0.0
         self._accum_count = 0
+
+        # Metrics for the security-aware CE loss (logging only).
+        self._ce_with_security_sum = 0.0
+        self._ce_with_security_count = 0
+        self._samples_with_security = 0
+        self._samples_without_security = 0
+
+        # Metrics accumulated during evaluation (logging only).
+        self._eval_ce_with_security_sum = 0.0
+        self._eval_ce_with_security_count = 0
+        self._eval_samples_with_security = 0
+        self._eval_samples_without_security = 0
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs: Any):
         import torch
@@ -1227,7 +1542,10 @@ class WeightedLossTrainer(Trainer):
 
         labels = inputs.pop("labels")
         loss_weight = inputs.pop("loss_weight")
-        kl_weight = inputs.pop("kl_weight", None)
+        kl_weight_background = inputs.pop("kl_weight_background", None)
+        kl_weight_think_with_security = inputs.pop("kl_weight_think_with_security", None)
+        security_turn_mask = inputs.pop("security_turn_mask", None)
+        has_security_block = inputs.pop("has_security_block", None)
 
         outputs = model(**inputs)
         logits = outputs.logits
@@ -1236,11 +1554,15 @@ class WeightedLossTrainer(Trainer):
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         shift_weight = loss_weight[..., 1:].contiguous()
-
-        # Only compute cross-entropy on positions that are not masked. This avoids
-        # materializing a full float32 [seq_len, vocab_size] matrix for padding and
-        # for user/system/tool tokens, which drastically reduces peak GPU memory.
         active_mask = shift_labels != -100
+        shift_security_turn_mask = None
+        if security_turn_mask is not None:
+            shift_security_turn_mask = security_turn_mask[..., 1:].contiguous()
+
+        # Only compute cross-entropy on positions that are not masked.
+        ce_loss_with_security = None
+        batch_with_security = 0
+        batch_without_security = 0
         if active_mask.any():
             active_logits = shift_logits[active_mask].float()
             active_labels = shift_labels[active_mask]
@@ -1254,87 +1576,215 @@ class WeightedLossTrainer(Trainer):
 
             weighted_sum = (per_token_loss * active_weights).sum()
             weight_sum = active_weights.sum()
+
+            # CE restricted to tokens that sit inside a tool_call_security turn.
+            # This metric is logged separately and does not affect the loss.
+            if has_security_block is not None:
+                batch_with_security = int((has_security_block == 1).sum().item())
+                batch_without_security = has_security_block.numel() - batch_with_security
+                if shift_security_turn_mask is not None:
+                    security_active_mask = active_mask & (shift_security_turn_mask == 1)
+                else:
+                    shift_has_security = has_security_block.unsqueeze(1).expand(-1, shift_labels.size(1))
+                    security_active_mask = active_mask & (shift_has_security == 1)
+                if security_active_mask.any():
+                    security_weights = shift_weight[security_active_mask]
+                    security_loss_sum = (
+                        per_token_loss[security_active_mask[active_mask]] * security_weights
+                    ).sum()
+                    ce_loss_with_security = security_loss_sum / security_weights.sum()
         else:
             weighted_sum = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
             weight_sum = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
 
-        # Normalize by the sum of weights so the returned loss is a weighted average
-        # per-token cross-entropy, on the same scale as the model's default loss.
         ce_loss = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
         loss = ce_loss
 
-        # KL anchoring: keep <think>, <tool_call> and ordinary assistant content
-        # close to the frozen base model distribution. The reference logits come from
-        # the same model with the LoRA adapter disabled.
-        kl_loss = None
-        if self.kl_anchoring_enabled and kl_weight is not None and model.training:
-            shift_kl_weight = kl_weight[..., 1:].contiguous()
-            kl_mask = shift_kl_weight > 0
-            if kl_mask.any():
-                unwrapped = self.accelerator.unwrap_model(model)
-                if not hasattr(unwrapped, "disable_adapter"):
-                    raise RuntimeError(
-                        "KL anchoring requires a PEFT model with disable_adapter(). "
-                        "Make sure finetuning_type is lora."
-                    )
-                with torch.no_grad(), unwrapped.disable_adapter():
-                    ref_outputs = unwrapped(**inputs)
-                ref_shift_logits = ref_outputs.logits[..., :-1, :].contiguous()
+        kl_bg_loss = None
+        kl_think_loss = None
 
-                # Cast to float32 for stable log-softmax / KL computation.
-                log_p = F.log_softmax(shift_logits[kl_mask].float(), dim=-1)
-                log_p_ref = F.log_softmax(ref_shift_logits[kl_mask].float(), dim=-1)
+        if self.loss_calc_kl_enabled and model.training:
+            unwrapped = self.accelerator.unwrap_model(model)
+            if not hasattr(unwrapped, "disable_adapter"):
+                raise RuntimeError(
+                    "KL anchoring requires a PEFT model with disable_adapter(). "
+                    "Make sure finetuning_type is lora."
+                )
 
-                # KL(current || reference) = sum_v p_current(v) * log(p_current(v) / p_ref(v))
-                kl_per_token = (log_p.exp() * (log_p - log_p_ref)).sum(dim=-1)
+            with torch.no_grad(), unwrapped.disable_adapter():
+                ref_outputs = unwrapped(**inputs)
+            ref_shift_logits = ref_outputs.logits[..., :-1, :].contiguous()
 
-                kl_weighted_sum = (kl_per_token * shift_kl_weight[kl_mask]).sum()
-                kl_weight_sum = shift_kl_weight[kl_mask].sum()
-                kl_loss = kl_weighted_sum / kl_weight_sum if kl_weight_sum > 0 else kl_weighted_sum
+            # Background KL: zero-CE-weight assistant tokens that are not part of a think block.
+            if kl_weight_background is not None:
+                shift_kl_bg = kl_weight_background[..., 1:].contiguous()
+                bg_mask = shift_kl_bg > 0
+                if bg_mask.any():
+                    log_p = F.log_softmax(shift_logits[bg_mask].float(), dim=-1)
+                    log_p_ref = F.log_softmax(ref_shift_logits[bg_mask].float(), dim=-1)
+                    kl_per_token = (log_p.exp() * (log_p - log_p_ref)).sum(dim=-1)
 
-                loss = loss + self.kl_alpha * kl_loss
+                    bg_weighted_sum = (kl_per_token * shift_kl_bg[bg_mask]).sum()
+                    bg_weight_sum = shift_kl_bg[bg_mask].sum()
+                    kl_bg_loss = bg_weighted_sum / bg_weight_sum if bg_weight_sum > 0 else bg_weighted_sum
+
+                    loss = loss + self.loss_calc_kl_alpha * kl_bg_loss
+
+            # Think KL: every token inside a <think>...</think> block.
+            # kl_weight_think_with_security stores the per-token KL coefficient:
+            # 0.0 when disabled, 0.1 for security turns when enabled, 0.2 for
+            # non-security turns when enabled.
+            if kl_weight_think_with_security is not None:
+                shift_kl_think = kl_weight_think_with_security[..., 1:].contiguous()
+                think_mask = shift_kl_think > 0
+                if think_mask.any():
+                    log_p = F.log_softmax(shift_logits[think_mask].float(), dim=-1)
+                    log_p_ref = F.log_softmax(ref_shift_logits[think_mask].float(), dim=-1)
+                    kl_per_token = (log_p.exp() * (log_p - log_p_ref)).sum(dim=-1)
+
+                    think_count = think_mask.sum()
+                    kl_think_loss = kl_per_token.sum() / think_count
+
+                    weighted_think_sum = (kl_per_token * shift_kl_think[think_mask]).sum()
+                    loss = loss + weighted_think_sum / think_count
 
         # Newer transformers versions pass num_items_in_batch and skip the division
-        # by gradient_accumulation_steps in training_step. If we do not divide here,
-        # the logged loss and the accumulated gradients are both amplified by the
-        # number of accumulation steps.
+        # by gradient_accumulation_steps in training_step.
         if num_items_in_batch is not None and self.args.gradient_accumulation_steps > 1:
             loss = loss / self.args.gradient_accumulation_steps
 
         outputs.loss = loss
 
-        # Accumulate CE/KL for the next logging event.
+        # Accumulate CE/KL and security-aware metrics for the next logging event.
         if model.training:
             self._ce_loss_sum += ce_loss.detach().item()
-            self._kl_loss_sum += kl_loss.detach().item() if kl_loss is not None else 0.0
+            self._kl_bg_sum += kl_bg_loss.detach().item() if kl_bg_loss is not None else 0.0
+            self._kl_think_sum += kl_think_loss.detach().item() if kl_think_loss is not None else 0.0
             self._accum_count += 1
+
+            if ce_loss_with_security is not None:
+                self._ce_with_security_sum += ce_loss_with_security.detach().item()
+                self._ce_with_security_count += 1
+            self._samples_with_security += batch_with_security
+            self._samples_without_security += batch_without_security
+        else:
+            # Evaluation path: accumulate the same security-aware metrics separately.
+            if ce_loss_with_security is not None:
+                self._eval_ce_with_security_sum += ce_loss_with_security.detach().item()
+                self._eval_ce_with_security_count += 1
+            self._eval_samples_with_security += batch_with_security
+            self._eval_samples_without_security += batch_without_security
 
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs: Dict[str, float], start_step: bool = False) -> None:
-        """Inject globally averaged CE/KL into the default training loss log."""
+        """Inject globally averaged CE/KL and security-aware metrics into the log."""
         if "loss" in logs and self._accum_count > 0:
             import torch
             import torch.distributed as dist
 
             ce = self._ce_loss_sum / self._accum_count
-            kl = self._kl_loss_sum / self._accum_count
+            kl_bg = self._kl_bg_sum / self._accum_count
+            kl_think = self._kl_think_sum / self._accum_count
 
             if dist.is_initialized() and dist.get_world_size() > 1:
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                ce_tensor = torch.tensor(ce, device=device)
-                kl_tensor = torch.tensor(kl, device=device)
-                dist.all_reduce(ce_tensor, op=dist.ReduceOp.AVG)
-                dist.all_reduce(kl_tensor, op=dist.ReduceOp.AVG)
-                ce = ce_tensor.item()
-                kl = kl_tensor.item()
+                metrics = torch.tensor([ce, kl_bg, kl_think], device=device, dtype=torch.float32)
+                dist.all_reduce(metrics, op=dist.ReduceOp.AVG)
+                ce, kl_bg, kl_think = metrics.tolist()
 
             logs["ce_loss"] = ce
-            logs["kl_loss"] = kl
+            logs["kl_loss_background"] = kl_bg
+            logs["kl_loss_think_with_security"] = kl_think
+
+            # Security-aware CE: average only over steps that actually saw a security block.
+            if self._ce_with_security_count > 0:
+                ce_sec = self._ce_with_security_sum / self._ce_with_security_count
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    ce_sec_t = torch.tensor(ce_sec, device=device, dtype=torch.float32)
+                    dist.all_reduce(ce_sec_t, op=dist.ReduceOp.AVG)
+                    ce_sec = ce_sec_t.item()
+                logs["ce_loss_with_security"] = ce_sec
+
+            with_security = self._samples_with_security
+            without_security = self._samples_without_security
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                counts = torch.tensor(
+                    [with_security, without_security], device=device, dtype=torch.int64
+                )
+                dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+                with_security, without_security = counts.tolist()
+            logs["num_samples_with_security"] = with_security
+            logs["num_samples_without_security"] = without_security
+
             self._ce_loss_sum = 0.0
-            self._kl_loss_sum = 0.0
+            self._kl_bg_sum = 0.0
+            self._kl_think_sum = 0.0
             self._accum_count = 0
+            self._ce_with_security_sum = 0.0
+            self._ce_with_security_count = 0
+            self._samples_with_security = 0
+            self._samples_without_security = 0
+
+        if "eval_loss" in logs:
+            import torch
+            import torch.distributed as dist
+
+            if self._eval_ce_with_security_count > 0:
+                ce_sec = self._eval_ce_with_security_sum / self._eval_ce_with_security_count
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    ce_sec_t = torch.tensor(ce_sec, device=device, dtype=torch.float32)
+                    dist.all_reduce(ce_sec_t, op=dist.ReduceOp.AVG)
+                    ce_sec = ce_sec_t.item()
+                logs["eval_ce_loss_with_security"] = ce_sec
+
+            with_security = self._eval_samples_with_security
+            without_security = self._eval_samples_without_security
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                counts = torch.tensor(
+                    [with_security, without_security], device=device, dtype=torch.int64
+                )
+                dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+                with_security, without_security = counts.tolist()
+            logs["eval_num_samples_with_security"] = with_security
+            logs["eval_num_samples_without_security"] = without_security
+
+            self._eval_ce_with_security_sum = 0.0
+            self._eval_ce_with_security_count = 0
+            self._eval_samples_with_security = 0
+            self._eval_samples_without_security = 0
+
         super().log(logs, start_step)
+
+
+def _find_latest_checkpoint(output_dir: str) -> Optional[str]:
+    """
+    Return the path of the most recent ``checkpoint-N`` directory under ``output_dir``.
+
+    If no checkpoint directory exists, returns ``None``. The checkpoint number is
+    extracted from the directory name so that ``checkpoint-12`` wins over
+    ``checkpoint-9``.
+    """
+    output_path = Path(output_dir)
+    if not output_path.exists():
+        return None
+
+    checkpoint_dirs = []
+    for item in output_path.iterdir():
+        if item.is_dir() and item.name.startswith("checkpoint-"):
+            try:
+                step = int(item.name.split("-", 1)[1])
+                checkpoint_dirs.append((step, str(item)))
+            except (ValueError, IndexError):
+                continue
+
+    if not checkpoint_dirs:
+        return None
+
+    checkpoint_dirs.sort(key=lambda x: x[0])
+    return checkpoint_dirs[-1][1]
 
 
 def build_training_arguments(config: TrainingConfig) -> Any:
@@ -1418,11 +1868,15 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Set up logging as early as possible so the very first messages are captured.
+    # In distributed training only the main process prints to stdout/file; other
+    # ranks stay silent for INFO logs to avoid the duplicated output seen with
+    # multiple GPUs. Errors/crashes on non-main ranks still surface via stderr.
     # mode="w" truncates training.log on every launch so runs never mix together.
     log_format = "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
     log_datefmt = "%Y-%m-%d %H:%M:%S"
-    handlers = [logging.StreamHandler(sys.stdout)]
+    handlers: List[logging.Handler] = []
     if is_main_process:
+        handlers.append(logging.StreamHandler(sys.stdout))
         handlers.append(logging.FileHandler(output_dir / "training.log", mode="w", encoding="utf-8"))
 
     logging.basicConfig(
@@ -1484,10 +1938,15 @@ def main() -> None:
     else:
         raise ValueError(f"Unsupported finetuning_type: {config.finetuning_type}")
 
-    if config.kl_anchoring_enabled:
+    if config.loss_calc_kl_enabled:
         logger.info(
-            "KL anchoring enabled (alpha=%.3f); reference logits obtained via disable_adapter()",
-            config.kl_anchoring_alpha,
+            "KL anchoring enabled (background alpha=%.3f, think-with-security alpha=%.3f, "
+            "enable_without_security=%s, enable_think_with_security=%s); "
+            "reference logits obtained via disable_adapter()",
+            config.loss_calc_kl_alpha,
+            config.loss_calc_kl_think_with_security_alpha,
+            config.loss_calc_kl_enable_without_security,
+            config.loss_calc_kl_enable_with_security,
         )
 
     # Build training arguments before loading datasets so tokenization can run on
@@ -1500,6 +1959,19 @@ def main() -> None:
     if eval_dataset is not None:
         logger.info("Eval samples: %d", len(eval_dataset))
 
+    # Count how many training samples contain a tool_call_security block for the
+    # final summary. The column is produced by the preprocessing function.
+    train_total_with_security = 0
+    train_total_without_security = 0
+    if "has_security_block" in train_dataset.column_names:
+        train_total_with_security = sum(int(flag) for flag in train_dataset["has_security_block"])
+        train_total_without_security = len(train_dataset) - train_total_with_security
+        logger.info(
+            "Training samples with tool_call_security block: %d, without: %d",
+            train_total_with_security,
+            train_total_without_security,
+        )
+
     data_collator = WeightedDataCollatorForSeq2Seq(
         tokenizer=tokenizer,
         model=model,
@@ -1507,14 +1979,16 @@ def main() -> None:
         padding="longest",
     )
     logger.info(
-        "Training on weighted tags: default weight=%.2f, <%s> weight=%.2f, <%s> weight=%.2f, <%s> weight=%.2f",
-        config.loss_calc_default_weight,
-        config.loss_calc_tag_tool_call_security or "none",
-        config.loss_calc_tag_tool_call_security_weight,
-        config.loss_calc_tag_think or "none",
-        config.loss_calc_tag_think_weight,
-        config.loss_calc_tag_tool_call or "none",
-        config.loss_calc_tag_tool_call_weight,
+        "CE weights: non-security uniform=%.2f; security turns: default=%.2f, "
+        "<%s>=%.2f, <%s>=%.2f, <%s>=%.2f",
+        config.loss_calc_ce_default_without_security_weight,
+        config.loss_calc_ce_default_with_security_weight,
+        config.loss_calc_ce_tool_call_security_tag or "none",
+        config.loss_calc_ce_tool_call_security_with_security_weight,
+        config.loss_calc_ce_think_with_security_tag or "none",
+        config.loss_calc_ce_think_with_security_weight,
+        config.loss_calc_ce_tool_call_with_security_tag or "none",
+        config.loss_calc_ce_tool_call_with_security_weight,
     )
     logger.info("Data collator initialized")
 
@@ -1531,8 +2005,9 @@ def main() -> None:
 
     trainer = WeightedLossTrainer(
         model=model,
-        kl_alpha=config.kl_anchoring_alpha,
-        kl_anchoring_enabled=config.kl_anchoring_enabled,
+        loss_calc_kl_alpha=config.loss_calc_kl_alpha,
+        loss_calc_kl_think_with_security_alpha=config.loss_calc_kl_think_with_security_alpha,
+        loss_calc_kl_enabled=config.loss_calc_kl_enabled,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
@@ -1547,12 +2022,17 @@ def main() -> None:
         trainer.add_callback(eval_callback)
         logger.info("Registered post-checkpoint evaluation callback")
 
+    # Automatically resume from the latest checkpoint in the output directory.
+    # If overwrite_output_dir was True the directory was cleared, so no checkpoint
+    # will be found and training starts from scratch.
+    resume_from_checkpoint = _find_latest_checkpoint(config.output_dir)
+    if resume_from_checkpoint is not None:
+        logger.info("Latest checkpoint found; resuming training from: %s", resume_from_checkpoint)
+
     if config.do_train:
-        if config.resume_from_checkpoint:
-            logger.info("Resuming training from checkpoint: %s", config.resume_from_checkpoint)
         logger.info("Starting training for %.2f epochs", config.num_train_epochs)
         start_time = time.time()
-        trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
         elapsed = time.time() - start_time
         logger.info("Training finished")
 
@@ -1586,6 +2066,11 @@ def main() -> None:
             logger.info("Total time: %s", str(timedelta(seconds=int(elapsed))))
             logger.info("Final train loss: %s", final_train_loss)
             logger.info("Final eval loss: %s", final_eval_loss)
+            logger.info(
+                "Training samples with tool_call_security block: %d, without: %d",
+                train_total_with_security,
+                train_total_without_security,
+            )
             logger.info("=" * 60)
 
         # save_model / save_state must run on all ranks (collective under DeepSpeed).
