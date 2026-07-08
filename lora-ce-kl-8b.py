@@ -84,6 +84,14 @@ class TrainingConfig:
     loss_calc_ce_tool_call_with_security_tag: Optional[str] = "tool_call"  # weighted tool-call JSON block
     loss_calc_ce_tool_call_with_security_weight: float = 1.0  # loss weight for tool_call content in turns with tool_call_security
     loss_calc_ce_default_without_security_weight: float = 1.0  # uniform loss weight for all assistant tokens in turns without tool_call_security
+
+    # In turn-by-turn mode, assistant turns without <tool_call_security> can be
+    # randomly subsampled. 0.0 drops all of them (train only security turns);
+    # 1.0 keeps all of them; 0.5 keeps roughly half. Sampling is deterministic
+    # given non_security_turn_sample_seed and the assistant turn content.
+    non_security_turn_keep_ratio: float = 0.0
+    non_security_turn_sample_seed: int = 42
+
     cutoff_len: int = 16384
     max_samples: Optional[int] = 100000
     preprocessing_num_workers: int = 16
@@ -806,6 +814,23 @@ def _mask_labels_for_assistant_turns(
     return labels, loss_weight, kl_weight_background, kl_weight_think_with_security, security_turn_mask, has_security, masked_any
 
 
+def _keep_non_security_turn(content: str, keep_ratio: float, seed: int) -> bool:
+    """
+    Deterministically decide whether a non-security assistant turn should be kept.
+
+    The decision is derived from a hash of ``seed`` and the turn content so that
+    the same turn always receives the same decision across preprocessing workers
+    and reruns, while still approximating the requested keep ratio globally.
+    """
+    if keep_ratio <= 0.0:
+        return False
+    if keep_ratio >= 1.0:
+        return True
+    digest = hashlib.sha256(f"{seed}:{content}".encode("utf-8")).hexdigest()
+    value = int(digest[:16], 16) / (2 ** 64)
+    return value < keep_ratio
+
+
 def build_turn_by_turn_samples(
     messages: List[Dict[str, str]],
     tokenizer: Any,
@@ -823,12 +848,31 @@ def build_turn_by_turn_samples(
     loss_calc_kl_think_with_security_alpha: float = 0.1,
     loss_calc_kl_enable_without_security: bool = False,
     loss_calc_kl_enable_with_security: bool = False,
+    non_security_turn_keep_ratio: float = 0.0,
+    non_security_turn_sample_seed: int = 42,
 ) -> List[Dict[str, List[Any]]]:
     """Create one training sample per assistant turn, preserving prior context."""
     samples = []
     assistant_turn_indices = [i for i, msg in enumerate(messages) if msg["role"] == "assistant"]
 
+    security_pattern = None
+    if loss_calc_ce_tool_call_security_tag is not None:
+        security_pattern = re.compile(
+            rf"<{re.escape(loss_calc_ce_tool_call_security_tag)}>.*?</{re.escape(loss_calc_ce_tool_call_security_tag)}>",
+            re.DOTALL,
+        )
+
     for turn_idx in assistant_turn_indices:
+        content = messages[turn_idx]["content"]
+        turn_has_security = (
+            security_pattern is not None and security_pattern.search(content) is not None
+        )
+
+        # Drop non-security turns according to the configured subsampling ratio.
+        if not turn_has_security:
+            if not _keep_non_security_turn(content, non_security_turn_keep_ratio, non_security_turn_sample_seed):
+                continue
+
         prefix_messages = messages[:turn_idx + 1]
         result = _apply_chat_template_with_fallback(tokenizer, prefix_messages, enable_thinking)
         input_ids = result["input_ids"]
@@ -918,6 +962,8 @@ def make_preprocess_function(
                 config.loss_calc_kl_think_with_security_alpha,
                 config.loss_calc_kl_enable_without_security,
                 config.loss_calc_kl_enable_with_security,
+                config.non_security_turn_keep_ratio,
+                config.non_security_turn_sample_seed,
             )
 
             for sample in samples:
@@ -1002,6 +1048,8 @@ def _tokenization_fingerprint(config: TrainingConfig, tokenizer: Any, split: str
         "loss_calc_kl_think_with_security_alpha": config.loss_calc_kl_think_with_security_alpha,
         "loss_calc_kl_enable_without_security": config.loss_calc_kl_enable_without_security,
         "loss_calc_kl_enable_with_security": config.loss_calc_kl_enable_with_security,
+        "non_security_turn_keep_ratio": config.non_security_turn_keep_ratio,
+        "non_security_turn_sample_seed": config.non_security_turn_sample_seed,
         "max_samples": config.max_samples,
         "eval_data_ratio": config.eval_data_ratio,
         "shuffle_seed": config.shuffle_seed,

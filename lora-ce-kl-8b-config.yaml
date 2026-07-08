@@ -63,6 +63,14 @@ loss_calc_ce_think_with_security_weight: 1.0  # think CE weight in turns with to
 loss_calc_ce_tool_call_with_security_tag: tool_call
 loss_calc_ce_tool_call_with_security_weight: 1.0  # tool_call CE weight in turns with tool_call_security
 
+# In turn-by-turn mode, assistant turns without <tool_call_security> are subsampled.
+# 0.0 = drop all non-security turns (only train security turns).
+# 1.0 = keep all non-security turns.
+# 0.5 = keep roughly 50% of non-security turns, dropping the rest.
+# The selection is deterministic given non_security_turn_sample_seed and the turn content.
+non_security_turn_keep_ratio: 0.0
+non_security_turn_sample_seed: 42
+
 cutoff_len: 16384
 max_samples: 100000
 preprocessing_num_workers: 16
@@ -74,7 +82,7 @@ eval_data_ratio: 0.05
 # ---------------------------------------------------------------------------
 stage: sft
 do_train: true
-output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260707_ce_only
+output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260708_ce_all_security
 overwrite_output_dir: false
 seed: 42
 num_train_epochs: 6.0
