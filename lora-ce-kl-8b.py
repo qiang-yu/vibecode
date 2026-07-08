@@ -85,11 +85,15 @@ class TrainingConfig:
     loss_calc_ce_tool_call_with_security_weight: float = 1.0  # loss weight for tool_call content in turns with tool_call_security
     loss_calc_ce_default_without_security_weight: float = 1.0  # uniform loss weight for all assistant tokens in turns without tool_call_security
 
-    # In turn-by-turn mode, assistant turns without <tool_call_security> can be
-    # randomly subsampled. 0.0 drops all of them (train only security turns);
-    # 1.0 keeps all of them; 0.5 keeps roughly half. Sampling is deterministic
-    # given non_security_turn_sample_seed and the assistant turn content.
-    non_security_turn_keep_ratio: float = 0.0
+    # In turn-by-turn mode, the number of non-security assistant turns kept per
+    # dataset file is controlled relative to the number of security turns in that
+    # file. After generating all turns, keep at most
+    # security_turn_count * non_security_to_security_turn_ratio non-security turns.
+    # 0.0 means keep only security turns; 0.5 means keep half as many non-security
+    # turns as security turns; 1.0 means keep equal numbers. The selection is
+    # random within each file's non-security turns and is reproducible given
+    # non_security_turn_sample_seed.
+    non_security_to_security_turn_ratio: float = 0.0
     non_security_turn_sample_seed: int = 42
 
     cutoff_len: int = 16384
@@ -814,21 +818,30 @@ def _mask_labels_for_assistant_turns(
     return labels, loss_weight, kl_weight_background, kl_weight_think_with_security, security_turn_mask, has_security, masked_any
 
 
-def _keep_non_security_turn(content: str, keep_ratio: float, seed: int) -> bool:
+def _select_non_security_samples(
+    non_security_samples: List[Dict[str, Any]],
+    security_count: int,
+    ratio: float,
+    seed: int,
+) -> List[Dict[str, Any]]:
     """
-    Deterministically decide whether a non-security assistant turn should be kept.
+    Randomly select non-security samples for a single dataset file.
 
-    The decision is derived from a hash of ``seed`` and the turn content so that
-    the same turn always receives the same decision across preprocessing workers
-    and reruns, while still approximating the requested keep ratio globally.
+    The target number of non-security samples is ``round(security_count * ratio)``.
+    If the available non-security samples are fewer than the target, all of them
+    are kept.  The selection is random but reproducible because it uses a
+    dedicated ``seed``.
     """
-    if keep_ratio <= 0.0:
-        return False
-    if keep_ratio >= 1.0:
-        return True
-    digest = hashlib.sha256(f"{seed}:{content}".encode("utf-8")).hexdigest()
-    value = int(digest[:16], 16) / (2 ** 64)
-    return value < keep_ratio
+    import random
+
+    if ratio <= 0.0 or not non_security_samples:
+        return []
+    target = min(int(round(security_count * ratio)), len(non_security_samples))
+    if target <= 0:
+        return []
+    if target >= len(non_security_samples):
+        return non_security_samples
+    return random.Random(seed).sample(non_security_samples, target)
 
 
 def build_turn_by_turn_samples(
@@ -848,8 +861,6 @@ def build_turn_by_turn_samples(
     loss_calc_kl_think_with_security_alpha: float = 0.1,
     loss_calc_kl_enable_without_security: bool = False,
     loss_calc_kl_enable_with_security: bool = False,
-    non_security_turn_keep_ratio: float = 0.0,
-    non_security_turn_sample_seed: int = 42,
 ) -> List[Dict[str, List[Any]]]:
     """Create one training sample per assistant turn, preserving prior context."""
     samples = []
@@ -867,11 +878,6 @@ def build_turn_by_turn_samples(
         turn_has_security = (
             security_pattern is not None and security_pattern.search(content) is not None
         )
-
-        # Drop non-security turns according to the configured subsampling ratio.
-        if not turn_has_security:
-            if not _keep_non_security_turn(content, non_security_turn_keep_ratio, non_security_turn_sample_seed):
-                continue
 
         prefix_messages = messages[:turn_idx + 1]
         result = _apply_chat_template_with_fallback(tokenizer, prefix_messages, enable_thinking)
@@ -918,6 +924,7 @@ def build_turn_by_turn_samples(
             "kl_weight_think_with_security": kl_weight_think_with_security,
             "security_turn_mask": security_turn_mask,
             "has_security_block": has_security,
+            "assistant_content": content,
         })
 
     return samples
@@ -962,8 +969,6 @@ def make_preprocess_function(
                 config.loss_calc_kl_think_with_security_alpha,
                 config.loss_calc_kl_enable_without_security,
                 config.loss_calc_kl_enable_with_security,
-                config.non_security_turn_keep_ratio,
-                config.non_security_turn_sample_seed,
             )
 
             for sample in samples:
@@ -1020,6 +1025,109 @@ def _interleave_datasets(datasets: List[Any], seed: int) -> Any:
     return Dataset.from_list(interleaved)
 
 
+def _interleave_sample_lists(
+    lists: List[List[Dict[str, Any]]], seed: int
+) -> List[Dict[str, Any]]:
+    """
+    Interleave multiple sample lists proportionally by size.
+
+    For example, if list sizes are [200, 100, 100, 50], the mixed list will
+    contain 4 samples from the first list, 2 from the second, 2 from the third
+    and 1 from the fourth, repeating until all samples are consumed.  Each
+    input list is deterministically shuffled using ``seed + idx``.
+    """
+    import random
+
+    shuffled: List[List[Dict[str, Any]]] = []
+    for idx, lst in enumerate(lists):
+        cp = lst[:]
+        random.Random(seed + idx).shuffle(cp)
+        shuffled.append(cp)
+
+    non_empty = [lst for lst in shuffled if lst]
+    if not non_empty:
+        return []
+    if len(non_empty) == 1:
+        return non_empty[0]
+
+    sizes = [len(lst) for lst in non_empty]
+    min_size = min(sizes)
+    ratios = [max(1, round(size / min_size)) for size in sizes]
+
+    indices = [0] * len(non_empty)
+    interleaved: List[Dict[str, Any]] = []
+    while any(indices[i] < len(non_empty[i]) for i in range(len(non_empty))):
+        for i in range(len(non_empty)):
+            end = min(indices[i] + ratios[i], len(non_empty[i]))
+            if end > indices[i]:
+                interleaved.extend(non_empty[i][indices[i]:end])
+                indices[i] = end
+
+    return interleaved
+
+
+def _write_jsonl(path: Path, samples: List[Dict[str, Any]]) -> None:
+    """Write a list of sample dicts to a JSONL file, one JSON object per line."""
+    with open(path, "w", encoding="utf-8") as f:
+        for sample in samples:
+            f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+
+
+def _generate_turn_samples_for_split(
+    split: Any,
+    info: Dict[str, Any],
+    config: TrainingConfig,
+    tokenizer: Any,
+) -> List[Dict[str, Any]]:
+    """Generate all turn-by-turn training samples from a raw dataset split."""
+    from functools import partial
+
+    msg_column = info.get("columns", {}).get("messages", "conversations")
+
+    def _map_fn(
+        example: Dict[str, Any],
+        info: Dict[str, Any],
+        config: TrainingConfig,
+        tokenizer: Any,
+    ) -> Dict[str, Any]:
+        messages = format_messages(
+            example[msg_column], info, config.tool_role_in_template
+        )
+        samples = build_turn_by_turn_samples(
+            messages,
+            tokenizer,
+            config.cutoff_len,
+            config.enable_thinking,
+            config.loss_calc_ce_default_with_security_weight,
+            config.loss_calc_ce_default_without_security_weight,
+            config.loss_calc_ce_tool_call_security_tag,
+            config.loss_calc_ce_tool_call_security_with_security_weight,
+            config.loss_calc_ce_think_with_security_tag,
+            config.loss_calc_ce_think_with_security_weight,
+            config.loss_calc_ce_tool_call_with_security_tag,
+            config.loss_calc_ce_tool_call_with_security_weight,
+            config.loss_calc_kl_alpha,
+            config.loss_calc_kl_think_with_security_alpha,
+            config.loss_calc_kl_enable_without_security,
+            config.loss_calc_kl_enable_with_security,
+        )
+        return {"samples": samples}
+
+    fn = partial(_map_fn, info=info, config=config, tokenizer=tokenizer)
+    mapped = split.map(
+        fn,
+        batched=False,
+        num_proc=config.preprocessing_num_workers,
+        remove_columns=split.column_names,
+        desc="Generating turn-by-turn samples",
+    )
+
+    samples: List[Dict[str, Any]] = []
+    for item in mapped:
+        samples.extend(item["samples"])
+    return samples
+
+
 def _tokenization_fingerprint(config: TrainingConfig, tokenizer: Any, split: str) -> str:
     """
     Build a deterministic fingerprint for a tokenized split.
@@ -1048,7 +1156,7 @@ def _tokenization_fingerprint(config: TrainingConfig, tokenizer: Any, split: str
         "loss_calc_kl_think_with_security_alpha": config.loss_calc_kl_think_with_security_alpha,
         "loss_calc_kl_enable_without_security": config.loss_calc_kl_enable_without_security,
         "loss_calc_kl_enable_with_security": config.loss_calc_kl_enable_with_security,
-        "non_security_turn_keep_ratio": config.non_security_turn_keep_ratio,
+        "non_security_to_security_turn_ratio": config.non_security_to_security_turn_ratio,
         "non_security_turn_sample_seed": config.non_security_turn_sample_seed,
         "max_samples": config.max_samples,
         "eval_data_ratio": config.eval_data_ratio,
@@ -1072,7 +1180,7 @@ def load_datasets(
     tokenizer: Any,
     training_args: Any = None,
 ) -> Any:
-    """Load, split, interleave, and tokenize all requested datasets."""
+    """Load datasets, split per-file security/non-security turns, interleave, and return tokenized datasets."""
     from datasets import load_dataset
     from contextlib import nullcontext
 
@@ -1085,7 +1193,11 @@ def load_datasets(
         requested_names = list(all_dataset_info.keys())
 
     logger = logging.getLogger(__name__)
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     raw_datasets = []
+    dataset_infos = []
     for name in requested_names:
         if name not in all_dataset_info:
             raise ValueError(f"Dataset '{name}' is not defined in {config.dataset_info_path}")
@@ -1100,6 +1212,7 @@ def load_datasets(
         raw = load_dataset("json", data_files=str(file_path), split="train")
         logger.info("Loaded dataset '%s': %d samples", name, len(raw))
         raw_datasets.append(raw)
+        dataset_infos.append(info)
 
     # Split each dataset individually so every dataset contributes eval data.
     train_splits = []
@@ -1111,66 +1224,115 @@ def load_datasets(
             eval_splits.append(split["test"])
         else:
             train_splits.append(raw)
+            eval_splits.append(None)
 
-    # Interleave train and eval splits proportionally.
-    logger.info("Interleaving train splits with ratios based on dataset sizes")
-    train_dataset = _interleave_datasets(train_splits, config.shuffle_seed)
+    train_interleaved_path = output_dir / "train_interleaved_turns.jsonl"
+    eval_interleaved_path = output_dir / "eval_interleaved_turns.jsonl"
 
-    eval_dataset = None
-    if eval_splits:
-        logger.info("Interleaving eval splits with ratios based on dataset sizes")
-        eval_dataset = _interleave_datasets(eval_splits, config.shuffle_seed)
-
-    if config.max_samples is not None and config.max_samples > 0:
-        max_samples = min(config.max_samples, len(train_dataset))
-        train_dataset = train_dataset.select(range(max_samples))
-        logger.info("Limited train dataset to %d samples", max_samples)
-
-    # Each dataset may define its own tags; use the first dataset's metadata for
-    # preprocessing. Mixed-tag datasets can be extended here if needed.
-    first_info = all_dataset_info[requested_names[0]]
-    preprocess_fn = make_preprocess_function(tokenizer, first_info, config)
-
-    # Under distributed training only the main process should tokenize; the other
-    # ranks then reuse the on-disk datasets cache instead of repeating the work
-    # (which is what produced multiple "Tokenizing ..." progress bars).
-    #
-    # The interleaved dataset lives in memory (Dataset.from_list), so .map() will
-    # not cache to disk unless we pass an explicit cache_file_name. We derive that
-    # name from a deterministic fingerprint of the tokenization config so every
-    # rank computes the SAME path: rank 0 writes it, the other ranks load it.
-    cache_dir = Path(config.output_dir) / "tokenized_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    train_cache_file = str(cache_dir / f"train-{_tokenization_fingerprint(config, tokenizer, 'train')}.arrow")
-    eval_cache_file = str(cache_dir / f"eval-{_tokenization_fingerprint(config, tokenizer, 'eval')}.arrow")
-
+    # Under distributed training only the main process generates and writes the
+    # JSONL preview files; the other ranks wait at the context boundary and then
+    # load the same files from disk.
     map_context = (
-        training_args.main_process_first(desc="dataset tokenization")
+        training_args.main_process_first(desc="dataset generation")
         if training_args is not None
         else nullcontext()
     )
 
     with map_context:
-        train_dataset = train_dataset.map(
-            preprocess_fn,
-            batched=True,
-            batch_size=1,
-            num_proc=config.preprocessing_num_workers,
-            remove_columns=train_dataset.column_names,
-            cache_file_name=train_cache_file,
-            desc="Tokenizing train dataset",
-        )
+        if training_args is None or training_args.process_index == 0:
+            train_category_lists: List[List[Dict[str, Any]]] = []
+            eval_category_lists: List[List[Dict[str, Any]]] = []
 
-        if eval_dataset is not None:
-            eval_dataset = eval_dataset.map(
-                preprocess_fn,
-                batched=True,
-                batch_size=1,
-                num_proc=config.preprocessing_num_workers,
-                remove_columns=eval_dataset.column_names,
-                cache_file_name=eval_cache_file,
-                desc="Tokenizing eval dataset",
+            for name, train_split, eval_split, info in zip(
+                requested_names, train_splits, eval_splits, dataset_infos
+            ):
+                train_samples = _generate_turn_samples_for_split(
+                    train_split, info, config, tokenizer
+                )
+                eval_samples = (
+                    _generate_turn_samples_for_split(eval_split, info, config, tokenizer)
+                    if eval_split is not None
+                    else []
+                )
+
+                train_security = [s for s in train_samples if s["has_security_block"]]
+                train_non_security = [s for s in train_samples if not s["has_security_block"]]
+                eval_security = [s for s in eval_samples if s["has_security_block"]]
+                eval_non_security = [s for s in eval_samples if not s["has_security_block"]]
+
+                selected_train_non_security = _select_non_security_samples(
+                    train_non_security,
+                    len(train_security),
+                    config.non_security_to_security_turn_ratio,
+                    config.non_security_turn_sample_seed,
+                )
+                selected_eval_non_security = _select_non_security_samples(
+                    eval_non_security,
+                    len(eval_security),
+                    config.non_security_to_security_turn_ratio,
+                    config.non_security_turn_sample_seed,
+                )
+
+                security_path = output_dir / f"{name}_security_turns.jsonl"
+                non_security_path = output_dir / f"{name}_non_security_turns.jsonl"
+                _write_jsonl(security_path, train_security)
+                _write_jsonl(non_security_path, selected_train_non_security)
+
+                logger.info(
+                    "Wrote %s: %d security turns",
+                    security_path, len(train_security),
+                )
+                logger.info(
+                    "Wrote %s: %d non-security turns (selected from %d available, ratio=%.3f)",
+                    non_security_path,
+                    len(selected_train_non_security),
+                    len(train_non_security),
+                    config.non_security_to_security_turn_ratio,
+                )
+
+                if train_security:
+                    train_category_lists.append(train_security)
+                if selected_train_non_security:
+                    train_category_lists.append(selected_train_non_security)
+                if eval_security:
+                    eval_category_lists.append(eval_security)
+                if selected_eval_non_security:
+                    eval_category_lists.append(selected_eval_non_security)
+
+            train_interleaved = _interleave_sample_lists(
+                train_category_lists, config.shuffle_seed
             )
+            if config.max_samples is not None and config.max_samples > 0:
+                max_samples = min(config.max_samples, len(train_interleaved))
+                train_interleaved = train_interleaved[:max_samples]
+                logger.info("Limited train dataset to %d samples", max_samples)
+
+            _write_jsonl(train_interleaved_path, train_interleaved)
+            logger.info(
+                "Wrote %s: %d interleaved train turns",
+                train_interleaved_path, len(train_interleaved),
+            )
+
+            eval_interleaved = _interleave_sample_lists(
+                eval_category_lists, config.shuffle_seed
+            ) if eval_category_lists else []
+            if eval_interleaved:
+                _write_jsonl(eval_interleaved_path, eval_interleaved)
+                logger.info(
+                    "Wrote %s: %d interleaved eval turns",
+                    eval_interleaved_path, len(eval_interleaved),
+                )
+
+    # All ranks load the generated JSONL files.
+    train_dataset = load_dataset("json", data_files=str(train_interleaved_path), split="train")
+    if "assistant_content" in train_dataset.column_names:
+        train_dataset = train_dataset.remove_columns(["assistant_content"])
+
+    eval_dataset = None
+    if eval_interleaved_path.exists():
+        eval_dataset = load_dataset("json", data_files=str(eval_interleaved_path), split="train")
+        if "assistant_content" in eval_dataset.column_names:
+            eval_dataset = eval_dataset.remove_columns(["assistant_content"])
 
     return train_dataset, eval_dataset
 

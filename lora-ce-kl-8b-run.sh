@@ -14,10 +14,10 @@
 ###
 
 # Physical GPUs to use (must match nproc_per_node below).
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=2,3,4,5,6,7
 
 # Number of processes = number of GPUs above.
-NPROC=8
+NPROC=6
 
 # ---------------------------------------------------------------------------
 # NCCL settings for servers WITHOUT NVLink and WITHOUT PCIe P2P support.
