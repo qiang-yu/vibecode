@@ -68,7 +68,7 @@ class TrainingConfig:
     # Dataset metadata and data loading
     dataset_dir: str = "/home/qiangyu/Models/FineTune/Data"
     dataset_info_path: str = "/home/qiangyu/Models/FineTune/Data/dataset_info.json"
-    datasets: List[str] = field(default_factory=lambda: ["no_inject_data", "simple_inject_data"])
+    datasets: List[str] = field(default_factory=lambda: ["all"])  # "all" loads every dataset in dataset_info_path
     role_tag: str = "from"
     content_tag: str = "value"
     user_tag: str = "human"
@@ -572,6 +572,34 @@ def _apply_chat_template_with_fallback(
     return tokenizer.apply_chat_template(messages, **base_kwargs)
 
 
+def _render_chat_template_text(
+    tokenizer: Any,
+    messages: List[Dict[str, str]],
+    enable_thinking: bool,
+) -> str:
+    """Render ``messages`` to a string using the tokenizer's chat template.
+
+    This is the same template used to produce ``input_ids``; it is kept as a
+    human-readable preview in the JSONL output.
+    """
+    base_kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": False,
+    }
+
+    if enable_thinking:
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                **base_kwargs,
+                enable_thinking=True,
+            )
+        except TypeError:
+            pass  # Tokenizer does not accept enable_thinking; fall through.
+
+    return tokenizer.apply_chat_template(messages, **base_kwargs)
+
+
 def _mask_labels_for_assistant_turns(
     input_ids: List[int],
     messages: List[Dict[str, str]],
@@ -882,6 +910,7 @@ def build_turn_by_turn_samples(
         prefix_messages = messages[:turn_idx + 1]
         result = _apply_chat_template_with_fallback(tokenizer, prefix_messages, enable_thinking)
         input_ids = result["input_ids"]
+        conversation_text = _render_chat_template_text(tokenizer, prefix_messages, enable_thinking)
 
         labels, loss_weight, kl_weight_background, kl_weight_think_with_security, security_turn_mask, has_security, masked_any = _mask_labels_for_assistant_turns(
             input_ids,
@@ -925,6 +954,7 @@ def build_turn_by_turn_samples(
             "security_turn_mask": security_turn_mask,
             "has_security_block": has_security,
             "assistant_content": content,
+            "conversation": conversation_text,
         })
 
     return samples
@@ -1128,7 +1158,12 @@ def _generate_turn_samples_for_split(
     return samples
 
 
-def _tokenization_fingerprint(config: TrainingConfig, tokenizer: Any, split: str) -> str:
+def _tokenization_fingerprint(
+    config: TrainingConfig,
+    tokenizer: Any,
+    split: str,
+    resolved_datasets: Optional[List[str]] = None,
+) -> str:
     """
     Build a deterministic fingerprint for a tokenized split.
 
@@ -1138,9 +1173,10 @@ def _tokenization_fingerprint(config: TrainingConfig, tokenizer: Any, split: str
     deterministic cache name each rank re-tokenizes instead of reusing rank 0's
     work, which is what produced the repeated "Tokenizing ..." progress bars.
     """
+    dataset_names = resolved_datasets if resolved_datasets is not None else list(config.datasets)
     payload = {
         "split": split,
-        "datasets": list(config.datasets),
+        "datasets": dataset_names,
         "cutoff_len": config.cutoff_len,
         "loss_calc_ce_default_with_security_weight": config.loss_calc_ce_default_with_security_weight,
         "loss_calc_ce_default_without_security_weight": config.loss_calc_ce_default_without_security_weight,
@@ -1325,14 +1361,17 @@ def load_datasets(
 
     # All ranks load the generated JSONL files.
     train_dataset = load_dataset("json", data_files=str(train_interleaved_path), split="train")
-    if "assistant_content" in train_dataset.column_names:
-        train_dataset = train_dataset.remove_columns(["assistant_content"])
+    preview_columns = ["assistant_content", "conversation"]
+    drop_train_cols = [c for c in preview_columns if c in train_dataset.column_names]
+    if drop_train_cols:
+        train_dataset = train_dataset.remove_columns(drop_train_cols)
 
     eval_dataset = None
     if eval_interleaved_path.exists():
         eval_dataset = load_dataset("json", data_files=str(eval_interleaved_path), split="train")
-        if "assistant_content" in eval_dataset.column_names:
-            eval_dataset = eval_dataset.remove_columns(["assistant_content"])
+        drop_eval_cols = [c for c in preview_columns if c in eval_dataset.column_names]
+        if drop_eval_cols:
+            eval_dataset = eval_dataset.remove_columns(drop_eval_cols)
 
     return train_dataset, eval_dataset
 

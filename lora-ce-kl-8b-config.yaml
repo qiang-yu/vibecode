@@ -35,9 +35,13 @@ use_rslora: false
 # ---------------------------------------------------------------------------
 dataset_dir: /home/qiangyu/Models/FineTune/Data
 dataset_info_path: /home/qiangyu/Models/FineTune/Data/dataset_info.json
+# Use "all" to load every dataset listed in dataset_info.json. To load only
+# specific datasets, replace "all" with a list of dataset names, e.g.:
+#   datasets:
+#     - no_inject_data
+#     - simple_inject_data
 datasets:
-  - no_inject_data
-  - simple_inject_data
+  - all
 
 role_tag: from
 content_tag: value
@@ -57,7 +61,7 @@ loss_calc_ce_default_without_security_weight: 1.0
 # with the respective tag weights. Set a tag to null to disable that tag.
 loss_calc_ce_default_with_security_weight: 1.0  # default CE weight for untagged assistant content in security turns
 loss_calc_ce_tool_call_security_tag: tool_call_security
-loss_calc_ce_tool_call_security_with_security_weight: 2.0
+loss_calc_ce_tool_call_security_with_security_weight: 4.0
 loss_calc_ce_think_with_security_tag: think
 loss_calc_ce_think_with_security_weight: 1.0  # think CE weight in turns with tool_call_security
 loss_calc_ce_tool_call_with_security_tag: tool_call
@@ -86,10 +90,10 @@ eval_data_ratio: 0.05
 # ---------------------------------------------------------------------------
 stage: sft
 do_train: true
-output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260708_ce_0.0_nosecurity_nodropout_10epochs
+output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260708_ce_0.0_nosecurity_nodropout_6epochs_secweight4.0
 overwrite_output_dir: false
 seed: 42
-num_train_epochs: 10.0
+num_train_epochs: 6.0
 gradient_checkpointing: true
 per_device_train_batch_size: 1
 per_device_eval_batch_size: 1
