@@ -14,7 +14,7 @@
 ###
 
 # Physical GPUs to use (must match nproc_per_node below).
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 # Number of processes = number of GPUs above.
 NPROC=4
@@ -32,7 +32,7 @@ export NCCL_DEBUG=INFO           # set to INFO for verbose NCCL diagnostics, def
 
 torchrun \
     --nproc_per_node=${NPROC} \
-    --master_port=29501 \
+    --master_port=29503 \
     lora-ce-kl-8b.py \
-    --config_file lora-ce-kl-8b-config.yaml \
+    --config_file After-lora-ce-kl-8b-config.yaml \
     --per_device_max_memory_gb 78.0

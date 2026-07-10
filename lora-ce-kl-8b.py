@@ -306,190 +306,46 @@ def set_per_device_memory_fraction(max_memory_gb: Optional[float], local_rank: i
 # Dataset helpers
 # ---------------------------------------------------------------------------
 
-def _build_whitespace_flexible_pattern(text: str) -> str:
-    """Build a regex pattern that matches ``text`` but treats whitespace as flexible."""
-    parts = []
-    for char in text:
-        if char.isspace():
-            if not parts or parts[-1] != r"\s+":
-                parts.append(r"\s+")
-        else:
-            parts.append(re.escape(char))
-    return "".join(parts)
-
-
-def _find_content_span_flexible(
-    text: str,
-    content: str,
-    search_start: int = 0,
-) -> Optional[Tuple[int, int]]:
-    """Find ``content`` in ``text`` allowing whitespace differences. Return (start, end) or None."""
-    if not content:
-        return None
-    pattern = _build_whitespace_flexible_pattern(content)
-    match = re.search(pattern, text[search_start:])
-    if match:
-        return match.start() + search_start, match.end() + search_start
-    return None
-
-
-def _find_content_span_whitespace_robust(
-    text: str,
-    content: str,
-    search_start: int = 0,
-) -> Optional[Tuple[int, int]]:
-    """
-    Find ``content`` in ``text`` ignoring all whitespace differences.
-
-    Returns the character span in the *original* ``text``.
-    """
-    if not content:
-        return None
-
-    def normalize_with_map(s: str) -> Tuple[str, List[int]]:
-        norm_chars = []
-        index_map = []
-        for i, char in enumerate(s):
-            if not char.isspace():
-                norm_chars.append(char)
-                index_map.append(i)
-        return "".join(norm_chars), index_map
-
-    norm_full, full_map = normalize_with_map(text[search_start:])
-    norm_content, _ = normalize_with_map(content)
-
-    pos = norm_full.find(norm_content)
-    if pos == -1:
-        return None
-
-    # Map back to original character positions.
-    orig_start = full_map[pos] + search_start
-    orig_end = full_map[pos + len(norm_content) - 1] + 1 + search_start
-    return orig_start, orig_end
-
-
-def _find_assistant_content_spans(
+def _find_assistant_turn_spans(
     input_ids: List[int],
     messages: List[Dict[str, str]],
     tokenizer: Any,
-    tag_patterns: Optional[Dict[str, Any]] = None,
+    enable_thinking: bool,
 ) -> List[Tuple[int, int, int]]:
     """
     Return a list of (turn_idx, tok_start, tok_end) for every assistant turn.
 
-    The span is derived by searching for the assistant's raw ``content`` string
-    inside the decoded ``full_text`` and converting the character span back to a
-    token span. This avoids both chat-template prefix-stability problems and
-    BPE-context tokenization mismatches (the same string can tokenize differently
-    in isolation vs. inside a longer sequence).
+    The span is derived from the chat template itself: ``messages[:turn_idx]``
+    with ``add_generation_prompt=True`` produces the prompt up to (and including)
+    the assistant header, and ``messages[:turn_idx+1]`` produces the full
+    assistant response.  The assistant content tokens are therefore
+    ``upto_ids[len(head_ids):]``.
 
-    The returned span covers only the assistant's content (not the assistant
-    header added by the chat template). If a content sequence cannot be found,
-    ``tok_start`` and ``tok_end`` are both -1.
+    This is robust against chat templates that rewrite the assistant content
+    (e.g. Qwen3's ``enable_thinking`` mode, which extracts ``<think>`` blocks),
+    and it naturally includes any ``<tool_call_security>`` blocks whether they
+    appear inside or outside a ``<think>`` block.
     """
-    full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
     assistant_indices = [i for i, msg in enumerate(messages) if msg["role"] == "assistant"]
     spans: List[Tuple[int, int, int]] = []
-    search_start = 0
-    logger = logging.getLogger(__name__)
+    max_len = len(input_ids)
 
     for turn_idx in assistant_indices:
-        content = messages[turn_idx]["content"]
-        if not content:
+        head = _apply_chat_template_with_fallback(
+            tokenizer, messages[:turn_idx], enable_thinking, add_generation_prompt=True
+        )
+        upto = _apply_chat_template_with_fallback(
+            tokenizer, messages[: turn_idx + 1], enable_thinking, add_generation_prompt=False
+        )
+        head_ids = head["input_ids"]
+        upto_ids = upto["input_ids"]
+
+        tok_start = len(head_ids)
+        tok_end = min(len(upto_ids), max_len)
+        if tok_start < tok_end:
+            spans.append((turn_idx, tok_start, tok_end))
+        else:
             spans.append((turn_idx, -1, -1))
-            continue
-
-        char_start = -1
-        char_end = -1
-
-        # Attempt 1: exact substring match.
-        char_start = full_text.find(content, search_start)
-        if char_start != -1:
-            char_end = char_start + len(content)
-
-        # Attempt 2: exact match from beginning (handles overlapping content).
-        if char_start == -1:
-            char_start = full_text.find(content, 0)
-            if char_start != -1:
-                char_end = char_start + len(content)
-
-        # Attempt 3: whitespace-robust match. Chat templates often insert or remove
-        # blank lines between XML tags (e.g. </think>\n\n<tool_call_security> vs
-        # </think><tool_call_security>), so exact matching fails even though the
-        # content is otherwise preserved.
-        if char_start == -1:
-            robust_span = _find_content_span_whitespace_robust(full_text, content, search_start)
-            if robust_span is None:
-                robust_span = _find_content_span_whitespace_robust(full_text, content, 0)
-            if robust_span is not None:
-                char_start, char_end = robust_span
-
-        # Attempt 4: regex-based whitespace-flexible match as a safety net.
-        if char_start == -1:
-            flex_span = _find_content_span_flexible(full_text, content, search_start)
-            if flex_span is None:
-                flex_span = _find_content_span_flexible(full_text, content, 0)
-            if flex_span is not None:
-                char_start, char_end = flex_span
-
-        # Attempt 5: Qwen3's chat template extracts the text inside
-        # <think>...</think> as reasoning_content. For assistant turns before the
-        # final user query it outputs only the text after </think> (with leading
-        # newlines stripped), so the raw content can never be found verbatim. Match
-        # the post-think text instead.
-        if char_start == -1 and "</think>" in content:
-            no_think = content.split("</think>")[-1].lstrip("\n")
-            if no_think:
-                for start_pos in (search_start, 0):
-                    no_think_start = full_text.find(no_think, start_pos)
-                    if no_think_start != -1:
-                        char_start, char_end = no_think_start, no_think_start + len(no_think)
-                        break
-
-        # Attempt 6: whitespace-robust match on the post-think text. Chat templates
-        # may collapse or insert blank lines between XML tags, so exact matching of
-        # the stripped text can still fail even though the characters are present.
-        if char_start == -1 and "</think>" in content:
-            no_think = content.split("</think>")[-1].lstrip("\n")
-            if no_think:
-                for start_pos in (search_start, 0):
-                    robust_span = _find_content_span_whitespace_robust(full_text, no_think, start_pos)
-                    if robust_span is not None:
-                        char_start, char_end = robust_span
-                        break
-
-        # Attempt 7: search for any configured XML tag block in the content after
-        # the previous turn. This is a last-resort anchor for security turns where
-        # <tool_call_security> is likely preserved even if the surrounding text was
-        # rewritten.
-        if char_start == -1 and tag_patterns is not None:
-            best_start = -1
-            best_end = -1
-            for pattern in tag_patterns.values():
-                for match in pattern.finditer(full_text, search_start):
-                    if best_start == -1 or match.start() < best_start:
-                        best_start, best_end = match.start(), match.end()
-            if best_start != -1:
-                char_start, char_end = best_start, best_end
-
-        if char_start == -1:
-            logger.warning(
-                "Assistant turn %d: content (len=%d chars) not found in decoded "
-                "conversation; this turn will be skipped.",
-                turn_idx, len(content),
-            )
-            spans.append((turn_idx, -1, -1))
-            continue
-
-        # Convert character offsets to token offsets by re-encoding prefixes.
-        prefix_ids = tokenizer.encode(full_text[:char_start], add_special_tokens=False)
-        end_ids = tokenizer.encode(full_text[:char_end], add_special_tokens=False)
-        tok_start = len(prefix_ids)
-        tok_end = min(len(end_ids), len(input_ids))
-
-        spans.append((turn_idx, tok_start, tok_end))
-        search_start = char_end
-
     return spans
 
 
@@ -542,7 +398,26 @@ def format_messages(
         role = role_map.get(raw_role, raw_role)
         if role == "tool" and tool_role_in_template == "user":
             role = "user"
-        messages.append({"role": role, "content": turn.get(content_tag, "")})
+        content = turn.get(content_tag, "")
+        message: Dict[str, str] = {"role": role, "content": content}
+        # Keep the original assistant content so downstream code can detect tags
+        # (e.g. <tool_call_security>) regardless of whether we split out
+        # reasoning_content below.
+        if role == "assistant":
+            message["_raw_content"] = content
+            think_start = content.find("<think>")
+            think_end = content.find("</think>", think_start)
+            if think_start != -1 and think_end != -1:
+                reasoning_content = content[
+                    think_start + len("<think>") : think_end
+                ].strip("\n")
+                remaining = content[think_end + len("</think>") :].lstrip("\n")
+                # Some datasets contain malformed/mismatched <think> tags; strip
+                # any stray tags from the post-think content to avoid broken output.
+                remaining = remaining.replace("</think>", "").replace("<think>", "")
+                message["reasoning_content"] = reasoning_content
+                message["content"] = remaining
+        messages.append(message)
     return messages
 
 
@@ -550,13 +425,14 @@ def _apply_chat_template_with_fallback(
     tokenizer: Any,
     messages: List[Dict[str, str]],
     enable_thinking: bool,
+    add_generation_prompt: bool = False,
 ) -> Dict[str, Any]:
     """Call apply_chat_template, gracefully disabling thinking for non-Qwen models."""
     base_kwargs = {
         "tokenize": True,
         "return_tensors": None,
         "return_dict": True,
-        "add_generation_prompt": False,
+        "add_generation_prompt": add_generation_prompt,
     }
 
     if enable_thinking:
@@ -675,10 +551,11 @@ def _mask_labels_for_assistant_turns(
 
     security_pattern = tag_patterns.get(loss_calc_ce_tool_call_security_tag)
 
-    # Find each assistant turn's content token span by searching for the raw
-    # content token sequence inside input_ids. This avoids all chat-template
-    # prefix-stability assumptions.
-    turn_spans = _find_assistant_content_spans(input_ids, messages, tokenizer, tag_patterns)
+    # Find each assistant turn's token span by comparing chat-template outputs for
+    # prefix message lists. This is robust against templates that rewrite content
+    # (e.g. Qwen3's enable_thinking mode) and includes tool_call_security blocks
+    # regardless of whether they sit inside or outside a <think> block.
+    turn_spans = _find_assistant_turn_spans(input_ids, messages, tokenizer, enable_thinking)
     if allowed_turn_indices is not None:
         turn_spans = [
             (turn_idx, tok_start, tok_end)
@@ -694,9 +571,9 @@ def _mask_labels_for_assistant_turns(
         turn_token_spans.append((tok_start, tok_end))
         turn_texts.append(_decode_turn_text(input_ids, tok_start, tok_end, tokenizer))
 
-        content = messages[turn_idx]["content"]
+        raw_content = messages[turn_idx].get("_raw_content", messages[turn_idx]["content"])
         turn_has_security = (
-            security_pattern is not None and security_pattern.search(content) is not None
+            security_pattern is not None and security_pattern.search(raw_content) is not None
         )
         turn_has_security_list.append(turn_has_security)
         if turn_has_security:
@@ -706,7 +583,7 @@ def _mask_labels_for_assistant_turns(
         turn_text = turn_texts[turn_pos]
         tok_start, tok_end = turn_token_spans[turn_pos]
         turn_has_security = turn_has_security_list[turn_pos]
-        content = messages[turn_idx]["content"]
+        raw_content = messages[turn_idx].get("_raw_content", messages[turn_idx]["content"])
 
         if tok_start >= tok_end:
             continue
@@ -716,17 +593,22 @@ def _mask_labels_for_assistant_turns(
             loss_weight[tok_start:tok_end] = [loss_calc_ce_default_with_security_weight] * (tok_end - tok_start)
             masked_any = True
 
-            found_tags = set()
-            for tag_name, pattern in tag_patterns.items():
-                if tag_name == loss_calc_ce_tool_call_security_tag:
-                    weight = loss_calc_ce_tool_call_security_with_security_weight
-                elif tag_name == loss_calc_ce_think_with_security_tag:
-                    weight = loss_calc_ce_think_with_security_weight
-                elif tag_name == loss_calc_ce_tool_call_with_security_tag:
-                    weight = loss_calc_ce_tool_call_with_security_weight
-                else:
-                    continue
+            # Apply per-tag weights. tool_call_security is applied last so that
+            # its higher weight wins when it is nested inside <think> or adjacent
+            # to <tool_call>.
+            ordered_tags = [
+                (loss_calc_ce_think_with_security_tag, loss_calc_ce_think_with_security_weight),
+                (loss_calc_ce_tool_call_with_security_tag, loss_calc_ce_tool_call_with_security_weight),
+                (loss_calc_ce_tool_call_security_tag, loss_calc_ce_tool_call_security_with_security_weight),
+            ]
 
+            found_tags = set()
+            for tag_name, weight in ordered_tags:
+                if tag_name is None:
+                    continue
+                pattern = tag_patterns.get(tag_name)
+                if pattern is None:
+                    continue
                 tag_found = False
                 for match in pattern.finditer(turn_text):
                     rel_start, rel_end = _turn_text_char_span_to_token_span(
@@ -741,8 +623,13 @@ def _mask_labels_for_assistant_turns(
                 if tag_found:
                     found_tags.add(tag_name)
 
-            for tag_name, pattern in tag_patterns.items():
-                if pattern.search(content) and tag_name not in found_tags:
+            for tag_name, _ in ordered_tags:
+                if tag_name is None:
+                    continue
+                pattern = tag_patterns.get(tag_name)
+                if pattern is None:
+                    continue
+                if pattern.search(raw_content) and tag_name not in found_tags:
                     # When enable_thinking=True, Qwen3's chat template rewrites
                     # <think>...</think> into special tokens, so the literal tag is
                     # not present in the decoded text. Suppress the warning for

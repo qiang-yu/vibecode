@@ -32,7 +32,7 @@ export NCCL_DEBUG=INFO           # set to INFO for verbose NCCL diagnostics, def
 
 torchrun \
     --nproc_per_node=${NPROC} \
-    --master_port=29501 \
+    --master_port=29502 \
     lora-ce-kl-8b.py \
-    --config_file lora-ce-kl-8b-config.yaml \
+    --config_file In-lora-ce-kl-8b-config.yaml \
     --per_device_max_memory_gb 78.0
