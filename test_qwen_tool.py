@@ -1,11 +1,19 @@
+###
+# This script loads the Qwen3-8B model with an optional LoRA adapter
+# and runs a two-turn tool-calling conversation. It prints the raw
+# model output for each generation step.
+###
+
 import os
 import json
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 MODEL_PATH="/home/qiangyu/Models/Qwen/Qwen3-8B"
+LORA_PATH="/home/qiangyu/Models/FineTune/Qwen/cekl_train_20260709_ce_0.0_nosecurity_nodropout_6epochs_secweight1.0_after_tool"
 
 ################################################################################
 # load
@@ -26,6 +34,16 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="cuda",
     trust_remote_code=True
 ).eval()
+
+if LORA_PATH and os.path.isdir(LORA_PATH):
+    print(f"Loading LoRA adapter from {LORA_PATH}...")
+    model = PeftModel.from_pretrained(
+        model,
+        LORA_PATH,
+    )
+    model = model.merge_and_unload()
+elif LORA_PATH:
+    print(f"Warning: LoRA path does not exist: {LORA_PATH}")
 
 ################################################################################
 # tool definition
