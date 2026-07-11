@@ -13,13 +13,13 @@ import sys
 from pathlib import Path
 
 
-MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-32B"
-INPUT_FILE = "func-calling/glaive-function-calling-5k-injected.json"
-OUTPUT_FILE = "func-calling/glaive-function-calling-5k-injected-inference-32b.json"
-TEMP_FILE = "func-calling/glaive-function-calling-5k-injected-inference-32b.jsonl"
+MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-8B"
+INPUT_FILE = "func-calling/glaive-function-calling-5k.json"
+OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b.json"
+TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b.jsonl"
 
 # GPU list used for parallel processing. Each GPU loads its own model instance.
-GPU_IDS = [0, 1, 2, 3, 4, 5, 6, 7]
+GPU_IDS = [4, 5, 6, 7]
 
 
 def generate_response(messages, tools, model, tokenizer):
