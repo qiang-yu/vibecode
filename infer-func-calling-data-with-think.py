@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-8B"
-INPUT_FILE = "func-calling/glaive-function-calling-5k.json"
+INPUT_FILE = "func-calling/glaive-function-calling-5k-no-system.json"
 OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b.json"
 TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b.jsonl"
 
