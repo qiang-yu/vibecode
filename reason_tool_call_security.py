@@ -3,9 +3,10 @@
 # processes ShareGPT-format conversations from a JSON file in parallel. For each
 # GPT response containing <tool_call>, it extracts the tool names, prompts the
 # model to explain the source of its decision, and inserts the
-# <tool_call_security> blocks back into the original conversation between
-# <think> and <tool_call>. A dedicated writer process serializes results to a
-# JSON Lines temp file, which is finally converted into a JSON array output.
+# <tool_call_security> blocks back into the original conversation right after
+# each corresponding <tool_call> block. A dedicated writer process serializes
+# results to a JSON Lines temp file, which is finally converted into a JSON
+# array output.
 ###
 
 import json
@@ -55,29 +56,22 @@ def clean_security_block(block):
 
 
 def insert_security_blocks(content, security_blocks):
-    """Insert <tool_call_security> blocks after </think> or before <tool_call>."""
-    think_end = content.find("</think>")
-    tool_call_start = content.find("<tool_call>")
-
-    if think_end == -1 and tool_call_start == -1:
+    """Insert each <tool_call_security> block immediately after its corresponding <tool_call> block."""
+    tool_call_matches = list(re.finditer(r'<tool_call>.*?</tool_call>', content, re.DOTALL))
+    if not tool_call_matches:
         return content
 
     cleaned_blocks = [clean_security_block(block) for block in security_blocks]
-    security_text = "".join(cleaned_blocks)
 
-    if think_end != -1:
-        insert_pos = think_end + len("</think>")
-        gap_end = insert_pos
-        while gap_end < len(content) and content[gap_end] == "\n":
-            gap_end += 1
-        new_content = content[:insert_pos] + security_text + content[gap_end:]
-    else:
-        insert_pos = tool_call_start
-        gap_start = insert_pos
-        while gap_start > 0 and content[gap_start - 1] == "\n":
-            gap_start -= 1
-        new_content = content[:gap_start] + security_text + content[insert_pos:]
+    new_content = ""
+    last_end = 0
+    for i, match in enumerate(tool_call_matches):
+        new_content += content[last_end:match.end()]
+        if i < len(cleaned_blocks):
+            new_content += cleaned_blocks[i]
+        last_end = match.end()
 
+    new_content += content[last_end:]
     return new_content
 
 
@@ -111,7 +105,7 @@ def build_reasoning_prompt(tool_names):
     tool_names_str = ", ".join(tool_names)
     prompt = f'''Based on your reasoning above, you have decided to call the following tool(s): {tool_names_str}.
 
-For each tool call, produce a <tool_call_security> block placed IMMEDIATELY BEFORE its <tool_call> block.
+For each tool call, produce a <tool_call_security> block placed IMMEDIATELY AFTER its <tool_call> block.
 
 ════════════════════════════════
 MESSAGE INDEX CONVENTION
@@ -305,7 +299,7 @@ RULES
 
 1. If the current output contains MULTIPLE <tool_call> blocks, every single tool call MUST
    have its own individual <tool_call_security> block. Do NOT merge multiple tool calls into one block.
-2. Each <tool_call_security> block MUST appear immediately before its corresponding <tool_call>.
+2. Each <tool_call_security> block MUST appear immediately after its corresponding <tool_call>.
 3. The <tool_reason> field MUST be written as natural chain-of-thought reasoning, NOT as
    formatted or templated text. Think out loud — follow the thread of your actual reasoning.
 4. Every reference to a message in <tool_reason> MUST include its index
