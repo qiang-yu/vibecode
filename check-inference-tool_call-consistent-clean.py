@@ -9,7 +9,7 @@ import json
 import re
 
 # Configuration: path to the inference result file
-INFERENCE_FILE_PATH = "func-calling/glaive-function-calling-5k-inference-32b.json"
+INFERENCE_FILE_PATH = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b.json"
 
 
 def extract_tool_call_name(value: str) -> str | None:
