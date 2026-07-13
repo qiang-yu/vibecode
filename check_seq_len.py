@@ -1,21 +1,21 @@
-"""
-统计数据集实际训练时的 token 序列长度分布。
-
-跟简单地把整段对话文本 tokenize 一遍不同，这里按你训练脚本实际的
-turn_by_turn 逻辑复现：对每个 assistant 轮次，取"从对话开头到这一轮
-为止"的所有消息，套用 chat template 编码，得到的长度才是真正喂给模型
-的那条训练样本的长度。whole 模式则是整段对话编码一次。
-
-用法：
-    python check_seq_len.py --dataset your_data.json --tokenizer /path/to/Qwen3-8B
-    python check_seq_len.py --dataset your_data.json --tokenizer /path/to/Qwen3-8B --mode whole
-    python check_seq_len.py --dataset your_data.json --tokenizer /path/to/Qwen3-8B --plot out.png
-
-    python check_seq_len.py --dataset func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security-more-tools-clean.json --tokenizer /home/qiangyu/Models/Qwen/Qwen3-8B
-
-    python check_seq_len.py --dataset func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b-clean-clean-tool_call_security-more-tools-clean.json --tokenizer /home/qiangyu/Models/Qwen/Qwen3-8B
-
-"""
+###
+# Analyze the token sequence length distribution of a dataset during actual training.
+#
+# Unlike simply tokenizing the entire conversation text, this script reproduces the
+# turn_by_turn logic used by the training script: for each assistant turn, it takes
+# all messages from the beginning of the conversation up to and including that turn,
+# applies the chat template, and reports the length of the resulting training sample.
+# The "whole" mode encodes the entire conversation once.
+#
+# Usage:
+#     python check_seq_len.py --dataset your_data.json --tokenizer /path/to/Qwen3-8B
+#     python check_seq_len.py --dataset your_data.json --tokenizer /path/to/Qwen3-8B --mode whole
+#     python check_seq_len.py --dataset your_data.json --tokenizer /path/to/Qwen3-8B --plot out.png
+#
+#     python check_seq_len.py --dataset func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security-more-tools-clean.json --tokenizer /home/qiangyu/Models/Qwen/Qwen3-8B
+#
+#     python check_seq_len.py --dataset func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b-clean-clean-tool_call_security-more-tools-clean.json --tokenizer /home/qiangyu/Models/Qwen/Qwen3-8B
+###
 import argparse
 import json
 from typing import Any, Dict, List
@@ -90,7 +90,7 @@ def collect_lengths(data, tokenizer, mode: str, role_tag: str, content_tag: str,
 
 def print_stats(name: str, lengths: List[int]):
     if not lengths:
-        print(f"\n[{name}] 无样本")
+        print(f"\n[{name}] No samples")
         return
     lengths = sorted(lengths)
     n = len(lengths)
@@ -99,7 +99,7 @@ def print_stats(name: str, lengths: List[int]):
         idx = min(n - 1, int(n * p))
         return lengths[idx]
 
-    print(f"\n[{name}] 样本数: {n}")
+    print(f"\n[{name}] Sample count: {n}")
     print(f"  min:  {lengths[0]}")
     print(f"  p50:  {pct(0.50)}")
     print(f"  p90:  {pct(0.90)}")
@@ -107,7 +107,7 @@ def print_stats(name: str, lengths: List[int]):
     print(f"  p99:  {pct(0.99)}")
     print(f"  max:  {lengths[-1]}")
 
-    # 简单文本直方图，桶宽根据最大值自动调整
+    # Simple text histogram; bucket edges are fixed.
     buckets = [512, 1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768]
     counts = [0] * (len(buckets) + 1)
     for l in lengths:
@@ -120,7 +120,7 @@ def print_stats(name: str, lengths: List[int]):
         if not placed:
             counts[-1] += 1
 
-    print("  分布:")
+    print("  Distribution:")
     prev = 0
     for b, c in zip(buckets, counts[:-1]):
         if c:
@@ -133,16 +133,16 @@ def print_stats(name: str, lengths: List[int]):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="统计训练数据的 token 序列长度分布")
-    parser.add_argument("--dataset", required=True, help="ShareGPT 格式的 json 数据集路径")
-    parser.add_argument("--tokenizer", required=True, help="tokenizer / 模型路径")
+    parser = argparse.ArgumentParser(description="Analyze token sequence length distribution of training data")
+    parser.add_argument("--dataset", required=True, help="Path to the ShareGPT-format JSON dataset")
+    parser.add_argument("--tokenizer", required=True, help="Tokenizer or model path")
     parser.add_argument("--mode", choices=["turn_by_turn", "whole"], default="turn_by_turn",
-                         help="对应训练脚本里的 conversation_mode，默认 turn_by_turn")
+                         help="Conversation mode used in the training script; default is turn_by_turn")
     parser.add_argument("--role_tag", default="from")
     parser.add_argument("--content_tag", default="value")
     parser.add_argument("--msg_column", default="conversations")
     parser.add_argument("--enable_thinking", action="store_true", default=True)
-    parser.add_argument("--plot", default=None, help="可选：保存长度分布直方图到该路径 (需要 matplotlib)")
+    parser.add_argument("--plot", default=None, help="Optional path to save the length distribution histogram (requires matplotlib)")
     args = parser.parse_args()
 
     from transformers import AutoTokenizer
@@ -155,10 +155,10 @@ def main():
         data, tokenizer, args.mode, args.role_tag, args.content_tag, args.msg_column, args.enable_thinking
     )
 
-    print_stats("全部训练样本", all_lengths)
+    print_stats("All training samples", all_lengths)
     if args.mode == "turn_by_turn":
-        print_stats("含 tool_call_security 标签的样本", security_lengths)
-        print_stats("不含 tool_call_security 标签的样本(replay数据)", non_security_lengths)
+        print_stats("Samples containing tool_call_security tag", security_lengths)
+        print_stats("Samples without tool_call_security tag (replay data)", non_security_lengths)
 
     if args.plot:
         try:
@@ -175,9 +175,9 @@ def main():
             plt.legend()
             plt.tight_layout()
             plt.savefig(args.plot)
-            print(f"\n直方图已保存到 {args.plot}")
+            print(f"\nHistogram saved to {args.plot}")
         except ImportError:
-            print("\n未安装 matplotlib，跳过画图（可选功能，不影响统计结果）")
+            print("\nmatplotlib not installed; skipping plotting (optional, does not affect statistics)")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 ###
 # This script checks ShareGPT-format JSON files for a tool-call security rule.
 # For every "from": "gpt" message whose value contains <tool_call>, each
-# <tool_call> must be preceded by exactly one complete
+# <tool_call> must be followed by exactly one complete
 # <tool_call_security>...</tool_call_security> block.
 #
 # Non-conforming items from all input files are written to OUTPUT_FILE whenever
@@ -46,11 +46,11 @@ def count_security_blocks(value: str) -> int:
     return len(SECURITY_BLOCK_RE.findall(value))
 
 
-def count_security_blocks_before_each_tool_call(value: str) -> list[int]:
+def count_security_blocks_after_each_tool_call(value: str) -> list[int]:
     """
     For each <tool_call> in value, count the number of complete
     <tool_call_security>...</tool_call_security> blocks in the text
-    that precedes it (since the previous <tool_call> or from the start).
+    that follows it (until the next <tool_call> or the end).
     """
     if TOOL_CALL_OPEN not in value:
         return []
@@ -60,8 +60,8 @@ def count_security_blocks_before_each_tool_call(value: str) -> list[int]:
     # parts[i] (i >= 1) is the text between the i-th and (i+1)-th <tool_call>.
     counts = []
     for i in range(1, len(parts)):
-        preceding = parts[i - 1]
-        counts.append(count_security_blocks(preceding))
+        following = parts[i]
+        counts.append(count_security_blocks(following))
     return counts
 
 
@@ -71,12 +71,12 @@ def check_message(value: str) -> tuple[int, int, int]:
 
     Returns:
         - total: number of <tool_call> occurrences.
-        - missing_count: number of tool calls with 0 preceding security blocks
+        - missing_count: number of tool calls with 0 following security blocks
           (error type 1).
-        - multiple_count: number of tool calls with more than 1 preceding
+        - multiple_count: number of tool calls with more than 1 following
           security blocks (error type 2).
     """
-    counts = count_security_blocks_before_each_tool_call(value)
+    counts = count_security_blocks_after_each_tool_call(value)
     total = len(counts)
     missing_count = sum(1 for c in counts if c == 0)
     multiple_count = sum(1 for c in counts if c > 1)
@@ -236,7 +236,7 @@ def process_file(input_path: str) -> list[dict]:
     print()
     print("  Tool-call level statistics:")
     print(f"    Total <tool_call> occurrences: {total_tool_calls}")
-    print(f"    Correct (exactly 1 preceding security block): {correct_tool_calls}")
+    print(f"    Correct (exactly 1 following security block): {correct_tool_calls}")
     print(f"    Missing security block (error type 1): {missing_tool_calls}")
     print(f"    Multiple security blocks (error type 2): {multiple_tool_calls}")
     print()
