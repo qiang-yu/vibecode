@@ -1,27 +1,36 @@
 ###
-# Analyze the token sequence length distribution of a dataset during actual training.
+# Analyze the token sequence length distribution of datasets during actual training.
 #
 # Unlike simply tokenizing the entire conversation text, this script reproduces the
 # turn_by_turn logic used by the training script: for each assistant turn, it takes
 # all messages from the beginning of the conversation up to and including that turn,
 # applies the chat template, and reports the length of the resulting training sample.
-# The "whole" mode encodes the entire conversation once.
 #
 # Usage:
+#     python check_seq_len.py --dataset your_data.json
 #     python check_seq_len.py --dataset your_data.json --tokenizer /path/to/Qwen3-8B
-#     python check_seq_len.py --dataset your_data.json --tokenizer /path/to/Qwen3-8B --mode whole
-#     python check_seq_len.py --dataset your_data.json --tokenizer /path/to/Qwen3-8B --plot out.png
+#     python check_seq_len.py --dataset your_data.json --plot out.png
 #
-#     python check_seq_len.py --dataset func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security-more-tools-clean.json --tokenizer /home/qiangyu/Models/Qwen/Qwen3-8B
+#     python check_seq_len.py --dataset func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security-more-tools-clean.json
 #
-#     python check_seq_len.py --dataset func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b-clean-clean-tool_call_security-more-tools-clean.json --tokenizer /home/qiangyu/Models/Qwen/Qwen3-8B
+#     python check_seq_len.py --dataset func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b-clean-clean-tool_call_security-more-tools-clean.json
 ###
 import argparse
 import json
+from pathlib import Path
 from typing import Any, Dict, List
 
 
 ROLE_MAP_DEFAULT = {"human": "user", "gpt": "assistant", "system": "system", "tool": "tool"}
+
+# Input files to process when --dataset is not provided. Modify these paths as needed.
+INPUT_FILES = [
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security-more-tools-clean.json",
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b-clean-clean-tool_call_security-more-tools-clean.json",
+]
+
+# Default tokenizer or model path. Modify this path as needed.
+DEFAULT_TOKENIZER = "/home/qiangyu/Models/Qwen/Qwen3-8B"
 
 
 def format_messages(conversation: List[Dict[str, Any]], role_tag="from", content_tag="value",
@@ -49,12 +58,14 @@ def apply_chat_template_len(tokenizer, messages, enable_thinking: bool) -> int:
     return len(result["input_ids"])
 
 
-def collect_lengths(data, tokenizer, mode: str, role_tag: str, content_tag: str,
+def collect_lengths(data, tokenizer, role_tag: str, content_tag: str,
                      msg_column: str, enable_thinking: bool):
     """
-    Returns two lists of lengths: all_lengths, security_lengths
-    (security_lengths only includes turn_by_turn samples whose assistant turn
-    contains the tool_call_security tag, for a side-by-side comparison).
+    Returns three lists of lengths: all_lengths, security_lengths, and
+    non_security_lengths. The lengths are computed in turn_by_turn mode:
+    for each assistant turn, the prefix up to and including that turn is
+    encoded. security_lengths only includes turns whose assistant content
+    contains the tool_call_security tag, for a side-by-side comparison.
     """
     all_lengths = []
     security_lengths = []
@@ -65,11 +76,6 @@ def collect_lengths(data, tokenizer, mode: str, role_tag: str, content_tag: str,
         if not conversation:
             continue
         messages = format_messages(conversation, role_tag, content_tag)
-
-        if mode == "whole":
-            length = apply_chat_template_len(tokenizer, messages, enable_thinking)
-            all_lengths.append(length)
-            continue
 
         # turn_by_turn: one sample per assistant turn, using the prefix up to
         # and including that turn.
@@ -132,12 +138,46 @@ def print_stats(name: str, lengths: List[int]):
         print(f"    > {buckets[-1]:>5}: {counts[-1]:>6} ({counts[-1]/n:.1%}) {bar}")
 
 
+def process_file(input_path: str, tokenizer, role_tag: str, content_tag: str,
+                 msg_column: str, enable_thinking: bool, plot: str = None) -> None:
+    """Analyze and print sequence length statistics for one input file."""
+    input_path = Path(input_path)
+    with input_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    all_lengths, security_lengths, non_security_lengths = collect_lengths(
+        data, tokenizer, role_tag, content_tag, msg_column, enable_thinking
+    )
+
+    print(f"Input file: {input_path}")
+    print_stats("All training samples", all_lengths)
+    print_stats("Samples containing tool_call_security tag", security_lengths)
+    print_stats("Samples without tool_call_security tag (replay data)", non_security_lengths)
+
+    if plot:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            plt.figure(figsize=(8, 5))
+            plt.hist(all_lengths, bins=60)
+            plt.xlabel("token length")
+            plt.ylabel("count")
+            plt.title("Sequence length distribution (turn_by_turn)")
+            plt.axvline(16384, color="red", linestyle="--", label="cutoff_len=16384")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(plot)
+            print(f"\nHistogram saved to {plot}")
+        except ImportError:
+            print("\nmatplotlib not installed; skipping plotting (optional, does not affect statistics)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze token sequence length distribution of training data")
-    parser.add_argument("--dataset", required=True, help="Path to the ShareGPT-format JSON dataset")
-    parser.add_argument("--tokenizer", required=True, help="Tokenizer or model path")
-    parser.add_argument("--mode", choices=["turn_by_turn", "whole"], default="turn_by_turn",
-                         help="Conversation mode used in the training script; default is turn_by_turn")
+    parser.add_argument("--dataset", default=None, help="Path to the ShareGPT-format JSON dataset")
+    parser.add_argument("--tokenizer", default=DEFAULT_TOKENIZER, help="Tokenizer or model path")
     parser.add_argument("--role_tag", default="from")
     parser.add_argument("--content_tag", default="value")
     parser.add_argument("--msg_column", default="conversations")
@@ -148,36 +188,18 @@ def main():
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
 
-    with open(args.dataset, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    datasets = [args.dataset] if args.dataset else INPUT_FILES
 
-    all_lengths, security_lengths, non_security_lengths = collect_lengths(
-        data, tokenizer, args.mode, args.role_tag, args.content_tag, args.msg_column, args.enable_thinking
-    )
-
-    print_stats("All training samples", all_lengths)
-    if args.mode == "turn_by_turn":
-        print_stats("Samples containing tool_call_security tag", security_lengths)
-        print_stats("Samples without tool_call_security tag (replay data)", non_security_lengths)
-
-    if args.plot:
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-
-            plt.figure(figsize=(8, 5))
-            plt.hist(all_lengths, bins=60)
-            plt.xlabel("token length")
-            plt.ylabel("count")
-            plt.title(f"Sequence length distribution ({args.mode})")
-            plt.axvline(16384, color="red", linestyle="--", label="cutoff_len=16384")
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(args.plot)
-            print(f"\nHistogram saved to {args.plot}")
-        except ImportError:
-            print("\nmatplotlib not installed; skipping plotting (optional, does not affect statistics)")
+    for input_file in datasets:
+        process_file(
+            input_file,
+            tokenizer,
+            args.role_tag,
+            args.content_tag,
+            args.msg_column,
+            args.enable_thinking,
+            args.plot,
+        )
 
 
 if __name__ == "__main__":
