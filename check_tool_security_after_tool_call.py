@@ -19,8 +19,8 @@ from pathlib import Path
 
 # Input files to check. Modify these paths as needed.
 INPUT_FILES = [
-    "func-calling/glaive-function-calling-5k-inference-32b-clean-tool-call-security-more-tools.json",
-    "func-calling/glaive-function-calling-5k-injected-inference-32b-clean-tool-call-security-more-tools.json",
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security-more-tools.json",
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b-clean-clean-tool_call_security-more-tools.json",
 ]
 
 # Output file for all non-conforming ShareGPT items. It is written only when
