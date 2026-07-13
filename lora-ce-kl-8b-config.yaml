@@ -61,7 +61,7 @@ loss_calc_ce_default_without_security_weight: 1.0
 # with the respective tag weights. Set a tag to null to disable that tag.
 loss_calc_ce_default_with_security_weight: 1.0  # default CE weight for untagged assistant content in security turns
 loss_calc_ce_tool_call_security_tag: tool_call_security
-loss_calc_ce_tool_call_security_with_security_weight: 4.0
+loss_calc_ce_tool_call_security_with_security_weight: 1.0
 loss_calc_ce_think_with_security_tag: think
 loss_calc_ce_think_with_security_weight: 1.0  # think CE weight in turns with tool_call_security
 loss_calc_ce_tool_call_with_security_tag: tool_call
@@ -79,7 +79,7 @@ loss_calc_ce_tool_call_with_security_weight: 1.0  # tool_call CE weight in turns
 non_security_to_security_turn_ratio: 0.0
 non_security_turn_sample_seed: 42
 
-cutoff_len: 16384
+cutoff_len: 8192
 max_samples: 100000
 preprocessing_num_workers: 16
 shuffle_seed: 42
@@ -90,7 +90,7 @@ eval_data_ratio: 0.05
 # ---------------------------------------------------------------------------
 stage: sft
 do_train: true
-output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260708_ce_0.0_nosecurity_nodropout_6epochs_secweight4.0
+output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260713_ce_0.0_nosecurity_nodropout_6epochs_8B
 overwrite_output_dir: false
 seed: 42
 num_train_epochs: 6.0
@@ -147,6 +147,6 @@ enable_thinking: true
 # ---------------------------------------------------------------------------
 loss_calc_kl_enabled: false  # default false: only CE loss, no KL reference-logit computation
 loss_calc_kl_alpha: 0.2
-loss_calc_kl_think_with_security_alpha: 0.1  # KL coefficient for <think> in security turns when enabled
-loss_calc_kl_enable_without_security: false  # enable KL for assistant turns without tool_call_security
+loss_calc_kl_think_with_security_alpha: 0.2  # KL coefficient for <think> in security turns when enabled
+loss_calc_kl_enable_without_security: false  # enale KL for assistant turns without tool_call_security
 loss_calc_kl_enable_with_security: false  # enable KL for assistant turns that contain tool_call_security (background + think, excluding tool_call blocks)
