@@ -11,7 +11,9 @@ turn_by_turn 逻辑复现：对每个 assistant 轮次，取"从对话开头到�
     python check_seq_len.py --dataset your_data.json --tokenizer /path/to/Qwen3-8B --mode whole
     python check_seq_len.py --dataset your_data.json --tokenizer /path/to/Qwen3-8B --plot out.png
 
-    python check_seq_len.py --dataset func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security-more-tools.json --tokenizer /home/qiangyu/Models/Qwen/Qwen3-8B
+    python check_seq_len.py --dataset func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security-more-tools-clean.json --tokenizer /home/qiangyu/Models/Qwen/Qwen3-8B
+
+    python check_seq_len.py --dataset func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b-clean-clean-tool_call_security-more-tools-clean.json --tokenizer /home/qiangyu/Models/Qwen/Qwen3-8B
 
 """
 import argparse
