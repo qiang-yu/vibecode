@@ -24,8 +24,8 @@ TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b.
 
 # GPU lists used for parallel processing. Each small GPU loads its own small model instance.
 # BIG_GPU_IDS lists the GPUs used for one big model instance. Set to [] to disable big model.
-SMALL_GPU_IDS = [4, 5, 6, 7]
-BIG_GPU_IDS = [2]
+SMALL_GPU_IDS = [1, 2, 3]
+BIG_GPU_IDS = [0]
 
 
 def generate_response(messages, tools, model, tokenizer):
@@ -133,12 +133,13 @@ def process_single_data(data: dict, model, tokenizer, big_generate_fn=None) -> d
     return data
 
 
-def big_worker(big_gpu_ids, big_pipes):
+def big_worker(big_gpu_ids, big_pipes, exit_event):
     """
     Dedicated worker process that loads a single big model instance.
     Each small worker has a dedicated Pipe; this worker listens on all pipes
     via select, processes requests one by one, and sends the response string
-    back through the same pipe.
+    back through the same pipe. The exit_event provides a reliable shutdown
+    signal independent of pipe state.
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in big_gpu_ids)
     import select
@@ -173,8 +174,12 @@ def big_worker(big_gpu_ids, big_pipes):
 
     pipes = list(big_pipes.values())
     while True:
+        if exit_event.is_set():
+            print(f"[BIG GPUs {big_gpu_ids}] Exit event set, shutting down.")
+            return
+
         try:
-            readable, _, _ = select.select(pipes, [], [], None)
+            readable, _, _ = select.select(pipes, [], [], 1.0)
         except select.error as e:
             print(f"[BIG GPUs {big_gpu_ids}] select error: {e}")
             break
@@ -183,8 +188,10 @@ def big_worker(big_gpu_ids, big_pipes):
             try:
                 task = conn.recv()
             except EOFError:
+                print(f"[BIG GPUs {big_gpu_ids}] Pipe closed, shutting down.")
                 return
             if task is None:
+                print(f"[BIG GPUs {big_gpu_ids}] Received None, shutting down.")
                 return
             gpu_id, messages, tools = task
             print(f"[BIG GPUs {big_gpu_ids}] Generating for small GPU {gpu_id}...")
@@ -198,7 +205,10 @@ def big_worker(big_gpu_ids, big_pipes):
                 print(f"[BIG GPUs {big_gpu_ids}] Done for small GPU {gpu_id}.")
             except Exception as e:
                 print(f"[BIG GPUs {big_gpu_ids}] Error generating response: {e}")
-                conn.send(e)
+                try:
+                    conn.send(e)
+                except Exception as send_err:
+                    print(f"[BIG GPUs {big_gpu_ids}] Failed to send error to GPU {gpu_id}: {send_err}")
 
 
 def worker(gpu_id, task_queue, result_queue, big_pipe=None):
@@ -339,11 +349,13 @@ def main():
     # Each small worker gets a dedicated Pipe to talk to the big worker.
     # The big worker uses select() to listen on all pipes and processes
     # requests one by one. The response string is sent directly back through
-    # the same pipe.
+    # the same pipe. An Event provides a reliable shutdown signal.
     big_pipes = None
     small_pipes = None
     big_worker_p = None
+    big_exit_event = None
     if BIG_GPU_IDS:
+        big_exit_event = mp.Event()
         big_pipes = {}
         small_pipes = {}
         for gpu_id in SMALL_GPU_IDS:
@@ -352,7 +364,7 @@ def main():
             small_pipes[gpu_id] = child_conn
         big_worker_p = mp.Process(
             target=big_worker,
-            args=(BIG_GPU_IDS, big_pipes)
+            args=(BIG_GPU_IDS, big_pipes, big_exit_event)
         )
         big_worker_p.start()
 
@@ -388,12 +400,20 @@ def main():
 
     # Signal big worker to exit and wait for it
     if big_worker_p is not None:
+        # Set the exit event so the big worker breaks out of its select loop
+        # even if pipe-based shutdown is unreliable.
+        big_exit_event.set()
+        # Also try to wake up each pipe by sending None.
         for conn in big_pipes.values():
             try:
                 conn.send(None)
             except Exception:
                 pass
-        big_worker_p.join()
+        big_worker_p.join(timeout=60)
+        if big_worker_p.is_alive():
+            print("Warning: big worker did not exit gracefully, terminating...")
+            big_worker_p.terminate()
+            big_worker_p.join()
 
     # Signal writer to exit and wait for it
     result_queue.put(None)
