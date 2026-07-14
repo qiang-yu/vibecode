@@ -1785,8 +1785,10 @@ class WeightedLossTrainer(Trainer):
                     loss = loss + weighted_think_sum / think_count
 
         # Newer transformers versions pass num_items_in_batch and skip the division
-        # by gradient_accumulation_steps in training_step.
-        if num_items_in_batch is not None and self.args.gradient_accumulation_steps > 1:
+        # by gradient_accumulation_steps in training_step. Only apply this scaling
+        # during training; evaluation has no gradient accumulation and must report
+        # the unscaled loss.
+        if model.training and num_items_in_batch is not None and self.args.gradient_accumulation_steps > 1:
             loss = loss / self.args.gradient_accumulation_steps
 
         outputs.loss = loss
