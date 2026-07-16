@@ -33,4 +33,7 @@
     check_seq_len.py
     cut_seq_len.py    
     
-    
+   
+8. Qwen3 如果需要 no-thinking 的训练数据，可以用
+   make_sharegpt_data_no_thinking.py
+ 
