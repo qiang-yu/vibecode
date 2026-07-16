@@ -66,8 +66,7 @@ class TrainingConfig:
     use_rslora: bool = False
 
     # Dataset metadata and data loading
-    dataset_dir: str = "/home/qiangyu/Models/FineTune/Data"
-    dataset_info_path: str = "/home/qiangyu/Models/FineTune/Data/dataset_info.json"
+    dataset_info_path: str = "/home/qiangyu/Models/FineTune/Data-no-thinking/dataset_info.json"
     datasets: List[str] = field(default_factory=lambda: ["all"])  # "all" loads every dataset in dataset_info_path
     role_tag: str = "from"
     content_tag: str = "value"
@@ -148,7 +147,7 @@ class TrainingConfig:
     per_device_max_memory_gb: Optional[float] = 70.0  # cap PyTorch memory per GPU; null disables the limit
 
     # Qwen3-specific thinking mode
-    enable_thinking: bool = True
+    enable_thinking: bool = False
 
     # KL anchoring against the frozen base weights inside the LoRA model.
     # disable_adapter() is used during training to obtain reference logits, so no
@@ -1107,7 +1106,7 @@ def load_datasets(
     from datasets import load_dataset
     from contextlib import nullcontext
 
-    dataset_dir = Path(config.dataset_dir)
+    dataset_dir = Path(config.dataset_info_path).parent
     with open(config.dataset_info_path, "r", encoding="utf-8") as f:
         all_dataset_info = json.load(f)
 
