@@ -137,7 +137,7 @@ def run_task_with_injection_tasks(
                     #     raise e
                 except ApiError as e:
                     logger.log_error(
-                        f"Skipping task '{user_task.ID}' with '{injection_task.ID}' because of internal server error: {e}"
+                        f"Skipping task '{user_task.ID}' with '{injection_task.ID}' because of ApiError: {e}"
                     )
                     utility = False
                     security = True
@@ -152,7 +152,7 @@ def run_task_with_injection_tasks(
                 # except ServerError as e:
                 except Exception as e:
                     logger.log_error(
-                        f"Skipping task '{user_task.ID}' with '{injection_task.ID}' because of internal server error: {e}"
+                        f"Skipping task '{user_task.ID}' with '{injection_task.ID}' because of other server error: {e}"
                     )
                     utility = False
                     security = True
@@ -317,7 +317,7 @@ def run_task_without_injection_tasks(
             # else:
             #     raise e
         except ApiError as e:
-            logger.log_error(f"Skipping task {task.ID} because of internal server error: {e}")
+            logger.log_error(f"Skipping task {task.ID} because of ApiError: {e}")
             utility = False
             security = True
             # if "internal server error" in str(e):
@@ -328,7 +328,7 @@ def run_task_without_injection_tasks(
             #     raise e
         # except ServerError as e:
         except Exception as e:
-            logger.log_error(f"Skipping task {task.ID} because of internal server error: {e}")
+            logger.log_error(f"Skipping task {task.ID} because of other server error: {e}")
             utility = False
             security = True
         logger.set_contextarg("utility", utility)
