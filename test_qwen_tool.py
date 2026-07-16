@@ -2,6 +2,9 @@
 # This script loads the Qwen3-8B model with an optional LoRA adapter
 # and runs a two-turn tool-calling conversation. It prints the raw
 # model output for each generation step.
+#
+# The ENABLE_THINKING flag controls whether Qwen3 runs in thinking mode
+# (model may emit <think>...</think> blocks) or no-thinking mode.
 ###
 
 import os
@@ -10,10 +13,14 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 MODEL_PATH="/home/qiangyu/Models/Qwen/Qwen3-8B"
-LORA_PATH="/home/qiangyu/Models/FineTune/Qwen/cekl_train_20260709_ce_0.0_nosecurity_nodropout_6epochs_secweight1.0_after_tool"
+LORA_PATH=None
+# LORA_PATH="/home/qiangyu/Models/FineTune/Qwen/cekl_train_20260709_ce_0.0_nosecurity_nodropout_6epochs_secweight1.0_after_tool"
+
+# Set to True to enable Qwen3 thinking mode, False for no-thinking mode.
+ENABLE_THINKING = False
 
 ################################################################################
 # load
@@ -91,7 +98,8 @@ def run_generation(messages, tools=None):
         messages,
         tools=tools,
         tokenize=False,
-        add_generation_prompt=True
+        add_generation_prompt=True,
+        enable_thinking=ENABLE_THINKING
     )
 
     print()
