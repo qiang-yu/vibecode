@@ -101,7 +101,8 @@ class ToolsExecutor(BasePipelineElement):
                     tool_call.args[arg_k] = literal_eval(arg_v)
 
             print("==== Tool Exe Start ====")
-            print(f"{messages[-1]['content'][0]['content']}")
+            if (content := messages[-1].get("content")) and len(content) > 0:
+                print(f"{messages[-1]['content'][0]['content']}")
             print("==== Tool Exe End ====")
 
             tool_call_result, error = runtime.run_function(env, tool_call.function, tool_call.args)
