@@ -34,7 +34,7 @@ use_rslora: false
 # Data
 # ---------------------------------------------------------------------------
 # Dataset directory is derived from the parent directory of dataset_info_path.
-dataset_info_path: /home/qiangyu/Models/FineTune/Data-no-thinking/dataset_info.json
+dataset_info_path: /home/qiangyu/Models/FineTune/Data/dataset_info.json
 # Use "all" to load every dataset listed in dataset_info.json. To load only
 # specific datasets, replace "all" with a list of dataset names, e.g.:
 #   datasets:
@@ -57,15 +57,16 @@ tool_role_in_template: tool
 loss_calc_ce_default_without_security_weight: 1.0
 
 # Every assistant turn is trained. Untagged assistant content uses
-# loss_calc_ce_default_with_security_weight. Content inside the three XML tags below is trained
-# with the respective tag weights. Set a tag to null to disable that tag.
+# loss_calc_ce_default_with_security_weight. Content inside the three XML tags below uses
+# the respective tag weights. A non-positive weight for <think> means those tokens
+# are ignored (labels stay -100). Set a tag to null to disable that tag.
 loss_calc_ce_default_with_security_weight: 1.0  # default CE weight for untagged assistant content in security turns
 loss_calc_ce_tool_call_security_tag: tool_call_security
 loss_calc_ce_tool_call_security_with_security_weight: 1.0
 loss_calc_ce_think_with_security_tag: think
-loss_calc_ce_think_with_security_weight: 1.0  # think CE weight in turns with tool_call_security
+loss_calc_ce_think_with_security_weight: -100  # think CE weight in all assistant turns; <=0 ignores
 loss_calc_ce_tool_call_with_security_tag: tool_call
-loss_calc_ce_tool_call_with_security_weight: 1.0  # tool_call CE weight in turns with tool_call_security
+loss_calc_ce_tool_call_with_security_weight: 1.0  # tool_call CE weight in all assistant turns; <=0 ignores
 
 # In turn-by-turn mode, the number of non-security assistant turns kept per
 # dataset file is controlled relative to the number of security turns in that
@@ -90,7 +91,7 @@ eval_data_ratio: 0.05
 # ---------------------------------------------------------------------------
 stage: sft
 do_train: true
-output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260716_ce_0.0_nosecurity_nodropout_4epochs_8B
+output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260729_ce_0.0_nosecurity_nodropout_4epochs_8B
 overwrite_output_dir: false
 seed: 42
 num_train_epochs: 4.0

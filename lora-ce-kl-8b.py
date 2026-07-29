@@ -77,11 +77,11 @@ class TrainingConfig:
     tool_role_in_template: str = "tool"  # tool | user; used when the chat template lacks a tool role
     loss_calc_ce_default_with_security_weight: float = 1.0  # default CE weight for untagged assistant content in security turns
     loss_calc_ce_tool_call_security_tag: Optional[str] = "tool_call_security"  # weighted security-analysis tag
-    loss_calc_ce_tool_call_security_with_security_weight: float = 2.0  # loss weight for tool_call_security content
+    loss_calc_ce_tool_call_security_with_security_weight: float = 1.0  # loss weight for tool_call_security content
     loss_calc_ce_think_with_security_tag: Optional[str] = "think"  # weighted think block
-    loss_calc_ce_think_with_security_weight: float = 1.0  # loss weight for think content in turns with tool_call_security
+    loss_calc_ce_think_with_security_weight: float = -100.0  # CE weight for <think> content in all assistant turns; <=0 ignores the span (labels=-100)
     loss_calc_ce_tool_call_with_security_tag: Optional[str] = "tool_call"  # weighted tool-call JSON block
-    loss_calc_ce_tool_call_with_security_weight: float = 1.0  # loss weight for tool_call content in turns with tool_call_security
+    loss_calc_ce_tool_call_with_security_weight: float = 1.0  # CE weight for <tool_call> content in all assistant turns; <=0 ignores the span (labels=-100)
     loss_calc_ce_default_without_security_weight: float = 1.0  # uniform loss weight for all assistant tokens in turns without tool_call_security
 
     # In turn-by-turn mode, the number of non-security assistant turns kept per
@@ -485,7 +485,7 @@ def _mask_labels_for_assistant_turns(
     loss_calc_ce_tool_call_security_tag: Optional[str] = None,
     loss_calc_ce_tool_call_security_with_security_weight: float = 1.0,
     loss_calc_ce_think_with_security_tag: Optional[str] = None,
-    loss_calc_ce_think_with_security_weight: float = 1.0,
+    loss_calc_ce_think_with_security_weight: float = -100.0,
     loss_calc_ce_tool_call_with_security_tag: Optional[str] = None,
     loss_calc_ce_tool_call_with_security_weight: float = 1.0,
     loss_calc_kl_alpha: float = 0.2,
@@ -508,9 +508,17 @@ def _mask_labels_for_assistant_turns(
     ``loss_calc_ce_default_without_security_weight``. Tokens outside the configured XML tags in
     security turns receive ``loss_calc_ce_default_with_security_weight``. Tokens inside
     ``<tool_call_security>...</tool_call_security>`` always use
-    ``loss_calc_ce_tool_call_security_with_security_weight``. Tokens inside
-    ``<tool_call>...</tool_call>`` and ``<think>...</think>`` use different
-    weights depending on whether the assistant turn contains a security block.
+    ``loss_calc_ce_tool_call_security_with_security_weight``.
+
+    Tokens inside ``<tool_call>...</tool_call>`` and ``<think>...</think>`` are
+    handled by ``loss_calc_ce_tool_call_with_security_weight`` and
+    ``loss_calc_ce_think_with_security_weight`` in **all** assistant turns, not only
+    in security turns. A non-positive value for either weight means the span is
+    ignored (labels stay -100 and loss_weight becomes 0). A positive value trains
+    the span with that weight.
+
+    The XML blocks in the data appear in the order
+    ``<think>`` → ``<tool_call>`` → ``<tool_call_security>`` and do not overlap.
 
     KL anchoring is controlled independently of CE loss by two flags:
 
@@ -592,9 +600,9 @@ def _mask_labels_for_assistant_turns(
             loss_weight[tok_start:tok_end] = [loss_calc_ce_default_with_security_weight] * (tok_end - tok_start)
             masked_any = True
 
-            # Apply per-tag weights. tool_call_security is applied last so that
-            # its higher weight wins when it is nested inside <think> or adjacent
-            # to <tool_call>.
+            # Apply per-tag weights. The data format places <think>, <tool_call>
+            # and <tool_call_security> blocks in order without overlap, so the
+            # overlay order simply reflects that same sequence.
             ordered_tags = [
                 (loss_calc_ce_think_with_security_tag, loss_calc_ce_think_with_security_weight),
                 (loss_calc_ce_tool_call_with_security_tag, loss_calc_ce_tool_call_with_security_weight),
@@ -616,8 +624,13 @@ def _mask_labels_for_assistant_turns(
                     abs_start = tok_start + rel_start
                     abs_end = tok_start + rel_end
                     if abs_start < abs_end:
-                        labels[abs_start:abs_end] = input_ids[abs_start:abs_end]
-                        loss_weight[abs_start:abs_end] = [weight] * (abs_end - abs_start)
+                        if weight <= 0:
+                            # Non-positive weight means "ignore this span": keep it out of CE loss.
+                            labels[abs_start:abs_end] = [-100] * (abs_end - abs_start)
+                            loss_weight[abs_start:abs_end] = [0.0] * (abs_end - abs_start)
+                        else:
+                            labels[abs_start:abs_end] = input_ids[abs_start:abs_end]
+                            loss_weight[abs_start:abs_end] = [weight] * (abs_end - abs_start)
                         tag_found = True
                 if tag_found:
                     found_tags.add(tag_name)
@@ -645,13 +658,40 @@ def _mask_labels_for_assistant_turns(
             loss_weight[tok_start:tok_end] = [loss_calc_ce_default_without_security_weight] * (tok_end - tok_start)
             masked_any = True
 
+            # Apply per-tag weights for <think> and <tool_call> in non-security turns.
+            # Non-positive weights ignore the span; positive weights train it with the
+            # configured coefficient.
+            non_security_ordered_tags = [
+                (loss_calc_ce_think_with_security_tag, loss_calc_ce_think_with_security_weight),
+                (loss_calc_ce_tool_call_with_security_tag, loss_calc_ce_tool_call_with_security_weight),
+            ]
+            for tag_name, weight in non_security_ordered_tags:
+                if tag_name is None:
+                    continue
+                pattern = tag_patterns.get(tag_name)
+                if pattern is None:
+                    continue
+                for match in pattern.finditer(turn_text):
+                    rel_start, rel_end = _turn_text_char_span_to_token_span(
+                        turn_text, match.start(), match.end(), tokenizer
+                    )
+                    abs_start = tok_start + rel_start
+                    abs_end = tok_start + rel_end
+                    if abs_start < abs_end:
+                        if weight <= 0:
+                            labels[abs_start:abs_end] = [-100] * (abs_end - abs_start)
+                            loss_weight[abs_start:abs_end] = [0.0] * (abs_end - abs_start)
+                        else:
+                            labels[abs_start:abs_end] = input_ids[abs_start:abs_end]
+                            loss_weight[abs_start:abs_end] = [weight] * (abs_end - abs_start)
+
     # Some chat templates append a trailing newline (or other formatting tokens)
     # after the EOS token, so the last sequence token is not always the EOS id.
     # Force the EOS token inside every assistant turn to weight 1.0 so that no
     # matter where formatting tokens land, the turn's closing EOS is trained.
     for tok_start, tok_end in turn_token_spans:
         for idx in range(tok_end - 1, tok_start - 1, -1):
-            if input_ids[idx] == tokenizer.eos_token_id:
+            if input_ids[idx] == tokenizer.eos_token_id and labels[idx] != -100:
                 labels[idx] = input_ids[idx]
                 loss_weight[idx] = 1.0
                 break
@@ -686,7 +726,7 @@ def _mask_labels_for_assistant_turns(
                 for idx in range(tok_start + rel_start, tok_start + rel_end):
                     is_tool_call_security_token[idx] = True
 
-        if tool_call_pattern is not None and turn_has_sec:
+        if tool_call_pattern is not None:
             for match in tool_call_pattern.finditer(turn_text):
                 rel_start, rel_end = _turn_text_char_span_to_token_span(
                     turn_text, match.start(), match.end(), tokenizer
@@ -768,7 +808,7 @@ def build_turn_by_turn_samples(
     loss_calc_ce_tool_call_security_tag: Optional[str] = None,
     loss_calc_ce_tool_call_security_with_security_weight: float = 1.0,
     loss_calc_ce_think_with_security_tag: Optional[str] = None,
-    loss_calc_ce_think_with_security_weight: float = 1.0,
+    loss_calc_ce_think_with_security_weight: float = -100.0,
     loss_calc_ce_tool_call_with_security_tag: Optional[str] = None,
     loss_calc_ce_tool_call_with_security_weight: float = 1.0,
     loss_calc_kl_alpha: float = 0.2,
@@ -2117,15 +2157,15 @@ def main() -> None:
     )
     logger.info(
         "CE weights: non-security uniform=%.2f; security turns: default=%.2f, "
-        "<%s>=%.2f, <%s>=%.2f, <%s>=%.2f",
+        "<%s>=%s, <%s>=%s, <%s>=%.2f",
         config.loss_calc_ce_default_without_security_weight,
         config.loss_calc_ce_default_with_security_weight,
+        config.loss_calc_ce_think_with_security_tag or "none",
+        "ignored" if config.loss_calc_ce_think_with_security_weight <= 0 else f"{config.loss_calc_ce_think_with_security_weight:.2f}",
+        config.loss_calc_ce_tool_call_with_security_tag or "none",
+        "ignored" if config.loss_calc_ce_tool_call_with_security_weight <= 0 else f"{config.loss_calc_ce_tool_call_with_security_weight:.2f}",
         config.loss_calc_ce_tool_call_security_tag or "none",
         config.loss_calc_ce_tool_call_security_with_security_weight,
-        config.loss_calc_ce_think_with_security_tag or "none",
-        config.loss_calc_ce_think_with_security_weight,
-        config.loss_calc_ce_tool_call_with_security_tag or "none",
-        config.loss_calc_ce_tool_call_with_security_weight,
     )
     logger.info("Data collator initialized")
 
