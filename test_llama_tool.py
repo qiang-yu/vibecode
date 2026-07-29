@@ -3,6 +3,9 @@
 # and runs a two-turn tool-calling conversation. It prints the raw
 # model output for each generation step.
 #
+# Messages are passed to the model exactly as provided, without stripping
+# any content.
+#
 # The functionality mirrors test_qwen_tool.py, but the model is switched
 # from Qwen3-8B to Llama-3.1-8B-Instruct and the Qwen-specific thinking
 # mode flag is removed.
@@ -17,7 +20,8 @@ from peft import PeftModel
 os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 MODEL_PATH = "/home/qiangyu/Models/meta-llama/Llama-3.1-8B-Instruct"
-LORA_PATH = "/home/qiangyu/Models/FineTune/Qwen/train_20260716_llamafactory_Llama3.1-8B"
+# LORA_PATH = None
+LORA_PATH = "/home/qiangyu/Models/FineTune/Qwen/train_20260729_llamafactory_Llama3.1-8B/checkpoint-100"
 
 ################################################################################
 # load
@@ -199,3 +203,4 @@ print("=" * 80)
 print("FINAL ASSISTANT RESPONSE")
 print("=" * 80)
 print(final_answer)
+
