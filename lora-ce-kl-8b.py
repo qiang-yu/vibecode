@@ -78,8 +78,8 @@ class TrainingConfig:
     loss_calc_ce_default_with_security_weight: float = 1.0  # default CE weight for untagged assistant content in security turns
     loss_calc_ce_tool_call_security_tag: Optional[str] = "tool_call_security"  # weighted security-analysis tag
     loss_calc_ce_tool_call_security_with_security_weight: float = 1.0  # loss weight for tool_call_security content
-    loss_calc_ce_think_with_security_tag: Optional[str] = "think"  # weighted think block
-    loss_calc_ce_think_with_security_weight: float = -100.0  # CE weight for <think> content in all assistant turns; <=0 ignores the span (labels=-100)
+    loss_calc_ce_think_tag: Optional[str] = "think"  # weighted think block
+    loss_calc_ce_think_weight: float = -100.0  # CE weight for <think> content in all assistant turns; <=0 ignores the span (labels=-100)
     loss_calc_ce_tool_call_with_security_tag: Optional[str] = "tool_call"  # weighted tool-call JSON block
     loss_calc_ce_tool_call_with_security_weight: float = 1.0  # CE weight for <tool_call> content in all assistant turns; <=0 ignores the span (labels=-100)
     loss_calc_ce_default_without_security_weight: float = 1.0  # uniform loss weight for all assistant tokens in turns without tool_call_security
@@ -154,7 +154,7 @@ class TrainingConfig:
     # separate reference model is loaded.
     loss_calc_kl_enabled: bool = False
     loss_calc_kl_alpha: float = 0.2
-    loss_calc_kl_think_with_security_alpha: float = 0.1  # KL coefficient for <think> in security turns when enabled
+    loss_calc_kl_think_alpha: float = 0.1  # KL coefficient for <think> in all assistant turns when enabled
     loss_calc_kl_enable_without_security: bool = False  # enable KL for assistant turns without tool_call_security
     loss_calc_kl_enable_with_security: bool = False  # enable KL for assistant turns that contain tool_call_security (background + think, excluding tool_call blocks)
 
@@ -484,12 +484,12 @@ def _mask_labels_for_assistant_turns(
     loss_calc_ce_default_without_security_weight: float = 1.0,
     loss_calc_ce_tool_call_security_tag: Optional[str] = None,
     loss_calc_ce_tool_call_security_with_security_weight: float = 1.0,
-    loss_calc_ce_think_with_security_tag: Optional[str] = None,
-    loss_calc_ce_think_with_security_weight: float = -100.0,
+    loss_calc_ce_think_tag: Optional[str] = None,
+    loss_calc_ce_think_weight: float = -100.0,
     loss_calc_ce_tool_call_with_security_tag: Optional[str] = None,
     loss_calc_ce_tool_call_with_security_weight: float = 1.0,
     loss_calc_kl_alpha: float = 0.2,
-    loss_calc_kl_think_with_security_alpha: float = 0.1,
+    loss_calc_kl_think_alpha: float = 0.1,
     loss_calc_kl_enable_without_security: bool = False,
     loss_calc_kl_enable_with_security: bool = False,
     enable_thinking: bool = True,
@@ -512,7 +512,7 @@ def _mask_labels_for_assistant_turns(
 
     Tokens inside ``<tool_call>...</tool_call>`` and ``<think>...</think>`` are
     handled by ``loss_calc_ce_tool_call_with_security_weight`` and
-    ``loss_calc_ce_think_with_security_weight`` in **all** assistant turns, not only
+    ``loss_calc_ce_think_weight`` in **all** assistant turns, not only
     in security turns. A non-positive value for either weight means the span is
     ignored (labels stay -100 and loss_weight becomes 0). A positive value trains
     the span with that weight.
@@ -522,15 +522,18 @@ def _mask_labels_for_assistant_turns(
 
     KL anchoring is controlled independently of CE loss by two flags:
 
-    * ``loss_calc_kl_enable_without_security``: enables KL for all non-think
-      assistant tokens in turns that do not contain a
-      ``<tool_call_security>...</tool_call_security>`` block.
+    * ``loss_calc_kl_enable_without_security``: enables KL for assistant tokens
+      in turns that do not contain a
+      ``<tool_call_security>...</tool_call_security>`` block. Inside those
+      turns, ``<think>...</think>`` receives ``loss_calc_kl_think_alpha``
+      (think KL) and all other assistant tokens receive ``loss_calc_kl_alpha``
+      (background KL).
     * ``loss_calc_kl_enable_with_security``: enables KL for assistant turns that
       contain a ``<tool_call_security>...</tool_call_security>`` block. Inside
-      those turns, ``<think>...</think>`` receives think KL,
-      ``<tool_call_security>...</tool_call_security>`` and
+      those turns, ``<think>...</think>`` receives ``loss_calc_kl_think_alpha``
+      (think KL), ``<tool_call_security>...</tool_call_security>`` and
       ``<tool_call>...</tool_call>`` are excluded from KL, and all other
-      assistant tokens receive background KL.
+      assistant tokens receive ``loss_calc_kl_alpha`` (background KL).
 
     The function returns the label list, the per-token CE loss weight list, the two
     per-token KL weight lists, a per-token security-turn mask, a flag indicating
@@ -547,9 +550,9 @@ def _mask_labels_for_assistant_turns(
         tag_patterns[loss_calc_ce_tool_call_security_tag] = re.compile(
             rf"<{re.escape(loss_calc_ce_tool_call_security_tag)}>.*?</{re.escape(loss_calc_ce_tool_call_security_tag)}>", re.DOTALL
         )
-    if loss_calc_ce_think_with_security_tag is not None:
-        tag_patterns[loss_calc_ce_think_with_security_tag] = re.compile(
-            rf"<{re.escape(loss_calc_ce_think_with_security_tag)}>.*?</{re.escape(loss_calc_ce_think_with_security_tag)}>", re.DOTALL
+    if loss_calc_ce_think_tag is not None:
+        tag_patterns[loss_calc_ce_think_tag] = re.compile(
+            rf"<{re.escape(loss_calc_ce_think_tag)}>.*?</{re.escape(loss_calc_ce_think_tag)}>", re.DOTALL
         )
     if loss_calc_ce_tool_call_with_security_tag is not None:
         tag_patterns[loss_calc_ce_tool_call_with_security_tag] = re.compile(
@@ -604,7 +607,7 @@ def _mask_labels_for_assistant_turns(
             # and <tool_call_security> blocks in order without overlap, so the
             # overlay order simply reflects that same sequence.
             ordered_tags = [
-                (loss_calc_ce_think_with_security_tag, loss_calc_ce_think_with_security_weight),
+                (loss_calc_ce_think_tag, loss_calc_ce_think_weight),
                 (loss_calc_ce_tool_call_with_security_tag, loss_calc_ce_tool_call_with_security_weight),
                 (loss_calc_ce_tool_call_security_tag, loss_calc_ce_tool_call_security_with_security_weight),
             ]
@@ -646,7 +649,7 @@ def _mask_labels_for_assistant_turns(
                     # <think>...</think> into special tokens, so the literal tag is
                     # not present in the decoded text. Suppress the warning for
                     # think tags in that mode.
-                    if tag_name == loss_calc_ce_think_with_security_tag and enable_thinking:
+                    if tag_name == loss_calc_ce_think_tag and enable_thinking:
                         continue
                     logger.warning(
                         "Assistant turn %d contains <%s> in source but it was not found "
@@ -662,7 +665,7 @@ def _mask_labels_for_assistant_turns(
             # Non-positive weights ignore the span; positive weights train it with the
             # configured coefficient.
             non_security_ordered_tags = [
-                (loss_calc_ce_think_with_security_tag, loss_calc_ce_think_with_security_weight),
+                (loss_calc_ce_think_tag, loss_calc_ce_think_weight),
                 (loss_calc_ce_tool_call_with_security_tag, loss_calc_ce_tool_call_with_security_weight),
             ]
             for tag_name, weight in non_security_ordered_tags:
@@ -702,7 +705,7 @@ def _mask_labels_for_assistant_turns(
     is_security_turn_token = [False] * len(input_ids)
     is_tool_call_security_token = [False] * len(input_ids)
     is_tool_call_token = [False] * len(input_ids)
-    think_pattern = tag_patterns.get(loss_calc_ce_think_with_security_tag)
+    think_pattern = tag_patterns.get(loss_calc_ce_think_tag)
     tool_call_security_pattern = tag_patterns.get(loss_calc_ce_tool_call_security_tag)
     tool_call_pattern = tag_patterns.get(loss_calc_ce_tool_call_with_security_tag)
     for turn_pos, (tok_start, tok_end), turn_has_sec in zip(
@@ -740,7 +743,7 @@ def _mask_labels_for_assistant_turns(
 
     security_turn_mask = [1 if flag else 0 for flag in is_security_turn_token]
     kl_weight_background = [0.0] * len(input_ids)
-    kl_weight_think_with_security = [0.0] * len(input_ids)
+    kl_weight_think = [0.0] * len(input_ids)
     for idx, (label, think_flag, sec_turn, tc_sec_flag, tc_flag) in enumerate(
         zip(
             labels,
@@ -759,17 +762,17 @@ def _mask_labels_for_assistant_turns(
             continue
 
         if think_flag:
-            if sec_turn and loss_calc_kl_enable_with_security:
-                kl_weight_think_with_security[idx] = loss_calc_kl_think_with_security_alpha
-            elif not sec_turn and loss_calc_kl_enable_without_security:
-                kl_weight_think_with_security[idx] = loss_calc_kl_alpha
+            if (sec_turn and loss_calc_kl_enable_with_security) or (
+                not sec_turn and loss_calc_kl_enable_without_security
+            ):
+                kl_weight_think[idx] = loss_calc_kl_think_alpha
         else:
             if sec_turn and loss_calc_kl_enable_with_security:
                 kl_weight_background[idx] = 1.0
             elif not sec_turn and loss_calc_kl_enable_without_security:
                 kl_weight_background[idx] = 1.0
 
-    return labels, loss_weight, kl_weight_background, kl_weight_think_with_security, security_turn_mask, has_security, masked_any
+    return labels, loss_weight, kl_weight_background, kl_weight_think, security_turn_mask, has_security, masked_any
 
 
 def _select_non_security_samples(
@@ -807,12 +810,12 @@ def build_turn_by_turn_samples(
     loss_calc_ce_default_without_security_weight: float = 1.0,
     loss_calc_ce_tool_call_security_tag: Optional[str] = None,
     loss_calc_ce_tool_call_security_with_security_weight: float = 1.0,
-    loss_calc_ce_think_with_security_tag: Optional[str] = None,
-    loss_calc_ce_think_with_security_weight: float = -100.0,
+    loss_calc_ce_think_tag: Optional[str] = None,
+    loss_calc_ce_think_weight: float = -100.0,
     loss_calc_ce_tool_call_with_security_tag: Optional[str] = None,
     loss_calc_ce_tool_call_with_security_weight: float = 1.0,
     loss_calc_kl_alpha: float = 0.2,
-    loss_calc_kl_think_with_security_alpha: float = 0.1,
+    loss_calc_kl_think_alpha: float = 0.1,
     loss_calc_kl_enable_without_security: bool = False,
     loss_calc_kl_enable_with_security: bool = False,
 ) -> List[Dict[str, List[Any]]]:
@@ -838,7 +841,7 @@ def build_turn_by_turn_samples(
         input_ids = result["input_ids"]
         conversation_text = _render_chat_template_text(tokenizer, prefix_messages, enable_thinking)
 
-        labels, loss_weight, kl_weight_background, kl_weight_think_with_security, security_turn_mask, has_security, masked_any = _mask_labels_for_assistant_turns(
+        labels, loss_weight, kl_weight_background, kl_weight_think, security_turn_mask, has_security, masked_any = _mask_labels_for_assistant_turns(
             input_ids,
             prefix_messages,
             tokenizer,
@@ -847,12 +850,12 @@ def build_turn_by_turn_samples(
             loss_calc_ce_default_without_security_weight=loss_calc_ce_default_without_security_weight,
             loss_calc_ce_tool_call_security_tag=loss_calc_ce_tool_call_security_tag,
             loss_calc_ce_tool_call_security_with_security_weight=loss_calc_ce_tool_call_security_with_security_weight,
-            loss_calc_ce_think_with_security_tag=loss_calc_ce_think_with_security_tag,
-            loss_calc_ce_think_with_security_weight=loss_calc_ce_think_with_security_weight,
+            loss_calc_ce_think_tag=loss_calc_ce_think_tag,
+            loss_calc_ce_think_weight=loss_calc_ce_think_weight,
             loss_calc_ce_tool_call_with_security_tag=loss_calc_ce_tool_call_with_security_tag,
             loss_calc_ce_tool_call_with_security_weight=loss_calc_ce_tool_call_with_security_weight,
             loss_calc_kl_alpha=loss_calc_kl_alpha,
-            loss_calc_kl_think_with_security_alpha=loss_calc_kl_think_with_security_alpha,
+            loss_calc_kl_think_alpha=loss_calc_kl_think_alpha,
             loss_calc_kl_enable_without_security=loss_calc_kl_enable_without_security,
             loss_calc_kl_enable_with_security=loss_calc_kl_enable_with_security,
             enable_thinking=enable_thinking,
@@ -867,7 +870,7 @@ def build_turn_by_turn_samples(
             labels = labels[-cutoff_len:]
             loss_weight = loss_weight[-cutoff_len:]
             kl_weight_background = kl_weight_background[-cutoff_len:]
-            kl_weight_think_with_security = kl_weight_think_with_security[-cutoff_len:]
+            kl_weight_think = kl_weight_think[-cutoff_len:]
             security_turn_mask = security_turn_mask[-cutoff_len:]
 
         samples.append({
@@ -876,7 +879,7 @@ def build_turn_by_turn_samples(
             "attention_mask": [1] * len(input_ids),
             "loss_weight": loss_weight,
             "kl_weight_background": kl_weight_background,
-            "kl_weight_think_with_security": kl_weight_think_with_security,
+            "kl_weight_think": kl_weight_think,
             "security_turn_mask": security_turn_mask,
             "has_security_block": has_security,
             "assistant_content": content,
@@ -898,7 +901,7 @@ def make_preprocess_function(
 
     def preprocess(examples: Dict[str, List[Any]]) -> Dict[str, List[List[int]]]:
         input_ids, labels, attention_mask, loss_weight = [], [], [], []
-        kl_weight_background, kl_weight_think_with_security, security_turn_mask, has_security_block = [], [], [], []
+        kl_weight_background, kl_weight_think, security_turn_mask, has_security_block = [], [], [], []
 
         for conversation in examples.get(msg_column, []):
             # Some datasets may already use the canonical keys.
@@ -917,12 +920,12 @@ def make_preprocess_function(
                 config.loss_calc_ce_default_without_security_weight,
                 config.loss_calc_ce_tool_call_security_tag,
                 config.loss_calc_ce_tool_call_security_with_security_weight,
-                config.loss_calc_ce_think_with_security_tag,
-                config.loss_calc_ce_think_with_security_weight,
+                config.loss_calc_ce_think_tag,
+                config.loss_calc_ce_think_weight,
                 config.loss_calc_ce_tool_call_with_security_tag,
                 config.loss_calc_ce_tool_call_with_security_weight,
                 config.loss_calc_kl_alpha,
-                config.loss_calc_kl_think_with_security_alpha,
+                config.loss_calc_kl_think_alpha,
                 config.loss_calc_kl_enable_without_security,
                 config.loss_calc_kl_enable_with_security,
             )
@@ -933,7 +936,7 @@ def make_preprocess_function(
                 attention_mask.append(sample["attention_mask"])
                 loss_weight.append(sample["loss_weight"])
                 kl_weight_background.append(sample["kl_weight_background"])
-                kl_weight_think_with_security.append(sample["kl_weight_think_with_security"])
+                kl_weight_think.append(sample["kl_weight_think"])
                 security_turn_mask.append(sample["security_turn_mask"])
                 has_security_block.append(sample["has_security_block"])
 
@@ -943,7 +946,7 @@ def make_preprocess_function(
             "attention_mask": attention_mask,
             "loss_weight": loss_weight,
             "kl_weight_background": kl_weight_background,
-            "kl_weight_think_with_security": kl_weight_think_with_security,
+            "kl_weight_think": kl_weight_think,
             "security_turn_mask": security_turn_mask,
             "has_security_block": has_security_block,
         }
@@ -1058,12 +1061,12 @@ def _generate_turn_samples_for_split(
             config.loss_calc_ce_default_without_security_weight,
             config.loss_calc_ce_tool_call_security_tag,
             config.loss_calc_ce_tool_call_security_with_security_weight,
-            config.loss_calc_ce_think_with_security_tag,
-            config.loss_calc_ce_think_with_security_weight,
+            config.loss_calc_ce_think_tag,
+            config.loss_calc_ce_think_weight,
             config.loss_calc_ce_tool_call_with_security_tag,
             config.loss_calc_ce_tool_call_with_security_weight,
             config.loss_calc_kl_alpha,
-            config.loss_calc_kl_think_with_security_alpha,
+            config.loss_calc_kl_think_alpha,
             config.loss_calc_kl_enable_without_security,
             config.loss_calc_kl_enable_with_security,
         )
@@ -1108,14 +1111,14 @@ def _tokenization_fingerprint(
         "loss_calc_ce_default_without_security_weight": config.loss_calc_ce_default_without_security_weight,
         "loss_calc_ce_tool_call_security_tag": config.loss_calc_ce_tool_call_security_tag,
         "loss_calc_ce_tool_call_security_with_security_weight": config.loss_calc_ce_tool_call_security_with_security_weight,
-        "loss_calc_ce_think_with_security_tag": config.loss_calc_ce_think_with_security_tag,
-        "loss_calc_ce_think_with_security_weight": config.loss_calc_ce_think_with_security_weight,
+        "loss_calc_ce_think_tag": config.loss_calc_ce_think_tag,
+        "loss_calc_ce_think_weight": config.loss_calc_ce_think_weight,
         "loss_calc_ce_tool_call_with_security_tag": config.loss_calc_ce_tool_call_with_security_tag,
         "loss_calc_ce_tool_call_with_security_weight": config.loss_calc_ce_tool_call_with_security_weight,
         "enable_thinking": config.enable_thinking,
         "loss_calc_kl_enabled": config.loss_calc_kl_enabled,
         "loss_calc_kl_alpha": config.loss_calc_kl_alpha,
-        "loss_calc_kl_think_with_security_alpha": config.loss_calc_kl_think_with_security_alpha,
+        "loss_calc_kl_think_alpha": config.loss_calc_kl_think_alpha,
         "loss_calc_kl_enable_without_security": config.loss_calc_kl_enable_without_security,
         "loss_calc_kl_enable_with_security": config.loss_calc_kl_enable_with_security,
         "non_security_to_security_turn_ratio": config.non_security_to_security_turn_ratio,
@@ -1548,7 +1551,7 @@ class EvaluateAfterSaveCallback(_BaseCallback):
 
 class WeightedDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     """
-    Pad ``loss_weight``, ``kl_weight_background``, ``kl_weight_think_with_security``,
+    Pad ``loss_weight``, ``kl_weight_background``, ``kl_weight_think``,
     ``security_turn_mask`` and ``has_security_block`` alongside the standard seq2seq fields.
 
     The parent collator does not know how to pad float weight arrays or the
@@ -1560,7 +1563,7 @@ class WeightedDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     def torch_call(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         weights = [f.pop("loss_weight", None) for f in features]
         kl_bg_weights = [f.pop("kl_weight_background", None) for f in features]
-        kl_think_weights = [f.pop("kl_weight_think_with_security", None) for f in features]
+        kl_think_weights = [f.pop("kl_weight_think", None) for f in features]
         security_masks = [f.pop("security_turn_mask", None) for f in features]
         has_security_flags = [f.pop("has_security_block", False) for f in features]
         try:
@@ -1574,7 +1577,7 @@ class WeightedDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 if kl_bg is not None:
                     feature["kl_weight_background"] = kl_bg
                 if kl_think is not None:
-                    feature["kl_weight_think_with_security"] = kl_think
+                    feature["kl_weight_think"] = kl_think
                 if sec_mask is not None:
                     feature["security_turn_mask"] = sec_mask
                 feature["has_security_block"] = flag
@@ -1618,7 +1621,7 @@ class WeightedDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
                 else:
                     kl_list = kl_list[:max_length]
                 padded_kl_weights.append(kl_list)
-            batch["kl_weight_think_with_security"] = torch.tensor(padded_kl_weights, dtype=torch.float32)
+            batch["kl_weight_think"] = torch.tensor(padded_kl_weights, dtype=torch.float32)
 
         if security_masks[0] is not None:
             import torch
@@ -1656,17 +1659,18 @@ class WeightedLossTrainer(Trainer):
 
     When a turn contains ``<tool_call_security>...</tool_call_security>`` and
     ``loss_calc_kl_enable_with_security`` is set, the ``<think>...</think>`` block
-    is anchored with ``loss_calc_kl_think_with_security_alpha`` (think KL), all
+    is anchored with ``loss_calc_kl_think_alpha`` (think KL), all
     other assistant tokens except ``<tool_call_security>...</tool_call_security>``
     and ``<tool_call>...</tool_call>`` are anchored with ``loss_calc_kl_alpha``
     (background KL). Assistant turns without a security block participate in KL
-    anchoring when ``loss_calc_kl_enable_without_security`` is set.
+    anchoring when ``loss_calc_kl_enable_without_security`` is set; inside those
+    turns, ``<think>...</think>`` also uses ``loss_calc_kl_think_alpha``.
 
     KL anchoring is logged in two separate metrics:
 
     * ``kl_loss_background`` for non-think assistant tokens inside turns where
       background KL is enabled.
-    * ``kl_loss_think_with_security`` for every token inside a
+    * ``kl_loss_think`` for every token inside a
       ``<think>...</think>`` block where think KL is enabled.
 
     Additionally, a separate ``ce_loss_with_security`` metric is logged: the average
@@ -1682,14 +1686,14 @@ class WeightedLossTrainer(Trainer):
     def __init__(
         self,
         loss_calc_kl_alpha: float = 0.2,
-        loss_calc_kl_think_with_security_alpha: float = 0.1,
+        loss_calc_kl_think_alpha: float = 0.1,
         loss_calc_kl_enabled: bool = False,
         *args,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.loss_calc_kl_alpha = loss_calc_kl_alpha
-        self.loss_calc_kl_think_with_security_alpha = loss_calc_kl_think_with_security_alpha
+        self.loss_calc_kl_think_alpha = loss_calc_kl_think_alpha
         self.loss_calc_kl_enabled = loss_calc_kl_enabled
         self._ce_loss_sum = 0.0
         self._kl_bg_sum = 0.0
@@ -1718,7 +1722,7 @@ class WeightedLossTrainer(Trainer):
         labels = inputs.pop("labels")
         loss_weight = inputs.pop("loss_weight")
         kl_weight_background = inputs.pop("kl_weight_background", None)
-        kl_weight_think_with_security = inputs.pop("kl_weight_think_with_security", None)
+        kl_weight_think = inputs.pop("kl_weight_think", None)
         security_turn_mask = inputs.pop("security_turn_mask", None)
         has_security_block = inputs.pop("has_security_block", None)
 
@@ -1806,11 +1810,10 @@ class WeightedLossTrainer(Trainer):
                     loss = loss + self.loss_calc_kl_alpha * kl_bg_loss
 
             # Think KL: every token inside a <think>...</think> block.
-            # kl_weight_think_with_security stores the per-token KL coefficient:
-            # 0.0 when disabled, 0.1 for security turns when enabled, 0.2 for
-            # non-security turns when enabled.
-            if kl_weight_think_with_security is not None:
-                shift_kl_think = kl_weight_think_with_security[..., 1:].contiguous()
+            # kl_weight_think stores the per-token KL coefficient:
+            # 0.0 when disabled, loss_calc_kl_think_alpha when enabled.
+            if kl_weight_think is not None:
+                shift_kl_think = kl_weight_think[..., 1:].contiguous()
                 think_mask = shift_kl_think > 0
                 if think_mask.any():
                     log_p = F.log_softmax(shift_logits[think_mask].float(), dim=-1)
@@ -1872,7 +1875,7 @@ class WeightedLossTrainer(Trainer):
 
             logs["ce_loss"] = ce
             logs["kl_loss_background"] = kl_bg
-            logs["kl_loss_think_with_security"] = kl_think
+            logs["kl_loss_think"] = kl_think
 
             # Security-aware CE: average only over steps that actually saw a security block.
             if self._ce_with_security_count > 0:
@@ -2117,11 +2120,11 @@ def main() -> None:
 
     if config.loss_calc_kl_enabled:
         logger.info(
-            "KL anchoring enabled (background alpha=%.3f, think-with-security alpha=%.3f, "
-            "enable_without_security=%s, enable_think_with_security=%s); "
+            "KL anchoring enabled (background alpha=%.3f, think alpha=%.3f, "
+            "enable_without_security=%s, enable_with_security=%s); "
             "reference logits obtained via disable_adapter()",
             config.loss_calc_kl_alpha,
-            config.loss_calc_kl_think_with_security_alpha,
+            config.loss_calc_kl_think_alpha,
             config.loss_calc_kl_enable_without_security,
             config.loss_calc_kl_enable_with_security,
         )
@@ -2160,8 +2163,8 @@ def main() -> None:
         "<%s>=%s, <%s>=%s, <%s>=%.2f",
         config.loss_calc_ce_default_without_security_weight,
         config.loss_calc_ce_default_with_security_weight,
-        config.loss_calc_ce_think_with_security_tag or "none",
-        "ignored" if config.loss_calc_ce_think_with_security_weight <= 0 else f"{config.loss_calc_ce_think_with_security_weight:.2f}",
+        config.loss_calc_ce_think_tag or "none",
+        "ignored" if config.loss_calc_ce_think_weight <= 0 else f"{config.loss_calc_ce_think_weight:.2f}",
         config.loss_calc_ce_tool_call_with_security_tag or "none",
         "ignored" if config.loss_calc_ce_tool_call_with_security_weight <= 0 else f"{config.loss_calc_ce_tool_call_with_security_weight:.2f}",
         config.loss_calc_ce_tool_call_security_tag or "none",
@@ -2183,7 +2186,7 @@ def main() -> None:
     trainer = WeightedLossTrainer(
         model=model,
         loss_calc_kl_alpha=config.loss_calc_kl_alpha,
-        loss_calc_kl_think_with_security_alpha=config.loss_calc_kl_think_with_security_alpha,
+        loss_calc_kl_think_alpha=config.loss_calc_kl_think_alpha,
         loss_calc_kl_enabled=config.loss_calc_kl_enabled,
         args=training_args,
         train_dataset=train_dataset,

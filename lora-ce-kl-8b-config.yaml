@@ -63,8 +63,8 @@ loss_calc_ce_default_without_security_weight: 1.0
 loss_calc_ce_default_with_security_weight: 1.0  # default CE weight for untagged assistant content in security turns
 loss_calc_ce_tool_call_security_tag: tool_call_security
 loss_calc_ce_tool_call_security_with_security_weight: 1.0
-loss_calc_ce_think_with_security_tag: think
-loss_calc_ce_think_with_security_weight: -100  # think CE weight in all assistant turns; <=0 ignores
+loss_calc_ce_think_tag: think
+loss_calc_ce_think_weight: -100  # think CE weight in all assistant turns; <=0 ignores
 loss_calc_ce_tool_call_with_security_tag: tool_call
 loss_calc_ce_tool_call_with_security_weight: 1.0  # tool_call CE weight in all assistant turns; <=0 ignores
 
@@ -77,7 +77,7 @@ loss_calc_ce_tool_call_with_security_weight: 1.0  # tool_call CE weight in all a
 # 1.0 means keep the same number of non-security and security turns.
 # The selection is random within each file's non-security turns and is
 # reproducible given non_security_turn_sample_seed.
-non_security_to_security_turn_ratio: 0.0
+non_security_to_security_turn_ratio: 1.0
 non_security_turn_sample_seed: 42
 
 cutoff_len: 8192
@@ -91,10 +91,10 @@ eval_data_ratio: 0.05
 # ---------------------------------------------------------------------------
 stage: sft
 do_train: true
-output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260729_ce_0.0_nosecurity_nodropout_4epochs_8B
+output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260730_ce_1.0_nosecurity_nodropout_3epochs_8B
 overwrite_output_dir: false
 seed: 42
-num_train_epochs: 4.0
+num_train_epochs: 3.0
 gradient_checkpointing: true
 per_device_train_batch_size: 1
 per_device_eval_batch_size: 1
@@ -141,13 +141,13 @@ per_device_max_memory_gb: 78.0  # cap PyTorch allocation per GPU; set to null to
 # ---------------------------------------------------------------------------
 # Qwen3 thinking mode
 # ---------------------------------------------------------------------------
-enable_thinking: false
+enable_thinking: true
 
 # ---------------------------------------------------------------------------
 # KL anchoring against the frozen base weights (disable_adapter() is used)
 # ---------------------------------------------------------------------------
 loss_calc_kl_enabled: false  # default false: only CE loss, no KL reference-logit computation
 loss_calc_kl_alpha: 0.005
-loss_calc_kl_think_with_security_alpha: 0.005  # KL coefficient for <think> in security turns when enabled
+loss_calc_kl_think_alpha: 0.005  # KL coefficient for <think> in all assistant turns when enabled
 loss_calc_kl_enable_without_security: false  # enale KL for assistant turns without tool_call_security
 loss_calc_kl_enable_with_security: false  # enable KL for assistant turns that contain tool_call_security (background + think, excluding tool_call blocks)
