@@ -68,18 +68,6 @@ loss_calc_ce_think_weight: -100  # think CE weight in all assistant turns; <=0 i
 loss_calc_ce_tool_call_with_security_tag: tool_call
 loss_calc_ce_tool_call_with_security_weight: 1.0  # tool_call CE weight in all assistant turns; <=0 ignores
 
-# In turn-by-turn mode, the number of non-security assistant turns kept per
-# dataset file is controlled relative to the number of security turns in that
-# file. After generating all turns, keep at most
-# security_turn_count * non_security_to_security_turn_ratio non-security turns.
-# 0.0 means keep only security turns (no non-security turns).
-# 0.5 means keep half as many non-security turns as security turns.
-# 1.0 means keep the same number of non-security and security turns.
-# The selection is random within each file's non-security turns and is
-# reproducible given non_security_turn_sample_seed.
-non_security_to_security_turn_ratio: 1.0
-non_security_turn_sample_seed: 42
-
 cutoff_len: 8192
 max_samples: 100000
 preprocessing_num_workers: 16

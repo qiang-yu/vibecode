@@ -84,17 +84,6 @@ class TrainingConfig:
     loss_calc_ce_tool_call_with_security_weight: float = 1.0  # CE weight for <tool_call> content in all assistant turns; <=0 ignores the span (labels=-100)
     loss_calc_ce_default_without_security_weight: float = 1.0  # uniform loss weight for all assistant tokens in turns without tool_call_security
 
-    # In turn-by-turn mode, the number of non-security assistant turns kept per
-    # dataset file is controlled relative to the number of security turns in that
-    # file. After generating all turns, keep at most
-    # security_turn_count * non_security_to_security_turn_ratio non-security turns.
-    # 0.0 means keep only security turns; 0.5 means keep half as many non-security
-    # turns as security turns; 1.0 means keep equal numbers. The selection is
-    # random within each file's non-security turns and is reproducible given
-    # non_security_turn_sample_seed.
-    non_security_to_security_turn_ratio: float = 0.0
-    non_security_turn_sample_seed: int = 42
-
     cutoff_len: int = 16384
     max_samples: Optional[int] = 100000
     preprocessing_num_workers: int = 16
@@ -780,32 +769,6 @@ def _mask_labels_for_assistant_turns(
     return labels, loss_weight, kl_weight_background, kl_weight_think, security_turn_mask, has_security, masked_any
 
 
-def _select_non_security_samples(
-    non_security_samples: List[Dict[str, Any]],
-    security_count: int,
-    ratio: float,
-    seed: int,
-) -> List[Dict[str, Any]]:
-    """
-    Randomly select non-security samples for a single dataset file.
-
-    The target number of non-security samples is ``round(security_count * ratio)``.
-    If the available non-security samples are fewer than the target, all of them
-    are kept.  The selection is random but reproducible because it uses a
-    dedicated ``seed``.
-    """
-    import random
-
-    if ratio <= 0.0 or not non_security_samples:
-        return []
-    target = min(int(round(security_count * ratio)), len(non_security_samples))
-    if target <= 0:
-        return []
-    if target >= len(non_security_samples):
-        return non_security_samples
-    return random.Random(seed).sample(non_security_samples, target)
-
-
 def build_turn_by_turn_samples(
     messages: List[Dict[str, str]],
     tokenizer: Any,
@@ -1126,8 +1089,6 @@ def _tokenization_fingerprint(
         "loss_calc_kl_think_alpha": config.loss_calc_kl_think_alpha,
         "loss_calc_kl_enable_without_security": config.loss_calc_kl_enable_without_security,
         "loss_calc_kl_enable_with_security": config.loss_calc_kl_enable_with_security,
-        "non_security_to_security_turn_ratio": config.non_security_to_security_turn_ratio,
-        "non_security_turn_sample_seed": config.non_security_turn_sample_seed,
         "max_samples": config.max_samples,
         "eval_data_ratio": config.eval_data_ratio,
         "shuffle_seed": config.shuffle_seed,
@@ -1230,18 +1191,8 @@ def load_datasets(
                 eval_security = [s for s in eval_samples if s["has_security_block"]]
                 eval_non_security = [s for s in eval_samples if not s["has_security_block"]]
 
-                selected_train_non_security = _select_non_security_samples(
-                    train_non_security,
-                    len(train_security),
-                    config.non_security_to_security_turn_ratio,
-                    config.non_security_turn_sample_seed,
-                )
-                selected_eval_non_security = _select_non_security_samples(
-                    eval_non_security,
-                    len(eval_security),
-                    config.non_security_to_security_turn_ratio,
-                    config.non_security_turn_sample_seed,
-                )
+                selected_train_non_security = train_non_security
+                selected_eval_non_security = eval_non_security
 
                 security_path = output_dir / f"{name}_security_turns.jsonl"
                 non_security_path = output_dir / f"{name}_non_security_turns.jsonl"
@@ -1253,11 +1204,10 @@ def load_datasets(
                     security_path, len(train_security),
                 )
                 logger.info(
-                    "Wrote %s: %d non-security turns (selected from %d available, ratio=%.3f)",
+                    "Wrote %s: %d non-security turns (all %d available)",
                     non_security_path,
                     len(selected_train_non_security),
                     len(train_non_security),
-                    config.non_security_to_security_turn_ratio,
                 )
 
                 if train_security:
