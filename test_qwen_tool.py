@@ -13,11 +13,11 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 MODEL_PATH="/home/qiangyu/Models/Qwen/Qwen3-8B"
 # LORA_PATH=None
-LORA_PATH="/home/qiangyu/Models/FineTune/Qwen/cekl_train_20260729_ce_0.0_nosecurity_nodropout_4epochs_8B"
+LORA_PATH="/home/qiangyu/Models/FineTune/Qwen/cekl_train_20260731_ce2.5_kl0.02_0.01_1.0_nosecurity_3epochs_8B/checkpoint-900"
 
 # Set to True to enable Qwen3 thinking mode, False for no-thinking mode.
 ENABLE_THINKING = True
