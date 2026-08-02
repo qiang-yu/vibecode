@@ -535,6 +535,10 @@ def _mask_labels_for_assistant_turns(
       ``<tool_call>...</tool_call>`` are excluded from KL, and all other
       assistant tokens receive ``loss_calc_kl_alpha`` (background KL).
 
+    Think tokens are included in KL anchoring even when
+    ``loss_calc_ce_think_weight <= 0`` masks them from CE loss (labels=-100).
+    Background tokens are only anchored when they are also trained by CE loss.
+
     The function returns the label list, the per-token CE loss weight list, the two
     per-token KL weight lists, a per-token security-turn mask, a flag indicating
     whether a security block was found, and a flag indicating whether at least one
@@ -753,20 +757,21 @@ def _mask_labels_for_assistant_turns(
             is_tool_call_token,
         )
     ):
-        if label == -100:
-            continue
-
         # tool_call_security and tool_call blocks never participate in KL anchoring,
         # regardless of whether KL is enabled for the turn.
         if tc_sec_flag or tc_flag:
             continue
 
         if think_flag:
+            # Think tokens participate in KL anchoring even when they are masked
+            # from CE loss (loss_calc_ce_think_weight <= 0 sets labels=-100).
             if (sec_turn and loss_calc_kl_enable_with_security) or (
                 not sec_turn and loss_calc_kl_enable_without_security
             ):
                 kl_weight_think[idx] = loss_calc_kl_think_alpha
         else:
+            if label == -100:
+                continue
             if sec_turn and loss_calc_kl_enable_with_security:
                 kl_weight_background[idx] = 1.0
             elif not sec_turn and loss_calc_kl_enable_without_security:
