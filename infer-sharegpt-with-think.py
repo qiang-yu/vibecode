@@ -24,7 +24,7 @@ TEMP_FILE = "/home/qiangyu/Models/mlabonne/FineTome-100k-dedup/data/FineTome-100
 
 # GPU lists used for parallel processing. Each small GPU loads its own small model instance.
 # BIG_GPU_IDS lists the GPUs used for one big model instance. Set to [] to disable big model.
-SMALL_GPU_IDS = [0, 1, 2, 3, 4, 5, 6, 7]
+SMALL_GPU_IDS = [0,1,2]
 BIG_GPU_IDS = None
 
 
