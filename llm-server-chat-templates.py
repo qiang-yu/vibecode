@@ -6,6 +6,42 @@
 
 from typing import Optional
 
+# Roles not natively understood by model chat templates are mapped here before
+# the template is applied.
+_ROLE_ALIASES = {
+    "developer": "system",  # OpenAI o-series "developer" role -> system
+}
+
+
+def _normalize_messages(messages: list[dict]) -> list[dict]:
+    """
+    Normalise messages so that every model's chat template can handle them:
+
+    1. Map unknown roles (e.g. "developer") to their canonical equivalents.
+    2. Convert list-type content (OpenAI multipart format) to a plain string
+       by joining all "text" parts, so templates that expect string content
+       don't silently produce an empty string.
+    """
+    normalized = []
+    for msg in messages:
+        msg = dict(msg)
+
+        # 1. Role normalisation.
+        msg["role"] = _ROLE_ALIASES.get(msg["role"], msg["role"])
+
+        # 2. Content normalisation: list -> string.
+        content = msg.get("content")
+        if isinstance(content, list):
+            text_parts = [
+                part["text"]
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ]
+            msg["content"] = "\n".join(text_parts)
+
+        normalized.append(msg)
+    return normalized
+
 
 def apply_chat_template(
     messages: list[dict],
@@ -19,6 +55,7 @@ def apply_chat_template(
     Returns the raw prompt string (not tokenized).
     """
     model_type = model_type.strip().lower()
+    messages = _normalize_messages(messages)
 
     if model_type == "qwen3":
         return _apply_qwen3(messages, tools, tokenizer)
