@@ -3,11 +3,49 @@
 # model types (Qwen3/Hermes and Llama3 JSON formats).
 ###
 
+import copy
 import json
 import re
 import time
 import uuid
 from typing import Optional
+
+
+# ------------------------------------------------------------------ #
+# <tool_call_security> stripping utilities
+# ------------------------------------------------------------------ #
+
+_SECURITY_BLOCK_RE = re.compile(
+    r"<tool_call_security>.*?</tool_call_security>", re.DOTALL
+)
+
+
+def strip_tool_call_security(text: str) -> str:
+    """Remove all <tool_call_security>...</tool_call_security> blocks from text."""
+    return _SECURITY_BLOCK_RE.sub("", text).strip()
+
+
+def clean_messages(messages: list[dict]) -> list[dict]:
+    """
+    Return a deep copy of messages with <tool_call_security> stripped from
+    every message's content field (string or list-of-parts).
+    """
+    result = []
+    for msg in messages:
+        msg = copy.deepcopy(msg)
+        content = msg.get("content")
+        if isinstance(content, str) and "<tool_call_security>" in content:
+            msg["content"] = strip_tool_call_security(content)
+        elif isinstance(content, list):
+            for part in content:
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and "<tool_call_security>" in part.get("text", "")
+                ):
+                    part["text"] = strip_tool_call_security(part["text"])
+        result.append(msg)
+    return result
 
 
 # ------------------------------------------------------------------ #
@@ -145,6 +183,7 @@ def build_chat_completion(
     content: Optional[str],
     prompt_tokens: int,
     completion_tokens: int,
+    cleaned_input_messages: Optional[list[dict]] = None,
 ) -> dict:
     message: dict = {"role": "assistant", "content": content}
 
@@ -164,7 +203,7 @@ def build_chat_completion(
     else:
         finish_reason = "stop"
 
-    return {
+    resp: dict = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -182,3 +221,11 @@ def build_chat_completion(
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
+
+    # Non-standard convenience field: cleaned history + new assistant message.
+    # Historical messages have <tool_call_security> stripped; the new assistant
+    # message keeps it so the client can inspect it.
+    if cleaned_input_messages is not None:
+        resp["messages"] = cleaned_input_messages + [message]
+
+    return resp

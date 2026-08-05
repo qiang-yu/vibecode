@@ -9,7 +9,7 @@ model:
   dtype: bfloat16
 
 server:
-  host: 0.0.0.0
+  host: localhost
   port: 19001
 
 templates:
@@ -20,3 +20,8 @@ logging:
   # Raw request/response debug log. Relative paths are resolved from the
   # directory that contains this config file.
   raw_message_log: raw_message.log
+
+# If true (default), <tool_call_security>...</tool_call_security> blocks are
+# removed from historical messages before the prompt is built and sent to the
+# model. Set to false to pass history through unmodified.
+strip_tool_call_security_in_history: true

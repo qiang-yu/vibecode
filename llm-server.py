@@ -23,8 +23,15 @@ from peft import PeftModel
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from llm_server_chat_templates import apply_chat_template
-from llm_server_tool_parsers import build_chat_completion, parse_model_output
+import importlib as _importlib
+
+_chat_tpl = _importlib.import_module("llm-server-chat-templates")
+_tool_parsers = _importlib.import_module("llm-server-tool-parsers")
+
+apply_chat_template = _chat_tpl.apply_chat_template
+build_chat_completion = _tool_parsers.build_chat_completion
+clean_messages = _tool_parsers.clean_messages
+parse_model_output = _tool_parsers.parse_model_output
 
 # --------------------------------------------------------------------------- #
 # Console logger (stdout)
@@ -65,7 +72,8 @@ TMPL_CFG = cfg.get("templates", {})
 LOG_CFG = cfg.get("logging", {})
 
 BASE_MODEL_PATH: str = MODEL_CFG["base_model_path"]
-LORA_ADAPTER_PATH: str = MODEL_CFG["lora_adapter_path"]
+LORA_ADAPTER_PATH: str = (MODEL_CFG.get("lora_adapter_path") or "").strip()
+HAS_LORA: bool = bool(LORA_ADAPTER_PATH)
 MODEL_TYPE: str = MODEL_CFG["model_type"]
 MAX_TOKENS: int = int(MODEL_CFG["max_tokens"])
 DEVICE: str = MODEL_CFG.get("device", "cuda")
@@ -80,6 +88,7 @@ def _resolve_path(val: Optional[str]) -> Optional[str]:
     return str(p if p.is_absolute() else _cfg_dir / p)
 
 LLAMA3_TEMPLATE_PATH: Optional[str] = _resolve_path(TMPL_CFG.get("llama3_chat_template"))
+STRIP_SECURITY_IN_HISTORY: bool = bool(cfg.get("strip_tool_call_security_in_history", True))
 
 DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
@@ -89,13 +98,21 @@ DTYPE_MAP = {
 DTYPE = DTYPE_MAP[DTYPE_STR]
 
 # --------------------------------------------------------------------------- #
-# Raw message file logger
+# Raw message file logger (one physical line per entry)
 # --------------------------------------------------------------------------- #
+
+class _SingleLineFormatter(logging.Formatter):
+    """Each log entry is written as one physical line: newlines become literal \n."""
+    def format(self, record: logging.LogRecord) -> str:
+        # Let the base class handle %s substitution and all other formatting,
+        # then escape newlines in the final output string.
+        return super().format(record).replace("\n", "\\n").replace("\r", "\\r")
+
 
 _raw_log_path = _resolve_path(LOG_CFG.get("raw_message_log", "raw_message.log"))
 _raw_handler = logging.FileHandler(_raw_log_path, encoding="utf-8")
 _raw_handler.setFormatter(
-    logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    _SingleLineFormatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 )
 raw_log = logging.getLogger("raw")
 raw_log.setLevel(logging.DEBUG)
@@ -129,10 +146,15 @@ _base = AutoModelForCausalLM.from_pretrained(
     trust_remote_code=True,
 )
 
-log.info("Loading LoRA adapter from %s", LORA_ADAPTER_PATH)
-model: PeftModel = PeftModel.from_pretrained(_base, LORA_ADAPTER_PATH)
+if HAS_LORA:
+    log.info("Loading LoRA adapter from %s", LORA_ADAPTER_PATH)
+    model: Any = PeftModel.from_pretrained(_base, LORA_ADAPTER_PATH)
+else:
+    log.info("No LoRA adapter configured — running base model only.")
+    model: Any = _base
+
 model.eval()
-log.info("Model ready.")
+log.info("Model ready. HAS_LORA=%s", HAS_LORA)
 
 _device = next(model.parameters()).device
 
@@ -177,8 +199,11 @@ def _forward(
     past_key_values: Any,
     use_lora: bool,
 ) -> tuple[torch.Tensor, Any]:
-    ctx = contextlib.nullcontext() if use_lora else model.disable_adapter()
-    with ctx:
+    if HAS_LORA:
+        ctx = contextlib.nullcontext() if use_lora else model.disable_adapter()
+        with ctx:
+            out = model(token_ids, past_key_values=past_key_values, use_cache=True)
+    else:
         out = model(token_ids, past_key_values=past_key_values, use_cache=True)
     return out.logits[:, -1, :], out.past_key_values
 
@@ -193,10 +218,13 @@ def generate_two_phase(
     """
     Two-phase generation with shared KV cache.
     Returns (full_generated_text, tool_call_was_produced).
+
+    When HAS_LORA is False, runs a single-phase base-model generation with no
+    tool_call stop detection and no <tool_call_security> injection.
     """
     input_tensor = torch.tensor([input_ids], device=_device)
 
-    # ---- Prefill (base model) -------------------------------------------- #
+    # ---- Prefill --------------------------------------------------------- #
     raw_log.info("[PHASE-1] Model: base model | path: %s", BASE_MODEL_PATH)
     logits, past_kv = _forward(input_tensor, None, use_lora=False)
 
@@ -215,10 +243,11 @@ def generate_two_phase(
             torch.tensor([[tok]], device=_device), past_kv, use_lora=False
         )
 
-        decoded = tokenizer.decode(phase1_ids, skip_special_tokens=False)
-        if "</tool_call>" in decoded:
-            tool_call_stopped = True
-            break
+        if HAS_LORA:
+            decoded = tokenizer.decode(phase1_ids, skip_special_tokens=False)
+            if "</tool_call>" in decoded:
+                tool_call_stopped = True
+                break
 
     phase1_text = tokenizer.decode(phase1_ids, skip_special_tokens=False)
 
@@ -237,6 +266,7 @@ def generate_two_phase(
     )
 
     # ---- Phase 2: inject <tool_call_security> and LoRA decoding ---------- #
+    # Only reached when HAS_LORA is True.
     raw_log.info("[PHASE-2] Model: LoRA adapter | path: %s", LORA_ADAPTER_PATH)
 
     inject_text = "<tool_call_security>"
@@ -338,13 +368,17 @@ async def chat_completions(raw_request: Request, request: ChatCompletionRequest)
         raise HTTPException(status_code=501, detail="Streaming is not supported.")
 
     messages = [m.model_dump(exclude_none=True) for m in request.messages]
+
+    # Optionally strip <tool_call_security> from history before feeding to the model.
+    messages_for_model = clean_messages(messages) if STRIP_SECURITY_IN_HISTORY else messages
+
     tools_for_template: Optional[list[dict]] = (
         [t.model_dump() for t in request.tools] if request.tools else None
     )
 
     try:
         prompt = apply_chat_template(
-            messages=messages,
+            messages=messages_for_model,
             tools=tools_for_template,
             tokenizer=tokenizer,
             model_type=MODEL_TYPE,
@@ -399,6 +433,7 @@ async def chat_completions(raw_request: Request, request: ChatCompletionRequest)
         content=content,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        cleaned_input_messages=messages_for_model,
     )
 
     elapsed = time.time() - t0
