@@ -1,0 +1,22 @@
+model:
+  base_model_path: /home/qiangyu/Models/Qwen/Qwen3-8B
+  lora_adapter_path: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260804_ce2.5_0.0nosecurity_3epochs_8B
+  # Supported: Qwen3, Llama3, Mistral3
+  model_type: Qwen3
+  max_tokens: 32768
+  device: cuda
+  # bfloat16 or float16
+  dtype: bfloat16
+
+server:
+  host: 0.0.0.0
+  port: 19001
+
+templates:
+  # Path to custom jinja chat template for Llama3 (used when model_type=Llama3)
+  llama3_chat_template: tool_chat_template_llama3.1_json.jinja
+
+logging:
+  # Raw request/response debug log. Relative paths are resolved from the
+  # directory that contains this config file.
+  raw_message_log: raw_message.log
