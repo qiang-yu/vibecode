@@ -55,11 +55,22 @@ def load_config(path: str) -> dict:
 
 
 _parser = argparse.ArgumentParser(description="llm-server")
-_parser.add_argument(
-    "--config",
-    default=str(Path(__file__).parent / "llm-server-config.yaml"),
-    help="Path to the YAML config file",
-)
+# fmt: off
+_parser.add_argument("--config",          default=str(Path(__file__).parent / "llm-server-config.yaml"), help="Path to the YAML config file")
+_parser.add_argument("--base-model-path", default=None, help="Override model.base_model_path")
+_parser.add_argument("--lora-adapter-path", default=None, help="Override model.lora_adapter_path (empty string = no LoRA)")
+_parser.add_argument("--model-type",      default=None, help="Override model.model_type (Qwen3/Llama3/Mistral3)")
+_parser.add_argument("--max-tokens",      type=int, default=None, help="Override model.max_tokens")
+_parser.add_argument("--device",          default=None, help="Override model.device")
+_parser.add_argument("--dtype",           default=None, help="Override model.dtype (bfloat16/float16/float32)")
+_parser.add_argument("--host",            default=None, help="Override server.host")
+_parser.add_argument("--port",            type=int, default=None, help="Override server.port")
+_parser.add_argument("--llama3-chat-template", default=None, help="Override templates.llama3_chat_template")
+_parser.add_argument("--raw-message-log", default=None, help="Override logging.raw_message_log")
+_parser.add_argument("--strip-tool-call-security-in-history",
+                     action=argparse.BooleanOptionalAction, default=None,
+                     help="Override strip_tool_call_security_in_history (--no-... to disable)")
+# fmt: on
 _args, _ = _parser.parse_known_args()
 
 CONFIG_PATH = _args.config
@@ -71,13 +82,23 @@ SERVER_CFG = cfg["server"]
 TMPL_CFG = cfg.get("templates", {})
 LOG_CFG = cfg.get("logging", {})
 
-BASE_MODEL_PATH: str = MODEL_CFG["base_model_path"]
-LORA_ADAPTER_PATH: str = (MODEL_CFG.get("lora_adapter_path") or "").strip()
-HAS_LORA: bool = bool(LORA_ADAPTER_PATH)
-MODEL_TYPE: str = MODEL_CFG["model_type"]
-MAX_TOKENS: int = int(MODEL_CFG["max_tokens"])
-DEVICE: str = MODEL_CFG.get("device", "cuda")
-DTYPE_STR: str = MODEL_CFG.get("dtype", "bfloat16")
+# Apply CLI overrides (None means the flag was not provided; keep config value).
+def _cli(arg_val, cfg_val):
+    return arg_val if arg_val is not None else cfg_val
+
+BASE_MODEL_PATH: str       = _cli(_args.base_model_path,   MODEL_CFG["base_model_path"])
+LORA_ADAPTER_PATH: str     = (_cli(_args.lora_adapter_path, MODEL_CFG.get("lora_adapter_path") or "")).strip()
+HAS_LORA: bool             = bool(LORA_ADAPTER_PATH)
+MODEL_TYPE: str            = _cli(_args.model_type,         MODEL_CFG["model_type"])
+MAX_TOKENS: int            = int(_cli(_args.max_tokens,     MODEL_CFG["max_tokens"]))
+DEVICE: str                = _cli(_args.device,             MODEL_CFG.get("device", "cuda"))
+DTYPE_STR: str             = _cli(_args.dtype,              MODEL_CFG.get("dtype", "bfloat16"))
+_HOST: str                 = _cli(_args.host,               SERVER_CFG.get("host", "0.0.0.0"))
+_PORT: int                 = int(_cli(_args.port,           SERVER_CFG.get("port", 19001)))
+STRIP_SECURITY_IN_HISTORY: bool = _cli(
+    _args.strip_tool_call_security_in_history,
+    cfg.get("strip_tool_call_security_in_history", True),
+)
 
 _cfg_dir = Path(CONFIG_PATH).parent
 
@@ -87,8 +108,10 @@ def _resolve_path(val: Optional[str]) -> Optional[str]:
     p = Path(val)
     return str(p if p.is_absolute() else _cfg_dir / p)
 
-LLAMA3_TEMPLATE_PATH: Optional[str] = _resolve_path(TMPL_CFG.get("llama3_chat_template"))
-STRIP_SECURITY_IN_HISTORY: bool = bool(cfg.get("strip_tool_call_security_in_history", True))
+_llama3_tpl_raw = _cli(_args.llama3_chat_template, TMPL_CFG.get("llama3_chat_template"))
+LLAMA3_TEMPLATE_PATH: Optional[str] = _resolve_path(_llama3_tpl_raw)
+
+_raw_log_raw = _cli(_args.raw_message_log, LOG_CFG.get("raw_message_log", "raw_message.log"))
 
 DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
@@ -109,7 +132,7 @@ class _SingleLineFormatter(logging.Formatter):
         return super().format(record).replace("\n", "\\n").replace("\r", "\\r")
 
 
-_raw_log_path = _resolve_path(LOG_CFG.get("raw_message_log", "raw_message.log"))
+_raw_log_path = _resolve_path(_raw_log_raw)
 _raw_handler = logging.FileHandler(_raw_log_path, encoding="utf-8")
 _raw_handler.setFormatter(
     _SingleLineFormatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -457,7 +480,7 @@ async def health():
 if __name__ == "__main__":
     uvicorn.run(
         app,
-        host=SERVER_CFG.get("host", "0.0.0.0"),
-        port=int(SERVER_CFG.get("port", 19001)),
+        host=_HOST,
+        port=_PORT,
         log_level="info",
     )

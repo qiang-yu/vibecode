@@ -12,6 +12,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cd "$SCRIPT_DIR"
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=0
 
-exec python llm-server.py --config "$SCRIPT_DIR/llm-server-config.yaml" "$@"
+PORT=19000
+
+exec python llm-server.py --config "$SCRIPT_DIR/llm-server-config.yaml" --port $PORT
