@@ -1,9 +1,8 @@
 ###
 # This script checks tool call security annotations in AgentDojo run JSON files.
-# It walks through ./runs, parses every JSON file, and classifies each file as
-# valid, invalid, or no_tool_call based on whether assistant messages with
-# non-empty tool_calls contain a <tool_call_security>...</tool_call_security>
-# block in their content.
+# For each assistant message whose tool_calls array is non-empty, it counts the
+# <tool_call_security>...</tool_call_security> blocks in the text content and
+# compares that count to len(tool_calls), then validates the format of each block.
 ###
 
 import json
@@ -14,7 +13,19 @@ from typing import Any
 
 
 INPUT_DIR = Path("./runs")
-SECURITY_BLOCK_PATTERN = re.compile(r"<tool_call_security>.*?</tool_call_security>", re.DOTALL)
+
+# Captures the inner content of every <tool_call_security> block.
+SECURITY_BLOCK_PATTERN = re.compile(
+    r"<tool_call_security>(.*?)</tool_call_security>", re.DOTALL
+)
+
+# All five sub-tags must appear in order inside a security block.
+VALID_SECURITY_INNER_PATTERN = re.compile(
+    r"<tool_name>.*?</tool_name>.*?<tool_args>.*?</tool_args>.*?"
+    r"<tool_reason>.*?</tool_reason>.*?<tool_trace>.*?</tool_trace>.*?"
+    r"<tool_security>.*?</tool_security>",
+    re.DOTALL,
+)
 
 
 def extract_text_content(content: Any) -> str:
@@ -23,7 +34,6 @@ def extract_text_content(content: Any) -> str:
         return content
     if not isinstance(content, list):
         return ""
-
     parts = []
     for block in content:
         if isinstance(block, dict) and block.get("type") == "text":
@@ -31,54 +41,91 @@ def extract_text_content(content: Any) -> str:
     return "".join(parts)
 
 
-def check_assistant_message(message: dict[str, Any]) -> tuple[int, int]:
-    """Return (valid_tool_calls, invalid_tool_calls) for one assistant message."""
+def classify_assistant_message(message: dict[str, Any]) -> tuple[int, str]:
+    """
+    Classify one assistant message.
+
+    Uses tool_calls (the parsed array) to determine how many tool calls were made,
+    then counts <tool_call_security> blocks in the text content and compares.
+
+    Returns (n_tool_calls, classification):
+      "no_tool_call"   - tool_calls is empty; nothing to check
+      "no_security"    - tool calls present but zero security blocks in text
+      "invalid_more"   - security block count does not match tool call count (and > 0)
+      "invalid_format" - count matches but at least one block is missing a required sub-tag
+      "valid"          - count matches and every block has all required sub-tags
+    """
     tool_calls = message.get("tool_calls", [])
     if not isinstance(tool_calls, list) or not tool_calls:
-        return 0, 0
+        return 0, "no_tool_call"
 
+    n = len(tool_calls)
     text = extract_text_content(message.get("content", ""))
-    has_security_block = SECURITY_BLOCK_PATTERN.search(text) is not None
+    security_inners = SECURITY_BLOCK_PATTERN.findall(text)
+    s = len(security_inners)
 
-    if has_security_block:
-        return len(tool_calls), 0
-    return 0, len(tool_calls)
+    if s == 0:
+        return n, "no_security"
+
+    if s != n:
+        return n, "invalid_more"
+
+    # s == n: validate the format of every security block
+    for inner in security_inners:
+        if not VALID_SECURITY_INNER_PATTERN.search(inner):
+            return n, "invalid_format"
+
+    return n, "valid"
 
 
-def check_json_file(path: Path) -> tuple[int, int, str]:
+def check_json_file(path: Path) -> tuple[dict[str, int], str]:
     """
     Check one JSON file.
 
-    Returns:
-        (valid_tool_calls, invalid_tool_calls, classification)
-        classification is one of "valid", "invalid", "no_tool_call", "parse_error".
+    Iterates all assistant messages and aggregates per-type tool call counts.
+
+    Returns (counts, classification) where classification is the worst issue found:
+      "valid", "no_security", "invalid_more", "invalid_format", "no_tool_call", "parse_error"
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
         print(f"[ERROR] Failed to read {path}: {exc}")
-        return 0, 0, "parse_error"
+        return {"valid": 0, "no_security": 0, "invalid_format": 0, "invalid_more": 0}, "parse_error"
 
     messages = []
     if isinstance(data, dict):
-        raw_messages = data.get("messages", [])
-        if isinstance(raw_messages, list):
-            messages = raw_messages
+        raw = data.get("messages", [])
+        if isinstance(raw, list):
+            messages = raw
 
-    total_valid = 0
-    total_invalid = 0
+    total_counts: dict[str, int] = {
+        "valid": 0,
+        "no_security": 0,
+        "invalid_format": 0,
+        "invalid_more": 0,
+    }
+
     for message in messages:
-        if isinstance(message, dict) and message.get("role") == "assistant":
-            v, i = check_assistant_message(message)
-            total_valid += v
-            total_invalid += i
+        if not (isinstance(message, dict) and message.get("role") == "assistant"):
+            continue
+        n, cls = classify_assistant_message(message)
+        if cls in total_counts:
+            total_counts[cls] += n
 
-    if total_invalid > 0:
-        return total_valid, total_invalid, "invalid"
-    if total_valid > 0:
-        return total_valid, total_invalid, "valid"
-    return total_valid, total_invalid, "no_tool_call"
+    total_tc = sum(total_counts.values())
+    if total_tc == 0:
+        return total_counts, "no_tool_call"
+
+    # File-level classification: worst issue wins
+    if total_counts["no_security"] > 0:
+        return total_counts, "no_security"
+    if total_counts["invalid_more"] > 0:
+        return total_counts, "invalid_more"
+    if total_counts["invalid_format"] > 0:
+        return total_counts, "invalid_format"
+    return total_counts, "valid"
 
 
 def print_path_list(title: str, paths: list[Path]) -> None:
@@ -103,29 +150,46 @@ def main() -> int:
 
     total_files = 0
     valid_files = 0
-    invalid_files = 0
+    no_security_files = 0
+    invalid_format_files = 0
+    invalid_more_files = 0
     no_tool_call_files = 0
     parse_error_files = 0
-    total_tool_calls = 0
-    valid_tool_calls = 0
-    invalid_tool_calls = 0
-    valid_paths = []
-    invalid_paths = []
-    no_tool_call_paths = []
+
+    total_tc = 0
+    valid_tc = 0
+    no_security_tc = 0
+    invalid_format_tc = 0
+    invalid_more_tc = 0
+
+    valid_paths: list[Path] = []
+    no_security_paths: list[Path] = []
+    invalid_format_paths: list[Path] = []
+    invalid_more_paths: list[Path] = []
+    no_tool_call_paths: list[Path] = []
 
     for json_path in json_files:
         total_files += 1
-        v, i, classification = check_json_file(json_path)
-        total_tool_calls += v + i
-        valid_tool_calls += v
-        invalid_tool_calls += i
+        counts, classification = check_json_file(json_path)
+
+        total_tc += sum(counts.values())
+        valid_tc += counts["valid"]
+        no_security_tc += counts["no_security"]
+        invalid_format_tc += counts["invalid_format"]
+        invalid_more_tc += counts["invalid_more"]
 
         if classification == "valid":
             valid_files += 1
             valid_paths.append(json_path)
-        elif classification == "invalid":
-            invalid_files += 1
-            invalid_paths.append(json_path)
+        elif classification == "no_security":
+            no_security_files += 1
+            no_security_paths.append(json_path)
+        elif classification == "invalid_format":
+            invalid_format_files += 1
+            invalid_format_paths.append(json_path)
+        elif classification == "invalid_more":
+            invalid_more_files += 1
+            invalid_more_paths.append(json_path)
         elif classification == "no_tool_call":
             no_tool_call_files += 1
             no_tool_call_paths.append(json_path)
@@ -133,20 +197,26 @@ def main() -> int:
             parse_error_files += 1
 
     print_path_list("Valid JSON files", valid_paths)
-    print_path_list("Invalid JSON files", invalid_paths)
+    print_path_list("No tool_call_security JSON files", no_security_paths)
+    print_path_list("Invalid tool_call_security JSON files", invalid_format_paths)
+    print_path_list("Invalid more tool_call_security JSON files", invalid_more_paths)
     print_path_list("No tool_call JSON files", no_tool_call_paths)
 
     print("=" * 80)
     print("Summary")
     print("=" * 80)
-    print(f"Total JSON files:          {total_files}")
-    print(f"Valid JSON files:          {valid_files}")
-    print(f"Invalid JSON files:        {invalid_files}")
-    print(f"No tool_call JSON files:   {no_tool_call_files}")
-    print(f"Parse error JSON files:    {parse_error_files}")
-    print(f"Total tool calls:          {total_tool_calls}")
-    print(f"Valid tool calls:          {valid_tool_calls}")
-    print(f"Invalid tool calls:        {invalid_tool_calls}")
+    print(f"Total JSON files:                           {total_files}")
+    print(f"Valid JSON files:                           {valid_files}")
+    print(f"No tool_call_security JSON files:           {no_security_files}")
+    print(f"Invalid tool_call_security JSON files:      {invalid_format_files}")
+    print(f"Invalid more tool_call_security JSON files: {invalid_more_files}")
+    print(f"No tool_call JSON files:                    {no_tool_call_files}")
+    print(f"Parse error JSON files:                     {parse_error_files}")
+    print(f"Total tool calls:                           {total_tc}")
+    print(f"Valid tool calls:                           {valid_tc}")
+    print(f"No security tool calls:                     {no_security_tc}")
+    print(f"Invalid format tool calls:                  {invalid_format_tc}")
+    print(f"Invalid more tool calls:                    {invalid_more_tc}")
 
     return 0
 
