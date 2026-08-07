@@ -1,6 +1,6 @@
 model:
   base_model_path: /home/qiangyu/Models/Qwen/Qwen3-8B
-  lora_adapter_path: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260804_ce2.5_0.0nosecurity_3epochs_8B
+  lora_adapter_path: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260805_ce1.5_0.0nosecurity_3epochs_8B
   # Supported: Qwen3, Llama3, Mistral3
   model_type: Qwen3
   max_tokens: 32768
@@ -19,7 +19,7 @@ templates:
 logging:
   # Raw request/response debug log. Relative paths are resolved from the
   # directory that contains this config file.
-  raw_message_log: raw_message.log
+  raw_message_log: raw_message-new-server.log
 
 # If true (default), <tool_call_security>...</tool_call_security> blocks are
 # removed from historical messages before the prompt is built and sent to the

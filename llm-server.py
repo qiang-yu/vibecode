@@ -166,6 +166,7 @@ _base = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL_PATH,
     torch_dtype=DTYPE,
     device_map=DEVICE,
+    attn_implementation="sdpa",
     trust_remote_code=True,
 )
 
@@ -191,43 +192,29 @@ def _sample_next_token(
     top_p: float,
     top_k: int,
 ) -> int:
-    logits = logits[0]
-
     if temperature == 0.0:
-        return int(logits.argmax())
+        return int(logits[0].argmax())
 
-    logits = logits.float() / temperature
-
-    if top_k > 0:
-        kth = torch.topk(logits, min(top_k, logits.size(-1)))[0][-1]
-        logits = logits.masked_fill(logits < kth, float("-inf"))
+    logits = logits[0].float() / temperature
+    # topk first so softmax + multinomial operate on a small tensor
+    k = min(top_k if top_k > 0 else 1024, logits.size(-1))
+    vals, idx = torch.topk(logits, k)   # already descending
+    probs = torch.softmax(vals, dim=-1)
 
     if 0.0 < top_p < 1.0:
-        probs_sort, probs_idx = torch.sort(
-            torch.softmax(logits, dim=-1), descending=True
-        )
-        cum = torch.cumsum(probs_sort, dim=-1)
-        mask = (cum - probs_sort) > top_p
-        probs_sort[mask] = 0.0
-        probs_sort.div_(probs_sort.sum())
-        next_tok = torch.multinomial(probs_sort, num_samples=1)
-        return int(probs_idx[next_tok])
+        cum = torch.cumsum(probs, dim=-1)
+        probs[(cum - probs) > top_p] = 0.0
+        probs.div_(probs.sum())
 
-    return int(torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1))
+    return int(idx[torch.multinomial(probs, 1)])
 
 
 @torch.no_grad()
 def _forward(
     token_ids: torch.Tensor,
     past_key_values: Any,
-    use_lora: bool,
 ) -> tuple[torch.Tensor, Any]:
-    if HAS_LORA:
-        ctx = contextlib.nullcontext() if use_lora else model.disable_adapter()
-        with ctx:
-            out = model(token_ids, past_key_values=past_key_values, use_cache=True)
-    else:
-        out = model(token_ids, past_key_values=past_key_values, use_cache=True)
+    out = model(token_ids, past_key_values=past_key_values, use_cache=True)
     return out.logits[:, -1, :], out.past_key_values
 
 
@@ -237,40 +224,44 @@ def generate_two_phase(
     temperature: float,
     top_p: float,
     top_k: int,
-) -> tuple[str, bool]:
+) -> tuple[str, int, bool]:
     """
     Two-phase generation with shared KV cache.
-    Returns (full_generated_text, tool_call_was_produced).
+    Returns (full_generated_text, completion_tokens, tool_call_was_produced).
 
     When HAS_LORA is False, runs a single-phase base-model generation with no
     tool_call stop detection and no <tool_call_security> injection.
     """
     input_tensor = torch.tensor([input_ids], device=_device)
 
-    # ---- Prefill --------------------------------------------------------- #
     raw_log.info("[PHASE-1] Model: base model | path: %s", BASE_MODEL_PATH)
-    logits, past_kv = _forward(input_tensor, None, use_lora=False)
 
-    # ---- Phase 1: base model decoding ------------------------------------ #
+    # ---- Phase 1: base model prefill + decode ----------------------------
+    # Wrap the entire phase so adapter toggle happens once, not per step.
     phase1_ids: list[int] = []
     tool_call_stopped = False
 
-    while len(phase1_ids) < max_new_tokens:
-        tok = _sample_next_token(logits, temperature, top_p, top_k)
-        phase1_ids.append(tok)
+    phase1_ctx = model.disable_adapter() if HAS_LORA else contextlib.nullcontext()
+    with phase1_ctx:
+        logits, past_kv = _forward(input_tensor, None)
 
-        if tok in eos_token_ids:
-            break
+        while len(phase1_ids) < max_new_tokens:
+            tok = _sample_next_token(logits, temperature, top_p, top_k)
+            phase1_ids.append(tok)
 
-        logits, past_kv = _forward(
-            torch.tensor([[tok]], device=_device), past_kv, use_lora=False
-        )
-
-        if HAS_LORA:
-            decoded = tokenizer.decode(phase1_ids, skip_special_tokens=False)
-            if "</tool_call>" in decoded:
-                tool_call_stopped = True
+            if tok in eos_token_ids:
                 break
+
+            logits, past_kv = _forward(
+                torch.tensor([[tok]], device=_device), past_kv
+            )
+
+            if HAS_LORA:
+                # Decode only the tail to avoid O(n) work each step.
+                tail = tokenizer.decode(phase1_ids[-16:], skip_special_tokens=False)
+                if "</tool_call>" in tail:
+                    tool_call_stopped = True
+                    break
 
     phase1_text = tokenizer.decode(phase1_ids, skip_special_tokens=False)
 
@@ -280,7 +271,7 @@ def generate_two_phase(
             "[PHASE-1] Output:\n%s",
             phase1_text,
         )
-        return phase1_text, False
+        return phase1_text, len(phase1_ids), False
 
     raw_log.info(
         "[PHASE-1] Stop: </tool_call> detected\n"
@@ -288,8 +279,8 @@ def generate_two_phase(
         phase1_text,
     )
 
-    # ---- Phase 2: inject <tool_call_security> and LoRA decoding ---------- #
-    # Only reached when HAS_LORA is True.
+    # ---- Phase 2: inject <tool_call_security> and LoRA decoding ----------
+    # Only reached when HAS_LORA is True. LoRA is active by default (no ctx).
     raw_log.info("[PHASE-2] Model: LoRA adapter | path: %s", LORA_ADAPTER_PATH)
 
     inject_text = "<tool_call_security>"
@@ -297,7 +288,7 @@ def generate_two_phase(
 
     for inj_tok in inject_ids:
         logits, past_kv = _forward(
-            torch.tensor([[inj_tok]], device=_device), past_kv, use_lora=True
+            torch.tensor([[inj_tok]], device=_device), past_kv
         )
 
     phase2_ids: list[int] = list(inject_ids)
@@ -311,11 +302,11 @@ def generate_two_phase(
             break
 
         logits, past_kv = _forward(
-            torch.tensor([[tok]], device=_device), past_kv, use_lora=True
+            torch.tensor([[tok]], device=_device), past_kv
         )
 
-        decoded2 = tokenizer.decode(phase2_ids, skip_special_tokens=False)
-        if "</tool_call_security>" in decoded2:
+        tail2 = tokenizer.decode(phase2_ids[-24:], skip_special_tokens=False)
+        if "</tool_call_security>" in tail2:
             break
 
     phase2_text = tokenizer.decode(phase2_ids, skip_special_tokens=False)
@@ -326,7 +317,7 @@ def generate_two_phase(
     )
 
     full_text = phase1_text + phase2_text
-    return full_text, True
+    return full_text, len(phase1_ids) + len(phase2_ids), True
 
 
 # --------------------------------------------------------------------------- #
@@ -431,7 +422,7 @@ async def chat_completions(raw_request: Request, request: ChatCompletionRequest)
     )
 
     try:
-        generated_text, had_tool_call = generate_two_phase(
+        generated_text, completion_tokens, had_tool_call = generate_two_phase(
             input_ids=input_ids,
             max_new_tokens=max_new,
             temperature=temperature,
@@ -446,8 +437,6 @@ async def chat_completions(raw_request: Request, request: ChatCompletionRequest)
         )
         raw_log.info("[ERROR] Generation failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Generation error: {exc}")
-
-    completion_tokens = len(tokenizer.encode(generated_text, add_special_tokens=False))
 
     tool_calls, content = parse_model_output(generated_text, MODEL_TYPE)
 
