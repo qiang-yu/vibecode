@@ -44,7 +44,7 @@ from transformers import AutoTokenizer
 VLLM_BASE_URL             = "http://localhost:19001/v1"
 BASE_MODEL_ID             = "Qwen3Base"
 LORA_MODEL_ID             = "lora-model"
-BASE_MODEL_PATH           = ""           # required: local path to load tokenizer
+BASE_MODEL_PATH           = "/home/qiangyu/Models/Qwen/Qwen3-8B"           # required: local path to load tokenizer
 MODEL_TYPE                = "Qwen3"     # Qwen3 | Llama3
 LLAMA3_TEMPLATE_PATH      = str(Path(__file__).parent / "tool_chat_template_llama3.1_json.jinja")
 MAX_TOKENS_SECURITY       = 512         # hard limit for phase 2 / security block
@@ -617,8 +617,8 @@ def main():
                         help=f"vllm model ID for base model (default: {BASE_MODEL_ID})")
     parser.add_argument("--lora-model-id",         default=None, metavar="ID",
                         help=f"vllm model ID for lora model (default: {LORA_MODEL_ID})")
-    parser.add_argument("--base-model-path",       required=True, metavar="PATH",
-                        help="local path used to load the tokenizer")
+    parser.add_argument("--base-model-path",       default=None, metavar="PATH",
+                        help=f"local path used to load the tokenizer (default: {BASE_MODEL_PATH})")
     parser.add_argument("--model-type",            default=None, choices=["Qwen3", "Llama3"],
                         help=f"model type (default: {MODEL_TYPE})")
     parser.add_argument("--llama3-template",       default=None, metavar="PATH",
@@ -642,7 +642,7 @@ def main():
     if args.vllm_url:            VLLM_BASE_URL        = args.vllm_url
     if args.base_model_id:       BASE_MODEL_ID        = args.base_model_id
     if args.lora_model_id:       LORA_MODEL_ID        = args.lora_model_id
-    BASE_MODEL_PATH                                    = args.base_model_path
+    if args.base_model_path:   BASE_MODEL_PATH      = args.base_model_path
     if args.model_type:          MODEL_TYPE           = args.model_type
     if args.llama3_template:     LLAMA3_TEMPLATE_PATH = args.llama3_template
     if args.max_tokens_security: MAX_TOKENS_SECURITY  = args.max_tokens_security
