@@ -147,6 +147,11 @@ class TrainingConfig:
     loss_calc_kl_enable_without_security: bool = False  # enable KL for assistant turns without tool_call_security
     loss_calc_kl_enable_with_security: bool = False  # enable KL for assistant turns that contain tool_call_security (background + think, excluding tool_call blocks)
 
+    # Ratio of non-security turns to security turns sampled per dataset.
+    # 0.0 means only security turns are used; >0 randomly samples that fraction
+    # of non-security turns relative to security turns (per dataset).
+    no_security_to_security_turn_ratio: float = 0.0
+
     # Optional external config file (YAML or JSON)
     config_file: Optional[str] = None
 
@@ -1089,6 +1094,7 @@ def _tokenization_fingerprint(
         "loss_calc_kl_think_alpha": config.loss_calc_kl_think_alpha,
         "loss_calc_kl_enable_without_security": config.loss_calc_kl_enable_without_security,
         "loss_calc_kl_enable_with_security": config.loss_calc_kl_enable_with_security,
+        "no_security_to_security_turn_ratio": config.no_security_to_security_turn_ratio,
         "max_samples": config.max_samples,
         "eval_data_ratio": config.eval_data_ratio,
         "shuffle_seed": config.shuffle_seed,
@@ -1191,8 +1197,17 @@ def load_datasets(
                 eval_security = [s for s in eval_samples if s["has_security_block"]]
                 eval_non_security = [s for s in eval_samples if not s["has_security_block"]]
 
-                selected_train_non_security = train_non_security
-                selected_eval_non_security = eval_non_security
+                import random as _random
+                ratio = config.no_security_to_security_turn_ratio
+                if ratio <= 0.0:
+                    selected_train_non_security: List[Dict[str, Any]] = []
+                    selected_eval_non_security: List[Dict[str, Any]] = []
+                else:
+                    n_train = min(len(train_non_security), int(round(len(train_security) * ratio)))
+                    rng = _random.Random(config.shuffle_seed)
+                    selected_train_non_security = rng.sample(train_non_security, n_train) if n_train > 0 else []
+                    n_eval = min(len(eval_non_security), int(round(len(eval_security) * ratio)))
+                    selected_eval_non_security = rng.sample(eval_non_security, n_eval) if n_eval > 0 else []
 
                 security_path = output_dir / f"{name}_security_turns.jsonl"
                 non_security_path = output_dir / f"{name}_non_security_turns.jsonl"
@@ -1204,10 +1219,11 @@ def load_datasets(
                     security_path, len(train_security),
                 )
                 logger.info(
-                    "Wrote %s: %d non-security turns (all %d available)",
+                    "Wrote %s: %d non-security turns (selected from %d available, ratio=%.2f)",
                     non_security_path,
                     len(selected_train_non_security),
                     len(train_non_security),
+                    ratio,
                 )
 
                 if train_security:

@@ -62,7 +62,7 @@ loss_calc_ce_default_without_security_weight: 1.0
 # are ignored (labels stay -100). Set a tag to null to disable that tag.
 loss_calc_ce_default_with_security_weight: 1.0  # default CE weight for untagged assistant content in security turns
 loss_calc_ce_tool_call_security_tag: tool_call_security
-loss_calc_ce_tool_call_security_with_security_weight: 3.5
+loss_calc_ce_tool_call_security_with_security_weight: 1.5
 loss_calc_ce_think_tag: think
 loss_calc_ce_think_weight: -100  # think CE weight in all assistant turns; <=0 ignores
 loss_calc_ce_tool_call_with_security_tag: tool_call
@@ -74,15 +74,20 @@ preprocessing_num_workers: 16
 shuffle_seed: 42
 eval_data_ratio: 0.05
 
+# Ratio of non-security turns to security turns sampled per dataset.
+# 0.0 means only security turns are used; >0 randomly samples that fraction
+# of non-security turns relative to security turns (per dataset).
+no_security_to_security_turn_ratio: 0.0
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 stage: sft
 do_train: true
-output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260801_ce3.5_kl0.02_0.01_1.0_nosecurity_8epochs_8B
+output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260805_ce1.5_0.0nosecurity_3epochs_8B
 overwrite_output_dir: false
 seed: 42
-num_train_epochs: 8.0
+num_train_epochs: 3.0
 gradient_checkpointing: true
 per_device_train_batch_size: 1
 per_device_eval_batch_size: 1
@@ -134,8 +139,8 @@ enable_thinking: true
 # ---------------------------------------------------------------------------
 # KL anchoring against the frozen base weights (disable_adapter() is used)
 # ---------------------------------------------------------------------------
-loss_calc_kl_enabled: true  # default false: only CE loss, no KL reference-logit computation
-loss_calc_kl_alpha: 0.01
-loss_calc_kl_think_alpha: 0.02  # KL coefficient for <think> in all assistant turns when enabled
-loss_calc_kl_enable_without_security: true  # enale KL for assistant turns without tool_call_security
-loss_calc_kl_enable_with_security: true  # enable KL for assistant turns that contain tool_call_security (background + think, excluding tool_call blocks)
+loss_calc_kl_enabled: false  # default false: only CE loss, no KL reference-logit computation
+loss_calc_kl_alpha: 0.02
+loss_calc_kl_think_alpha: 0.04  # KL coefficient for <think> in all assistant turns when enabled
+loss_calc_kl_enable_without_security: false  # enable KL for assistant turns without tool_call_security (think + background, excluding tool_call blocks)
+loss_calc_kl_enable_with_security: false  # enable KL for assistant turns that contain tool_call_security: KL is applied to background (untagged assistant content) and <think> blocks; <tool_call> and <tool_call_security> blocks are excluded from KL
