@@ -78,6 +78,10 @@ class TrainingConfig:
     loss_calc_ce_default_with_security_weight: float = 1.0  # default CE weight for untagged assistant content in security turns
     loss_calc_ce_tool_call_security_tag: Optional[str] = "tool_call_security"  # weighted security-analysis tag
     loss_calc_ce_tool_call_security_with_security_weight: float = 1.0  # loss weight for tool_call_security content
+    loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight: float = 1.0  # extra CE weight added to the tag tokens themselves (e.g. <tool_name>, </tool_name>, <tool_call_security>, etc.)
+    loss_calc_ce_tool_call_security_inner_tags: List[str] = field(
+        default_factory=lambda: ["tool_name", "tool_args", "tool_reason", "tool_trace", "tool_security"]
+    )  # inner structural tags whose opening/closing tokens get the plus-weight boost
     loss_calc_ce_think_tag: Optional[str] = "think"  # weighted think block
     loss_calc_ce_think_weight: float = -100.0  # CE weight for <think> content in all assistant turns; <=0 ignores the span (labels=-100)
     loss_calc_ce_tool_call_with_security_tag: Optional[str] = "tool_call"  # weighted tool-call JSON block
@@ -359,10 +363,32 @@ def _turn_text_char_span_to_token_span(
     char_start: int,
     char_end: int,
     tokenizer: Any,
+    offsets: Optional[List[Tuple[int, int]]] = None,
 ) -> Tuple[int, int]:
-    """Convert a character span inside ``turn_text`` to a token span inside ``turn_text``."""
+    """Convert a character span inside ``turn_text`` to a token span.
+
+    When ``offsets`` (an offset_mapping from a single encode of the full turn_text)
+    is provided, the conversion uses overlap detection rather than re-encoding
+    prefixes. This avoids the pretoken-boundary misalignment that occurs when
+    Qwen's pre-tokenizer merges consecutive punctuation (e.g. >{" or }</>) into a
+    single pretoken: independently encoding a prefix may split the merged pretoken
+    differently than the full-sequence encoding does.
+    """
     if char_start < 0 or char_end <= char_start:
         return 0, 0
+    if offsets is not None:
+        tok_start = tok_end = None
+        for i, (s, e) in enumerate(offsets):
+            if e <= s:  # zero-width placeholder (special token)
+                continue
+            if s < char_end and e > char_start:  # overlaps the target char span
+                if tok_start is None:
+                    tok_start = i
+                tok_end = i + 1
+        if tok_start is None:
+            return 0, 0
+        return tok_start, tok_end
+    # Fallback when offset_mapping is unavailable (slow tokenizer).
     prefix_ids = tokenizer.encode(turn_text[:char_start], add_special_tokens=False)
     end_ids = tokenizer.encode(turn_text[:char_end], add_special_tokens=False)
     return len(prefix_ids), len(end_ids)
@@ -478,6 +504,8 @@ def _mask_labels_for_assistant_turns(
     loss_calc_ce_default_without_security_weight: float = 1.0,
     loss_calc_ce_tool_call_security_tag: Optional[str] = None,
     loss_calc_ce_tool_call_security_with_security_weight: float = 1.0,
+    loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight: float = 1.0,
+    loss_calc_ce_tool_call_security_inner_tags: Optional[List[str]] = None,
     loss_calc_ce_think_tag: Optional[str] = None,
     loss_calc_ce_think_weight: float = -100.0,
     loss_calc_ce_tool_call_with_security_tag: Optional[str] = None,
@@ -557,6 +585,20 @@ def _mask_labels_for_assistant_turns(
             rf"<{re.escape(loss_calc_ce_tool_call_with_security_tag)}>.*?</{re.escape(loss_calc_ce_tool_call_with_security_tag)}>", re.DOTALL
         )
 
+    # Pattern matching the tag tokens themselves (not content) inside tool_call_security blocks.
+    # Matches opening and closing forms: <tool_call_security>, </tool_name>, etc.
+    # The outer tag is placed first in the alternation so longer prefixes are tried before
+    # any shorter inner-tag name that might share a prefix.
+    security_inner_tags_pattern = None
+    if loss_calc_ce_tool_call_security_tag is not None and loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight > 0:
+        _inner = loss_calc_ce_tool_call_security_inner_tags or []
+        _tag_alts = [re.escape(loss_calc_ce_tool_call_security_tag)] + [
+            re.escape(t) for t in _inner
+        ]
+        security_inner_tags_pattern = re.compile(
+            r'</?(?:' + '|'.join(_tag_alts) + r')>'
+        )
+
     security_pattern = tag_patterns.get(loss_calc_ce_tool_call_security_tag)
 
     # Find each assistant turn's token span by comparing chat-template outputs for
@@ -586,6 +628,37 @@ def _mask_labels_for_assistant_turns(
         turn_has_security_list.append(turn_has_security)
         if turn_has_security:
             has_security = True
+
+    # Precompute token offset_mapping for each turn once.  Using the full turn
+    # text for a single encode avoids the pretoken-boundary misalignment that
+    # occurs when Qwen's pre-tokenizer merges e.g. >{ or }</ into one pretoken:
+    # independently encoding a prefix of the string may split that merged pretoken
+    # differently from the full-sequence encode, producing off-by-one token spans.
+    turn_offsets: List[Optional[List[Tuple[int, int]]]] = []
+    for turn_pos, turn_text in enumerate(turn_texts):
+        if not turn_text:
+            turn_offsets.append(None)
+            continue
+        tok_start_check, tok_end_check = turn_token_spans[turn_pos]
+        try:
+            enc = tokenizer(turn_text, add_special_tokens=False, return_offsets_mapping=True)
+            enc_len = len(enc["input_ids"])
+            span_len = tok_end_check - tok_start_check
+            if enc_len != span_len and tok_start_check >= 0:
+                logger.warning(
+                    "Turn %d offset re-encode length mismatch: standalone=%d vs context-span=%d; "
+                    "tag spans may be misaligned. This can happen with unusual Unicode or "
+                    "special-token combinations.",
+                    turn_pos, enc_len, span_len,
+                )
+            turn_offsets.append(list(enc["offset_mapping"]))
+        except Exception as exc:
+            logger.warning(
+                "Turn %d: offset_mapping unavailable (%s); falling back to prefix-encode method "
+                "which may misalign at pretoken boundaries (e.g. >{ or }</).",
+                turn_pos, exc,
+            )
+            turn_offsets.append(None)
 
     for turn_pos, (turn_idx, tok_start, tok_end) in enumerate(turn_spans):
         turn_text = turn_texts[turn_pos]
@@ -620,10 +693,11 @@ def _mask_labels_for_assistant_turns(
                 tag_found = False
                 for match in pattern.finditer(turn_text):
                     rel_start, rel_end = _turn_text_char_span_to_token_span(
-                        turn_text, match.start(), match.end(), tokenizer
+                        turn_text, match.start(), match.end(), tokenizer,
+                        offsets=turn_offsets[turn_pos],
                     )
-                    abs_start = tok_start + rel_start
-                    abs_end = tok_start + rel_end
+                    abs_start = min(tok_start + rel_start, tok_end, len(labels))
+                    abs_end = min(tok_start + rel_end, tok_end, len(labels))
                     if abs_start < abs_end:
                         if weight <= 0:
                             # Non-positive weight means "ignore this span": keep it out of CE loss.
@@ -654,6 +728,23 @@ def _mask_labels_for_assistant_turns(
                         "in the tokenized text; the turn is still trained with the default weight.",
                         turn_idx, tag_name,
                     )
+
+            # Apply extra weight boost to the tag tokens themselves (not their content).
+            # This raises the weight of structural tags like <tool_name>, </tool_args>, etc.
+            # so the model learns to emit them reliably. The boost adds on top of whatever
+            # block weight was already applied above.
+            if security_inner_tags_pattern is not None:
+                for match in security_inner_tags_pattern.finditer(turn_text):
+                    rel_start, rel_end = _turn_text_char_span_to_token_span(
+                        turn_text, match.start(), match.end(), tokenizer,
+                        offsets=turn_offsets[turn_pos],
+                    )
+                    abs_start = min(tok_start + rel_start, tok_end)
+                    abs_end = min(tok_start + rel_end, tok_end, len(labels))
+                    abs_start = min(abs_start, abs_end)
+                    for idx in range(abs_start, abs_end):
+                        if labels[idx] != -100:
+                            loss_weight[idx] += loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight
         else:
             labels[tok_start:tok_end] = input_ids[tok_start:tok_end]
             loss_weight[tok_start:tok_end] = [loss_calc_ce_default_without_security_weight] * (tok_end - tok_start)
@@ -674,10 +765,11 @@ def _mask_labels_for_assistant_turns(
                     continue
                 for match in pattern.finditer(turn_text):
                     rel_start, rel_end = _turn_text_char_span_to_token_span(
-                        turn_text, match.start(), match.end(), tokenizer
+                        turn_text, match.start(), match.end(), tokenizer,
+                        offsets=turn_offsets[turn_pos],
                     )
-                    abs_start = tok_start + rel_start
-                    abs_end = tok_start + rel_end
+                    abs_start = min(tok_start + rel_start, tok_end, len(labels))
+                    abs_end = min(tok_start + rel_end, tok_end, len(labels))
                     if abs_start < abs_end:
                         if weight <= 0:
                             labels[abs_start:abs_end] = [-100] * (abs_end - abs_start)
@@ -711,28 +803,41 @@ def _mask_labels_for_assistant_turns(
     ):
         turn_text = turn_texts[turn_pos]
 
+        n = len(input_ids)
         if think_pattern is not None:
             for match in think_pattern.finditer(turn_text):
                 rel_start, rel_end = _turn_text_char_span_to_token_span(
-                    turn_text, match.start(), match.end(), tokenizer
+                    turn_text, match.start(), match.end(), tokenizer,
+                    offsets=turn_offsets[turn_pos],
                 )
-                for idx in range(tok_start + rel_start, tok_start + rel_end):
+                for idx in range(
+                    min(tok_start + rel_start, tok_end, n),
+                    min(tok_start + rel_end, tok_end, n),
+                ):
                     is_think_token[idx] = True
 
         if tool_call_security_pattern is not None and turn_has_sec:
             for match in tool_call_security_pattern.finditer(turn_text):
                 rel_start, rel_end = _turn_text_char_span_to_token_span(
-                    turn_text, match.start(), match.end(), tokenizer
+                    turn_text, match.start(), match.end(), tokenizer,
+                    offsets=turn_offsets[turn_pos],
                 )
-                for idx in range(tok_start + rel_start, tok_start + rel_end):
+                for idx in range(
+                    min(tok_start + rel_start, tok_end, n),
+                    min(tok_start + rel_end, tok_end, n),
+                ):
                     is_tool_call_security_token[idx] = True
 
         if tool_call_pattern is not None:
             for match in tool_call_pattern.finditer(turn_text):
                 rel_start, rel_end = _turn_text_char_span_to_token_span(
-                    turn_text, match.start(), match.end(), tokenizer
+                    turn_text, match.start(), match.end(), tokenizer,
+                    offsets=turn_offsets[turn_pos],
                 )
-                for idx in range(tok_start + rel_start, tok_start + rel_end):
+                for idx in range(
+                    min(tok_start + rel_start, tok_end, n),
+                    min(tok_start + rel_end, tok_end, n),
+                ):
                     is_tool_call_token[idx] = True
 
         if turn_has_sec:
@@ -783,6 +888,8 @@ def build_turn_by_turn_samples(
     loss_calc_ce_default_without_security_weight: float = 1.0,
     loss_calc_ce_tool_call_security_tag: Optional[str] = None,
     loss_calc_ce_tool_call_security_with_security_weight: float = 1.0,
+    loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight: float = 1.0,
+    loss_calc_ce_tool_call_security_inner_tags: Optional[List[str]] = None,
     loss_calc_ce_think_tag: Optional[str] = None,
     loss_calc_ce_think_weight: float = -100.0,
     loss_calc_ce_tool_call_with_security_tag: Optional[str] = None,
@@ -823,6 +930,8 @@ def build_turn_by_turn_samples(
             loss_calc_ce_default_without_security_weight=loss_calc_ce_default_without_security_weight,
             loss_calc_ce_tool_call_security_tag=loss_calc_ce_tool_call_security_tag,
             loss_calc_ce_tool_call_security_with_security_weight=loss_calc_ce_tool_call_security_with_security_weight,
+            loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight=loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight,
+            loss_calc_ce_tool_call_security_inner_tags=loss_calc_ce_tool_call_security_inner_tags,
             loss_calc_ce_think_tag=loss_calc_ce_think_tag,
             loss_calc_ce_think_weight=loss_calc_ce_think_weight,
             loss_calc_ce_tool_call_with_security_tag=loss_calc_ce_tool_call_with_security_tag,
@@ -893,6 +1002,8 @@ def make_preprocess_function(
                 config.loss_calc_ce_default_without_security_weight,
                 config.loss_calc_ce_tool_call_security_tag,
                 config.loss_calc_ce_tool_call_security_with_security_weight,
+                config.loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight,
+                config.loss_calc_ce_tool_call_security_inner_tags,
                 config.loss_calc_ce_think_tag,
                 config.loss_calc_ce_think_weight,
                 config.loss_calc_ce_tool_call_with_security_tag,
@@ -1034,6 +1145,8 @@ def _generate_turn_samples_for_split(
             config.loss_calc_ce_default_without_security_weight,
             config.loss_calc_ce_tool_call_security_tag,
             config.loss_calc_ce_tool_call_security_with_security_weight,
+            config.loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight,
+            config.loss_calc_ce_tool_call_security_inner_tags,
             config.loss_calc_ce_think_tag,
             config.loss_calc_ce_think_weight,
             config.loss_calc_ce_tool_call_with_security_tag,
@@ -1084,6 +1197,8 @@ def _tokenization_fingerprint(
         "loss_calc_ce_default_without_security_weight": config.loss_calc_ce_default_without_security_weight,
         "loss_calc_ce_tool_call_security_tag": config.loss_calc_ce_tool_call_security_tag,
         "loss_calc_ce_tool_call_security_with_security_weight": config.loss_calc_ce_tool_call_security_with_security_weight,
+        "loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight": config.loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight,
+        "loss_calc_ce_tool_call_security_inner_tags": config.loss_calc_ce_tool_call_security_inner_tags,
         "loss_calc_ce_think_tag": config.loss_calc_ce_think_tag,
         "loss_calc_ce_think_weight": config.loss_calc_ce_think_weight,
         "loss_calc_ce_tool_call_with_security_tag": config.loss_calc_ce_tool_call_with_security_tag,
@@ -2129,9 +2244,11 @@ def main() -> None:
         label_pad_token_id=-100,
         padding="longest",
     )
+    _boosted_tags = ([config.loss_calc_ce_tool_call_security_tag] if config.loss_calc_ce_tool_call_security_tag else []) + list(config.loss_calc_ce_tool_call_security_inner_tags)
     logger.info(
         "CE weights: non-security uniform=%.2f; security turns: default=%.2f, "
-        "<%s>=%s, <%s>=%s, <%s>=%.2f",
+        "<%s>=%s, <%s>=%s, <%s>=%.2f; tag-token plus weight=%.2f "
+        "(boosted tags: %s and their closing forms)",
         config.loss_calc_ce_default_without_security_weight,
         config.loss_calc_ce_default_with_security_weight,
         config.loss_calc_ce_think_tag or "none",
@@ -2140,6 +2257,8 @@ def main() -> None:
         "ignored" if config.loss_calc_ce_tool_call_with_security_weight <= 0 else f"{config.loss_calc_ce_tool_call_with_security_weight:.2f}",
         config.loss_calc_ce_tool_call_security_tag or "none",
         config.loss_calc_ce_tool_call_security_with_security_weight,
+        config.loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight,
+        ", ".join(f"<{t}>" for t in _boosted_tags),
     )
     logger.info("Data collator initialized")
 
