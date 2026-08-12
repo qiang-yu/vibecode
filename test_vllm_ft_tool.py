@@ -20,7 +20,7 @@
 import json
 from openai import OpenAI
 
-VLLM_BASE_URL = "http://localhost:19001/v1"
+VLLM_BASE_URL = "http://localhost:29003/v1"
 
 # This is the LoRA module name registered in the vLLM server via
 # --lora-modules my-lora-model=/home/qiangyu/Models/FineTune/Qwen/train_20260614
@@ -976,15 +976,13 @@ def message_to_dict(message):
 def has_tool_call(message, tool_name):
     """
     Check whether the assistant message requests a call to tool_name.
+    Only inspects message.tool_calls; text content is not considered.
     """
 
     if message.tool_calls:
         for tc in message.tool_calls:
             if tc.function.name == tool_name:
                 return True
-
-    if message.content and tool_name in message.content:
-        return True
 
     return False
 

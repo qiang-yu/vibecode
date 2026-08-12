@@ -12,8 +12,8 @@ import json
 import re
 import sys
 
-INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-2-think-8b-clean.json"
-OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-2-think-8b-clean-clean.json"
+INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-3-think-8b-clean.json"
+OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-3-think-8b-clean-clean.json"
 
 PROGRESS_INTERVAL = 100
 

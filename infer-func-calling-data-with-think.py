@@ -18,14 +18,14 @@ from pathlib import Path
 SMALL_MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-8B"
 BIG_MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-32B"
 
-INPUT_FILE = "func-calling/glaive-function-calling-5k-injected.json"
-OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b.json"
-TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b.jsonl"
+INPUT_FILE = "func-calling/glaive-function-calling-5k-injected-4.json"
+OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-4-think-8b.json"
+TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-4-think-8b.jsonl"
 
 # GPU lists used for parallel processing. Each small GPU loads its own small model instance.
 # BIG_GPU_IDS lists the GPUs used for one big model instance. Set to [] to disable big model.
-SMALL_GPU_IDS = [1, 2, 3]
-BIG_GPU_IDS = [0]
+SMALL_GPU_IDS = [4, 5, 6]
+BIG_GPU_IDS = [7]
 
 
 def generate_response(messages, tools, model, tokenizer):
@@ -298,11 +298,22 @@ def writer_process(result_queue, total_count, temp_file, initial_count):
 def convert_jsonl_to_json_array(jsonl_path, output_path):
     """Read a JSON Lines file and write it as a JSON array."""
     results = []
+    skipped = 0
     with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
+        for line_num, line in enumerate(f, 1):
             line = line.strip()
             if line:
-                results.append(json.loads(line))
+                try:
+                    results.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    print(
+                        f"Warning: Skipping invalid JSON at line {line_num}: {e}",
+                        file=sys.stderr,
+                    )
+                    skipped += 1
+
+    if skipped > 0:
+        print(f"Warning: {skipped} invalid lines skipped.", file=sys.stderr)
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)

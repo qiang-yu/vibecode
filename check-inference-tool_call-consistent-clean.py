@@ -9,7 +9,7 @@ import json
 import re
 
 # Configuration: path to the inference result file
-INFERENCE_FILE_PATH = "/home/qiangyu/ClaudeCode/deal-func-calling-file/func-calling/Qwen3-8B/glaive-function-calling-5k-injected-2-think-8b.json"
+INFERENCE_FILE_PATH = "/home/qiangyu/ClaudeCode/deal-func-calling-file/func-calling/Qwen3-8B/glaive-function-calling-5k-injected-3-think-8b.json"
 
 
 def extract_tool_call_name(value: str) -> str | None:
