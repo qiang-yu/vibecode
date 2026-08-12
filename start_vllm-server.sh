@@ -4,9 +4,9 @@
 # Configurable parameters — edit these before starting the server
 # -----------------------------------------------------------------------
 
-VLLM_BASE_URL="http://localhost:19006/v1"
+VLLM_BASE_URL="http://localhost:19003/v1"
 LISTEN_HOST="localhost"
-LISTEN_PORT=29006
+LISTEN_PORT=29003
 
 BASE_MODEL_PATH="/home/qiangyu/Models/Qwen/Qwen3-8B"
 BASE_MODEL_ID="Qwen3Base"
@@ -17,11 +17,14 @@ MAX_TOKENS_SECURITY=512          # max tokens for phase-2 lora security block
 REQUEST_TIMEOUT=300              # HTTP request timeout in seconds
 LOG_LEVEL="info"                 # debug | info | warning | error
 
-# Set to "--no-enable-thinking" to disable Qwen3 thinking mode, or "" to keep it enabled.
-NO_ENABLE_THINKING=""
+ENABLE_THINKING=true              # true | false
+STRIP_SECURITY_IN_HISTORY=true    # true | false
 
-# Set to "--no-strip-security-in-history" to keep <tool_call_security> in history, or "" to strip it.
-NO_STRIP_SECURITY=""
+# Security defence: block tool calls whose lora verdict is at or below SECURITY_DEFENCE_LEVEL.
+SECURITY_DEFENCE_ENABLE=true          # true | false
+SECURITY_DEFENCE_LEVEL="suspicious"   # safe | neutral | suspicious | unsafe
+SECURITY_DEFENCE_DEBUG=true           # true: keep <tool_call_security> in response; false: strip it
+SECURITY_DEFENCE_MAX_RETRIES=3        # max base-model retries after a defence block
 
 # -----------------------------------------------------------------------
 # Launch
@@ -40,5 +43,9 @@ python "${SCRIPT_DIR}/vllm-server.py" \
     --max-tokens-security  "${MAX_TOKENS_SECURITY}" \
     --timeout              "${REQUEST_TIMEOUT}" \
     --log-level            "${LOG_LEVEL}" \
-    ${NO_ENABLE_THINKING} \
-    ${NO_STRIP_SECURITY}
+    --enable_thinking          "${ENABLE_THINKING}" \
+    --strip_security_in_history "${STRIP_SECURITY_IN_HISTORY}" \
+    --security_defence_enable       "${SECURITY_DEFENCE_ENABLE}" \
+    --security_defence_debug        "${SECURITY_DEFENCE_DEBUG}" \
+    --security-defence-level        "${SECURITY_DEFENCE_LEVEL}" \
+    --security-defence-max-retries  "${SECURITY_DEFENCE_MAX_RETRIES}"
