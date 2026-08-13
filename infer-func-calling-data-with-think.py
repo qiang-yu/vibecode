@@ -18,14 +18,14 @@ from pathlib import Path
 SMALL_MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-8B"
 BIG_MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-32B"
 
-INPUT_FILE = "func-calling/glaive-function-calling-5k-injected-4.json"
-OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-4-think-8b.json"
-TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-4-think-8b.jsonl"
+INPUT_FILE = "func-calling/glaive-function-calling-5k-injected-5-0.json"
+OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-5-0-think-8b.json"
+TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-5-0-think-8b.jsonl"
 
 # GPU lists used for parallel processing. Each small GPU loads its own small model instance.
 # BIG_GPU_IDS lists the GPUs used for one big model instance. Set to [] to disable big model.
-SMALL_GPU_IDS = [4, 5, 6]
-BIG_GPU_IDS = [7]
+SMALL_GPU_IDS = [1, 2, 3]
+BIG_GPU_IDS = [0]
 
 
 def generate_response(messages, tools, model, tokenizer):
@@ -80,7 +80,7 @@ def process_single_data(data: dict, model, tokenizer, big_generate_fn=None) -> d
         value = item["value"]
 
         if role == "system":
-            # Ignore system messages in the conversation
+            messages.append({"role": "system", "content": value})
             i += 1
 
         elif role == "human":
