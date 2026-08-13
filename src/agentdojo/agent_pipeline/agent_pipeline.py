@@ -22,7 +22,6 @@ from agentdojo.agent_pipeline.llms.cohere_llm import CohereLLM
 from agentdojo.agent_pipeline.llms.google_llm import GoogleLLM
 from agentdojo.agent_pipeline.llms.local_llm import LocalLLM
 from agentdojo.agent_pipeline.llms.openai_llm import OpenAILLM, OpenAILLMToolFilter
-from agentdojo.agent_pipeline.llms.vllm_parsed_llm import VllmParsedLLM
 from agentdojo.agent_pipeline.llms.prompting_llm import PromptingLLM
 from agentdojo.agent_pipeline.pi_detector import TransformersBasedPIDetector
 from agentdojo.agent_pipeline.tool_execution import (
@@ -122,7 +121,7 @@ def get_llm(provider: str, model: str, model_id: str | None, tool_delimiter: str
         )
         # llm = OpenAILLM(client, _get_local_model_id(port))
         # use model_id instead
-        llm = VllmParsedLLM(client, model_id)
+        llm = OpenAILLM(client, model_id)
     elif provider == "openai-compatible":
         base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
         api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
