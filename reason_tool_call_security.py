@@ -16,13 +16,13 @@ import re
 
 
 MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-32B"
-INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-5-1-think-8b-clean-clean.json"
-# OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-1234-think-8b-clean-clean-tool_call_security.json"
-# TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-1234-think-8b-clean-clean-tool_call_security.jsonl"
+INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-1234-think-8b-clean-clean.json"
+OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-1234-think-8b-clean-clean-tool_call_security.json"
+TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-1234-think-8b-clean-clean-tool_call_security.jsonl"
 
 # for testing purpose
-OUTPUT_FILE = "test_reason_tool_call_security.json"
-TEMP_FILE = "test_reason_tool_call_security.jsonl"
+# OUTPUT_FILE = "test_reason_tool_call_security.json"
+# TEMP_FILE = "test_reason_tool_call_security.jsonl"
 
 # GPU list used for parallel processing. Each GPU loads its own model instance.
 GPU_IDS = [4, 5, 6, 7]
