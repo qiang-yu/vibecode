@@ -25,7 +25,7 @@ TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-1234-thin
 # TEMP_FILE = "test_reason_tool_call_security.jsonl"
 
 # GPU list used for parallel processing. Each GPU loads its own model instance.
-GPU_IDS = [4, 5, 6, 7]
+GPU_IDS = [0, 1, 2, 3, 4, 5, 6, 7]
 
 
 def extract_tool_names(content):
