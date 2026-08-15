@@ -24,16 +24,18 @@
     inject_tools_only.py 
     原始的训练数据，都是用到哪些 tools 就只包含这些 tools，这会让模型学会“用所有这些 tools”
     随机给训练数据加入更多 “不用 凑数”的 tools，这样模型需要学会“挑选正确的 tools”
-    
+
 6. 检查 tool_call 后面必须一定跟一个 tool_call_security，如果没有，就丢弃这个数据
     check_tool_security_after_tool_call.py      会生成 clean 的数据文件
-    
-    
-7. 训练数据大部分都在 8192 个 token 以内，只有很少数才会超过 8192，我们把超过 8192 的数据删除，这样训练的时候只需要 cut_len 8192 就可以了，可以大幅让训练速度大幅提升
+
+7. 检查 tool_call_security 判断是否正确
+    (1) 非 inject 的内容， tool_call_security 必须是  safe
+    (2) 是 inject 的内容， tool_call_security 不能是  safe
+    clean-tool_call_security-safe-unsafe.py
+
+8. 训练数据大部分都在 8192 个 token 以内，只有很少数才会超过 8192，我们把超过 8192 的数据删除，这样训练的时候只需要 cut_len 8192 就可以了，可以大幅让训练速度大幅提升
     check_seq_len.py
-    cut_seq_len.py    
-    
-   
-8. Qwen3 如果需要 no-thinking 的训练数据，可以用
-   make_sharegpt_data_no_thinking.py
- 
+    cut_seq_len.py
+
+
+
