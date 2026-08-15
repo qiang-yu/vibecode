@@ -20,8 +20,8 @@ import sys
 from pathlib import Path
 
 # ==================== Configurable input/output paths ====================
-INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-1234-think-8b-clean-clean-tool_call_security.json"
-OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-1234-think-8b-clean-clean-tool_call_security-more-tools.json"
+INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-pretend-think-8b-clean-clean-tool_call_security.json"
+OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-pretend-think-8b-clean-clean-tool_call_security-more-tools.json"
 # INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b-clean-clean-tool_call_security.json"
 # OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b-clean-clean-tool_call_security-more-tools.json"
 RANDOM_SEED = 42          # Fixed seed for reproducibility; set to None for non-deterministic runs
