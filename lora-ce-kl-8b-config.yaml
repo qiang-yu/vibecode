@@ -95,10 +95,10 @@ no_security_to_security_turn_ratio: 0.0
 # ---------------------------------------------------------------------------
 stage: sft
 do_train: true
-output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260815_ce_0.0_nosecurity_2.0_tagw_4epochs_8B_nothink
+output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260816_ce_0.0_nosecurity_2.0_tagw_8epochs_8B_nothink
 overwrite_output_dir: false
 seed: 42
-num_train_epochs: 4.0
+num_train_epochs: 8.0
 gradient_checkpointing: true
 per_device_train_batch_size: 1
 per_device_eval_batch_size: 1

@@ -1248,6 +1248,11 @@ def load_datasets(
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Keep all generated training-data JSONL files in a dedicated subdirectory so
+    # they do not mix with model checkpoints, logs and plots in output_dir.
+    train_data_dir = output_dir / "train-data"
+    train_data_dir.mkdir(parents=True, exist_ok=True)
+
     raw_datasets = []
     dataset_infos = []
     for name in requested_names:
@@ -1278,8 +1283,8 @@ def load_datasets(
             train_splits.append(raw)
             eval_splits.append(None)
 
-    train_interleaved_path = output_dir / "train_interleaved_turns.jsonl"
-    eval_interleaved_path = output_dir / "eval_interleaved_turns.jsonl"
+    train_interleaved_path = train_data_dir / "train_interleaved_turns.jsonl"
+    eval_interleaved_path = train_data_dir / "eval_interleaved_turns.jsonl"
 
     # Under distributed training only the main process generates and writes the
     # JSONL preview files; the other ranks wait at the context boundary and then
@@ -1324,8 +1329,8 @@ def load_datasets(
                     n_eval = min(len(eval_non_security), int(round(len(eval_security) * ratio)))
                     selected_eval_non_security = rng.sample(eval_non_security, n_eval) if n_eval > 0 else []
 
-                security_path = output_dir / f"{name}_security_turns.jsonl"
-                non_security_path = output_dir / f"{name}_non_security_turns.jsonl"
+                security_path = train_data_dir / f"{name}_security_turns.jsonl"
+                non_security_path = train_data_dir / f"{name}_non_security_turns.jsonl"
                 _write_jsonl(security_path, train_security)
                 _write_jsonl(non_security_path, selected_train_non_security)
 
