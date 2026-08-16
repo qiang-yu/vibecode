@@ -16,9 +16,9 @@ import re
 
 
 MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-32B"
-INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-simple-think-8b-clean-clean.json"
-OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-simple-think-8b-clean-clean-tool_call_security.json"
-TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-simple-think-8b-clean-clean-tool_call_security.jsonl"
+INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean.json"
+OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security.json"
+TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security.jsonl"
 
 # for testing purpose
 # OUTPUT_FILE = "test_reason_tool_call_security.json"
