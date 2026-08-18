@@ -57,6 +57,43 @@ LISTEN_PORT               = 29006
 STRIP_SECURITY_IN_HISTORY = True
 ENABLE_THINKING           = True        # Qwen3: pass enable_thinking to apply_chat_template
 
+# ---------------------------------------------------------------------------
+# Deterministic inference
+# ---------------------------------------------------------------------------
+# When True, BOTH phases ignore whatever sampling params the client sent and
+# use a fixed greedy configuration, so repeated runs over the same input give
+# the same output. This is deliberately an override rather than a default:
+# vllm falls back to the model's generation_config.json when a field is absent,
+# and Qwen3 ships temperature=0.6 / top_p=0.95 / top_k=20 there — silently
+# turning "unset" into "sampling".
+#
+# This only removes randomness from *sampling*. vllm's continuous batching can
+# still shift floating-point reduction order between runs and flip a token.
+# For end-to-end reproducibility, also start vllm with:
+#
+#   VLLM_BATCH_INVARIANT=1 vllm serve <model> \
+#       --compilation-config '{"cudagraph_mode": "PIECEWISE"}' \
+#       --no-enable-prefix-caching \
+#       --generation-config vllm
+#
+# and keep tensor-parallel size, GPU set and attention backend fixed.
+DETERMINISTIC             = True
+DETERMINISTIC_SEED        = 42          # only matters if DETERMINISTIC is off but a seed is wanted
+
+# Sampling params forced on every phase when DETERMINISTIC is True. Every field
+# is written explicitly so nothing can fall through to generation_config.json.
+_DETERMINISTIC_PARAMS = {
+    "temperature":        0.0,          # vllm: temperature 0 == greedy / argmax
+    "top_p":              1.0,
+    "top_k":             -1,
+    "min_p":              0.0,
+    "frequency_penalty":  0.0,
+    "presence_penalty":   0.0,
+    "repetition_penalty": 1.0,
+    "n":                  1,
+    "best_of":            1,
+}
+
 # When True, log the full assistant output of every base/lora inference on a single
 # line (newlines shown as "\n"), including the prefix WE injected and let the model
 # continue from. The log clearly labels each line as Base Model or Lora Model.
@@ -480,6 +517,20 @@ _FORWARD_PARAMS = frozenset({
 })
 
 
+def _sampling_params(fwd: Dict) -> Dict:
+    """Resolve the sampling params for one /v1/completions call.
+
+    In deterministic mode the client's params are dropped entirely — a stray
+    top_p/top_k from upstream (AgentDojo, an OpenAI SDK default, ...) would
+    otherwise re-introduce randomness that is hard to spot after the fact.
+    """
+    if not DETERMINISTIC:
+        return dict(fwd)
+    params = dict(_DETERMINISTIC_PARAMS)
+    params["seed"] = DETERMINISTIC_SEED   # redundant under greedy, harmless, aids debugging
+    return params
+
+
 async def _call_completions(
     prompt: str,
     model: str,
@@ -488,7 +539,7 @@ async def _call_completions(
     fwd: Dict,
 ) -> Dict:
     payload = {
-        **fwd,
+        **_sampling_params(fwd),
         "model": model,
         "prompt": prompt,
         "stop": stop,
@@ -1012,6 +1063,7 @@ def main():
     global LLAMA3_TEMPLATE_PATH, MAX_TOKENS_SECURITY, REQUEST_TIMEOUT
     global LISTEN_HOST, LISTEN_PORT, STRIP_SECURITY_IN_HISTORY, ENABLE_THINKING
     global VLLM_INFERENCE_DEBUG
+    global DETERMINISTIC, DETERMINISTIC_SEED
     global LORA_THINK_MODE, LORA_THINK_STRING
     global TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL
     global SECURITY_DEFENCE_DEBUG, SECURITY_DEFENCE_MAX_RETRIES
@@ -1047,6 +1099,12 @@ def main():
     parser.add_argument("--vllm_inference_debug",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=f"log full assistant output of every base/lora inference (default: {str(VLLM_INFERENCE_DEBUG).lower()})")
+    parser.add_argument("--deterministic",
+                        choices=["true", "false"], default=None, metavar="true|false",
+                        help=(f"force greedy decoding on both phases and ignore client sampling "
+                              f"params (default: {str(DETERMINISTIC).lower()})"))
+    parser.add_argument("--seed",                  type=int, default=None, metavar="N",
+                        help=f"sampling seed sent to vllm (default: {DETERMINISTIC_SEED})")
     parser.add_argument("--lora-think-mode",
                         choices=["base_model_think", "config_model_think", "empty_model_think"],
                         default=None,
@@ -1090,6 +1148,10 @@ def main():
         ENABLE_THINKING = args.enable_thinking == "true"
     if args.vllm_inference_debug is not None:
         VLLM_INFERENCE_DEBUG = args.vllm_inference_debug == "true"
+    if args.deterministic is not None:
+        DETERMINISTIC = args.deterministic == "true"
+    if args.seed is not None:
+        DETERMINISTIC_SEED = args.seed
     if args.lora_think_mode:
         LORA_THINK_MODE = args.lora_think_mode
     if args.lora_think_string:
@@ -1135,6 +1197,13 @@ def main():
     log.info("  lora model       : %s  security_max_tokens=%d", LORA_MODEL_ID, MAX_TOKENS_SECURITY)
     log.info("  enable_thinking  : %s", ENABLE_THINKING)
     log.info("  inference_debug  : %s", VLLM_INFERENCE_DEBUG)
+    if DETERMINISTIC:
+        log.info("  deterministic    : ON  (greedy, client sampling params ignored, seed=%d)",
+                 DETERMINISTIC_SEED)
+        log.info("                     start vllm with VLLM_BATCH_INVARIANT=1 and "
+                 "--no-enable-prefix-caching for full reproducibility")
+    else:
+        log.info("  deterministic    : OFF (client sampling params forwarded as-is)")
     log.info("  lora_think_mode  : %s", LORA_THINK_MODE)
     log.info("  defence          : enable=%s  level=%s  debug=%s  max_retries=%d",
              TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL,

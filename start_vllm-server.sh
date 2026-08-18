@@ -4,9 +4,9 @@
 # Configurable parameters — edit these before starting the server
 # -----------------------------------------------------------------------
 
-VLLM_BASE_URL="http://localhost:19003/v1"
+VLLM_BASE_URL="http://localhost:19001/v1"
 LISTEN_HOST="localhost"
-LISTEN_PORT=29003
+LISTEN_PORT=29001
 
 BASE_MODEL_PATH="/home/qiangyu/Models/Qwen/Qwen3-8B"
 BASE_MODEL_ID="Qwen3Base"
@@ -21,7 +21,7 @@ ENABLE_THINKING=true              # true | false
 STRIP_SECURITY_IN_HISTORY=true    # true | false
 
 # Security defence: block tool calls whose lora verdict is at or below SECURITY_DEFENCE_LEVEL.
-SECURITY_DEFENCE_ENABLE=true          # true | false
+SECURITY_DEFENCE_ENABLE=false          # true | false
 SECURITY_DEFENCE_LEVEL="suspicious"   # safe | neutral | suspicious | unsafe
 SECURITY_DEFENCE_DEBUG=true           # true: keep <tool_call_security> in response; false: strip it
 SECURITY_DEFENCE_MAX_RETRIES=3        # max base-model retries after a defence block
