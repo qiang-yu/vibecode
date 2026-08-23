@@ -531,95 +531,129 @@ CANONICAL_RULES = """Rules for judging the security of a tool call:
 TRANSITION = "Now, let us do reasoning step by step."
 
 
-def attach_rules(block):
-    """Prepend the canonical rule list to the <tool_reason> body.
+FAILURE_LOG = "generation_failures.jsonl"
 
-    The model is told not to write the rules itself, precisely because a model asked to
-    reproduce a long fixed text will sometimes abbreviate it with an ellipsis. Anything the
-    model emitted before the transition sentence is discarded and replaced with the exact
-    canonical text, so every training sample carries an identical, complete rule list.
+
+def dump_failure(conv_index, tool_names, attempt, detail, generated_text):
+    """Append a rejected generation to a log so failures can actually be diagnosed.
+
+    Without this the only signal is a count, which says nothing about what the model wrote.
     """
-    m = re.search(r"(<tool_reason>)(.*?)(</tool_reason>)", block, re.S)
-    if not m:
-        return None
-    body = m.group(2)
+    try:
+        with open(FAILURE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "conv_index": conv_index,
+                "tool_names": tool_names,
+                "attempt": attempt + 1,
+                "reason": detail,
+                "generated": generated_text[:4000]
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
-    idx = body.find(TRANSITION)
-    if idx == -1:
-        return None
-    body = body[idx:].strip()
 
-    new_body = "\n" + CANONICAL_RULES + "\n\n" + body + "\n"
-    return block[:m.start(2)] + new_body + block[m.end(2):]
+def _strip_markdown(text):
+    """Remove bold/italic markers the model sometimes wraps labels in."""
+    return text.replace("**", "").replace("__", "")
 
 
-def validate_security_block(block):
-    """Reject malformed or degenerate <tool_call_security> blocks.
+def _normalise_qa_labels(text):
+    """Rewrite Q1:/**Q3**:/q: and the matching answers to the canonical 'Q: ' / 'A: '.
 
-    Returns True only if the block follows the fixed <tool_reason> template and shows
-    no sign of the repetition loops that otherwise run on until max_new_tokens.
-    Discarding a bad block is cheaper than training on it.
+    The model is inconsistent about how it numbers the questions, and the numbering carries
+    no information: the order already identifies them. Folding every variant to one form
+    keeps the training data uniform instead of throwing the sample away.
     """
-    for tag in ("tool_name", "tool_args", "tool_reason", "tool_trace", "tool_security"):
-        if block.count("<%s>" % tag) != 1 or block.count("</%s>" % tag) != 1:
-            return False
+    text = re.sub(r"(?im)^[ \t]*Q\s*\d*[ \t]*[:.\-][ \t]*", "Q: ", text)
+    text = re.sub(r"(?im)^[ \t]*A\s*\d*[ \t]*[:.\-][ \t]*", "A: ", text)
+    return text
 
-    m = re.search(r"<tool_reason>(.*?)</tool_reason>", block, re.S)
-    if not m:
-        return False
-    reason = m.group(1)
 
-    # no literal tag leaked into the reasoning text
+def normalize_security_block(block):
+    """Repair what can be repaired, reject only what is genuinely broken.
+
+    Returns (normalised_block, None) on success, or (None, reason) on failure. The rule list
+    is always replaced with the canonical text, so the model writing it, abbreviating it, or
+    omitting it entirely all lead to the same correct output.
+    """
+    tags = ("tool_name", "tool_args", "tool_reason", "tool_trace", "tool_security")
+    parts = {}
+    for tag in tags:
+        m = re.search(r"<%s>(.*?)</%s>" % (tag, tag), block, re.S)
+        if not m:
+            return None, "missing <%s>" % tag
+        parts[tag] = m.group(1)
+
+    reason = _strip_markdown(parts["tool_reason"])
+
+    # a literal tag inside the reasoning would corrupt the block structure
     if re.search(r"</?(tool_call|tool_response|tool_call_security|think)\b", reason):
-        return False
+        return None, "literal tag inside <tool_reason>"
 
-    # the model must not write the rule list itself, and must not abbreviate anything
-    if "Rules for judging the security of a tool call:" in reason:
-        return False
-    if "..." in reason or "\u2026" in reason:
-        return False
-    if reason.count(TRANSITION) != 1:
-        return False
-    if reason.count("Summary:") != 1:
-        return False
-    if reason.count("So the security of this tool call is") != 1:
-        return False
+    # drop whatever the model wrote before the transition, rules included
+    idx = reason.find(TRANSITION)
+    if idx != -1:
+        body = reason[idx + len(TRANSITION):]
+    else:
+        # no transition sentence: fall back to the first question
+        m = re.search(r"(?im)^[ \t]*Q\s*\d*[ \t]*[:.\-]", reason)
+        if not m:
+            return None, "no transition sentence and no questions"
+        body = reason[m.start():]
 
-    # Q/A structure: Q1,Q2 always; Q3-Q6 only when the source is a tool response
-    q = len(re.findall(r"^Q: ", reason, re.M))
-    a = len(re.findall(r"^A: ", reason, re.M))
-    if q != a or q not in (2, 6):
-        return False
+    body = _normalise_qa_labels(body).strip()
 
-    sec = re.search(r"<tool_security>\s*(\w+)\s*</tool_security>", block)
-    if not sec or sec.group(1) not in ("safe", "neutral", "suspicious", "unsafe"):
-        return False
-    level = sec.group(1)
-    if level == "safe" and q != 2:
-        return False
-    if level != "safe" and q != 6:
-        return False
-    if ("is %s." % level) not in reason:
-        return False
+    questions = re.findall(r"(?m)^Q: ", body)
+    answers = re.findall(r"(?m)^A: ", body)
+    if len(questions) != len(answers):
+        return None, "%d questions but %d answers" % (len(questions), len(answers))
+    if len(questions) not in (2, 6):
+        return None, "%d questions (expected 2 or 6)" % len(questions)
 
-    trace = re.search(r"<tool_trace>\s*([^<]+?)\s*</tool_trace>", block)
-    if not trace:
-        return False
-    trace = trace.group(1)
-    if not re.fullmatch(r"(user_message|tool_response)\[\d+\]", trace):
-        return False
+    level = parts["tool_security"].strip().lower().strip(".")
+    if level not in ("safe", "neutral", "suspicious", "unsafe"):
+        return None, "bad security level %r" % level
+    if level == "safe" and len(questions) != 2:
+        return None, "safe with %d questions" % len(questions)
+    if level != "safe" and len(questions) != 6:
+        return None, "%s with %d questions" % (level, len(questions))
+
+    m = re.search(r"So the security of this tool call is\s+(\w+)", body)
+    if not m:
+        return None, "no conclusion sentence"
+    if m.group(1).lower() != level:
+        return None, "conclusion %r disagrees with <tool_security> %r" % (m.group(1), level)
+
+    trace = parts["tool_trace"].strip()
+    m = re.search(r"(user_message|tool_response)\[(\d+)\]", trace)
+    if not m:
+        return None, "unparseable <tool_trace> %r" % trace
+    trace = "%s[%s]" % (m.group(1), m.group(2))
     if level == "safe" and not trace.startswith("user_message"):
-        return False
+        return None, "safe but traced to %s" % trace
     if level != "safe" and not trace.startswith("tool_response"):
-        return False
+        return None, "%s but traced to %s" % (level, trace)
 
     # degeneration guard: the same long line emitted more than once
-    body = [ln.strip() for ln in reason.splitlines() if len(ln.strip()) > 60]
-    body = [ln for ln in body if not ln[0].isdigit()]   # skip the verbatim rule list
-    if len(body) != len(set(body)):
-        return False
+    lines = [ln.strip() for ln in body.splitlines() if len(ln.strip()) > 60]
+    if len(lines) != len(set(lines)):
+        return None, "repeated line (degenerate output)"
 
-    return True
+    if "Summary:" not in body:
+        return None, "no summary"
+
+    reason_out = "\n%s\n\n%s\n\n%s\n" % (CANONICAL_RULES, TRANSITION, body)
+    rebuilt = (
+        "<tool_call_security>\n"
+        "<tool_name>%s</tool_name>\n"
+        "<tool_args>%s</tool_args>\n"
+        "<tool_reason>%s</tool_reason>\n"
+        "<tool_trace>%s</tool_trace>\n"
+        "<tool_security>%s</tool_security>\n"
+        "</tool_call_security>"
+    ) % (parts["tool_name"].strip(), parts["tool_args"].strip(),
+         reason_out, trace, level)
+    return rebuilt, None
 
 
 def process_single_sharegpt(sharegpt_data, tokenizer, model):
@@ -678,16 +712,19 @@ def process_single_sharegpt(sharegpt_data, tokenizer, model):
 
             blocks = extract_security_blocks(generated_text)
             kept = []
+            errors = []
             for b in blocks:
-                if not validate_security_block(b):
-                    continue
-                b = attach_rules(b)
-                if b is not None:
-                    kept.append(b)
+                fixed, err = normalize_security_block(b)
+                if fixed is None:
+                    errors.append(err)
+                else:
+                    kept.append(fixed)
 
             if len(kept) != len(tool_names):
+                detail = "; ".join(errors) if errors else "no block emitted at all"
                 print(f"  attempt {attempt + 1}: got {len(kept)} valid block(s) "
-                      f"for {len(tool_names)} tool call(s)")
+                      f"for {len(tool_names)} tool call(s) [{detail}]")
+                dump_failure(i, tool_names, attempt, detail, generated_text)
                 continue
 
             candidate = insert_security_blocks(content, kept)
