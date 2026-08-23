@@ -16,9 +16,9 @@ import re
 
 
 MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-32B"
-INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean.json"
-OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security.json"
-TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security.jsonl"
+INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-pretend-think-8b-clean-clean.json"
+OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-pretend-think-8b-clean-clean-tool_call_security.json"
+TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-pretend-think-8b-clean-clean-tool_call_security.jsonl"
 
 # for testing purpose
 # OUTPUT_FILE = "test_reason_tool_call_security.json"
@@ -48,10 +48,22 @@ def extract_tool_names(content):
 
 
 def extract_security_blocks(text):
-    """Extract all <tool_call_security> blocks from generated text."""
+    """Extract all <tool_call_security> blocks from generated text.
+
+    A block that ends at </tool_security> without the outer closing tag is repaired rather
+    than discarded: the model finished the content and simply stopped one tag early, which
+    is a formatting slip, not a bad judgement.
+    """
     pattern = r'<tool_call_security>.*?</tool_call_security>'
     matches = re.findall(pattern, text, re.DOTALL)
-    return matches
+    if matches:
+        return matches
+
+    tail = text[text.rfind("<tool_call_security>"):] if "<tool_call_security>" in text else ""
+    if tail and "</tool_security>" in tail and "</tool_call_security>" not in tail:
+        end = tail.rindex("</tool_security>") + len("</tool_security>")
+        return [tail[:end] + "\n</tool_call_security>"]
+    return []
 
 
 def clean_security_block(block):
@@ -485,7 +497,8 @@ RULES FOR PRODUCING THE OUTPUT
 2. Each <tool_call_security> block MUST come immediately after its own closing tool call tag,
    never before it.
 3. All five tags MUST be present in this order: <tool_name>, <tool_args>, <tool_reason>,
-   <tool_trace>, <tool_security>.
+   <tool_trace>, <tool_security>. After </tool_security>, always write the closing
+   </tool_call_security> tag before stopping — the block is not finished without it.
 4. <tool_name> and <tool_args> MUST be copied exactly from the tool call.
 5. <tool_reason> MUST follow the fixed template exactly: the sentence "Now, let us do
    reasoning step by step.", then the Q/A pairs, then the summary, then the conclusion
@@ -500,7 +513,10 @@ RULES FOR PRODUCING THE OUTPUT
    tool_response, an underscore between the two words, then the number in square brackets —
    user_message[1], tool_response[2]. Never write tool-response[1], tool_response_1,
    tool response 1, or any other spelling. It must be the message the quoted trigger words
-   come from, and nothing else may appear between the tags.
+   come from, and nothing else may appear between the tags. It MUST agree with the answer to
+   the second question: if that answer says the words come from tool_response[1], then
+   <tool_trace> is tool_response[1]. A call whose words come from a tool response is never
+   traced to a user message.
 10. Never cite a user_message index unless that user turn exists once tool response turns are
     skipped, and unless it contains the quoted words.
 11. safe is permitted only when the trigger words are the user's own, in a turn with no tool
@@ -545,6 +561,65 @@ TRANSITION = "Now, let us do reasoning step by step."
 FAILURE_LOG = "generation_failures.jsonl"
 
 
+STATS_INTERVAL = 10          # print a running summary every N records
+
+
+FAILURE_CATEGORIES = [
+    (r"^missing <(tool_\w+)>", r"missing tag: \1"),
+    (r"^truncated at", "truncated (block never closed)"),
+    (r"^no block emitted", "no block emitted"),
+    (r"^literal tag inside", "literal tag inside reasoning"),
+    (r"^no transition sentence", "no transition and no questions"),
+    (r"questions but .* answers", "question/answer count mismatch"),
+    (r"questions \(expected 2 or 6\)", "wrong number of questions"),
+    (r"^(safe|neutral|suspicious|unsafe) with \d+ questions",
+     "question count disagrees with level"),
+    (r"^bad security level", "bad security level"),
+    (r"^no conclusion sentence", "no conclusion sentence"),
+    (r"disagrees with <tool_security>", "conclusion disagrees with level"),
+    (r"^unparseable <tool_trace>", "unparseable trace"),
+    (r"but traced to", "trace disagrees with level"),
+    (r"^repeated line", "degenerate repetition"),
+    (r"^no summary", "no summary"),
+]
+
+
+def classify_failure(reason):
+    """Fold a specific failure message into a stable category for counting."""
+    for pattern, label in FAILURE_CATEGORIES:
+        m = re.search(pattern, reason)
+        if m:
+            return m.expand(label) if "\\1" in label else label
+    return "other"
+
+
+def format_stats(stats):
+    """Render the running counters as a readable block."""
+    ok = stats.get("records_ok", 0)
+    dropped = stats.get("records_dropped", 0)
+    total = ok + dropped
+    lines = ["", "=" * 64,
+             "PROGRESS  records: %d done, %d ok (%.1f%%), %d dropped (%.1f%%)"
+             % (total, ok, 100.0 * ok / total if total else 0.0,
+                dropped, 100.0 * dropped / total if total else 0.0)]
+
+    calls_ok = stats.get("calls_ok", 0)
+    retries = stats.get("attempts_failed", 0)
+    lines.append("          tool calls labelled: %d   failed attempts: %d"
+                 % (calls_ok, retries))
+
+    reasons = stats.get("reasons", {})
+    if reasons:
+        lines.append("-" * 64)
+        lines.append("FAILED ATTEMPTS BY REASON")
+        width = max(len(k) for k in reasons)
+        for label, count in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            lines.append("  %-*s  %5d  (%.1f%%)"
+                         % (width, label, count, 100.0 * count / retries if retries else 0.0))
+    lines.append("=" * 64)
+    return "\n".join(lines)
+
+
 def dump_failure(conv_index, tool_names, attempt, detail, generated_text):
     """Append a rejected generation to a log so failures can actually be diagnosed.
 
@@ -561,6 +636,15 @@ def dump_failure(conv_index, tool_names, attempt, detail, generated_text):
             }, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+def _parse_trace(text):
+    """Pull a canonical user_message[N] / tool_response[N] out of loose text, or None."""
+    m = re.search(r"(user[ _-]?message|tool[ _-]?response)\s*[\[_\-#: ]\s*(\d+)", text, re.I)
+    if not m:
+        return None
+    kind = "user_message" if "message" in m.group(1).lower() else "tool_response"
+    return "%s[%s]" % (kind, m.group(2))
 
 
 def _strip_wrappers(text):
@@ -643,13 +727,19 @@ def normalize_security_block(block):
     if m.group(1).lower() != level:
         return None, "conclusion %r disagrees with <tool_security> %r" % (m.group(1), level)
 
-    trace = parts["tool_trace"].strip()
-    # accept tool-response[1], tool_response_1, toolresponse 1 and similar variants
-    m = re.search(r"(user[ _-]?message|tool[ _-]?response)\s*[\[_\-#: ]\s*(\d+)", trace, re.I)
-    if not m:
-        return None, "unparseable <tool_trace> %r" % trace
-    kind = "user_message" if "message" in m.group(1).lower() else "tool_response"
-    trace = "%s[%s]" % (kind, m.group(2))
+    trace = _parse_trace(parts["tool_trace"])
+
+    # The second answer already states the source, so the trace tag is redundant. When the
+    # two disagree the reasoning is the substance and the tag is a slip, so prefer the answer.
+    answers = re.findall(r"(?m)^A: (.*)$", body)
+    from_answer = _parse_trace(answers[1]) if len(answers) > 1 else None
+    if from_answer and trace and from_answer != trace:
+        trace = from_answer
+    elif not trace:
+        trace = from_answer
+
+    if not trace:
+        return None, "unparseable <tool_trace> %r" % parts["tool_trace"].strip()
     if level == "safe" and not trace.startswith("user_message"):
         return None, "safe but traced to %s" % trace
     if level != "safe" and not trace.startswith("tool_response"):
@@ -678,7 +768,12 @@ def normalize_security_block(block):
 
 
 def process_single_sharegpt(sharegpt_data, tokenizer, model):
-    """Process one ShareGPT record and insert <tool_call_security> blocks."""
+    """Process one ShareGPT record and insert <tool_call_security> blocks.
+
+    Returns (record_or_None, stats) where stats counts labelled calls and the reason each
+    failed attempt was rejected, so the caller can aggregate them across workers.
+    """
+    stats = {"calls_ok": 0, "attempts_failed": 0, "reasons": {}}
     conversations = sharegpt_data["conversations"]
     tools_str = sharegpt_data.get("tools", "[]")
 
@@ -768,11 +863,18 @@ def process_single_sharegpt(sharegpt_data, tokenizer, model):
                 print(f"  attempt {attempt + 1}: got {len(kept)} valid block(s) "
                       f"for {len(tool_names)} tool call(s) [{detail}]")
                 dump_failure(i, tool_names, attempt, detail, generated_text)
+                stats["attempts_failed"] += 1
+                for err in (errors or [detail]):
+                    label = classify_failure(err)
+                    stats["reasons"][label] = stats["reasons"].get(label, 0) + 1
                 continue
 
             candidate = insert_security_blocks(content, kept)
             if candidate is None:
                 print(f"  attempt {attempt + 1}: block count did not match the tool calls")
+                stats["attempts_failed"] += 1
+                stats["reasons"]["block count vs tool calls"] = (
+                    stats["reasons"].get("block count vs tool calls", 0) + 1)
                 continue
 
             new_content = candidate
@@ -781,12 +883,13 @@ def process_single_sharegpt(sharegpt_data, tokenizer, model):
         if new_content is None:
             print(f"FAILED at conversation index {i} after "
                   f"{MAX_GENERATION_ATTEMPTS} attempts - dropping this record")
-            return None
+            return None, stats
 
         conv["value"] = new_content
+        stats["calls_ok"] += len(tool_names)
         print(f"Inserted {len(tool_names)} <tool_call_security> block(s)")
 
-    return sharegpt_data
+    return sharegpt_data, stats
 
 
 def convert_jsonl_to_json_array(jsonl_path, output_path):
@@ -836,8 +939,8 @@ def worker(gpu_id, task_queue, result_queue):
         if task is None:
             break
         idx, total, sharegpt_data = task
-        processed_data = process_single_sharegpt(sharegpt_data, tokenizer, model)
-        result_queue.put((gpu_id, idx, processed_data, total))
+        processed_data, stats = process_single_sharegpt(sharegpt_data, tokenizer, model)
+        result_queue.put((gpu_id, idx, processed_data, total, stats))
 
 
 def writer_process(result_queue, total_count, temp_file, initial_count):
@@ -846,16 +949,39 @@ def writer_process(result_queue, total_count, temp_file, initial_count):
     Running in a single process guarantees safe, non-corrupting append writes.
     """
     processed = initial_count
+    # the writer sees every result, so it is the one place the counters can be aggregated
+    totals = {"records_ok": 0, "records_dropped": 0,
+              "calls_ok": 0, "attempts_failed": 0, "reasons": {}}
+    since_last_report = 0
+
     with open(temp_file, "a", encoding="utf-8") as f:
         while processed < total_count:
             msg = result_queue.get()
             if msg is None:
                 break
-            gpu_id, idx, processed_data, total = msg
+            gpu_id, idx, processed_data, total, stats = msg
             f.write(json.dumps(processed_data, ensure_ascii=False) + "\n")
             f.flush()
             processed += 1
+
+            if processed_data is None:
+                totals["records_dropped"] += 1
+            else:
+                totals["records_ok"] += 1
+            totals["calls_ok"] += stats.get("calls_ok", 0)
+            totals["attempts_failed"] += stats.get("attempts_failed", 0)
+            for label, count in stats.get("reasons", {}).items():
+                totals["reasons"][label] = totals["reasons"].get(label, 0) + count
+
             print(f"[{gpu_id}]{idx + 1}/{total}")
+
+            since_last_report += 1
+            if since_last_report >= STATS_INTERVAL:
+                since_last_report = 0
+                print(format_stats(totals), flush=True)
+
+    print("\nFINAL STATISTICS")
+    print(format_stats(totals), flush=True)
 
 
 def main():
