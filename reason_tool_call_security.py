@@ -16,9 +16,20 @@ import re
 
 
 MODEL_PATH = "/home/qiangyu/Models/Qwen/Qwen3-32B"
-INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-pretend-think-8b-clean-clean.json"
-OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-pretend-think-8b-clean-clean-tool_call_security.json"
-TEMP_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-pretend-think-8b-clean-clean-tool_call_security.jsonl"
+# Input files are processed one after another. The output and temp paths for each are
+# derived from its name: <base>.json -> <base>-tool_call_security.json / .jsonl
+INPUT_FILES = [
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-pretend-think-8b-clean-clean.json",
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-simple-think-8b-clean-clean.json",
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean.json",
+]
+OUTPUT_SUFFIX = "-tool_call_security"
+
+
+def derive_paths(input_path):
+    """Return (output_json, temp_jsonl) for an input file."""
+    base = input_path[:-len(".json")] if input_path.endswith(".json") else input_path
+    return base + OUTPUT_SUFFIX + ".json", base + OUTPUT_SUFFIX + ".jsonl"
 
 # for testing purpose
 # OUTPUT_FILE = "test_reason_tool_call_security.json"
@@ -581,6 +592,7 @@ FAILURE_CATEGORIES = [
     (r"but traced to", "trace disagrees with level"),
     (r"^repeated line", "degenerate repetition"),
     (r"^no summary", "no summary"),
+    (r"^merged words", "merged words (corrupted text)"),
 ]
 
 
@@ -753,6 +765,11 @@ def normalize_security_block(block):
     if "Summary:" not in body:
         return None, "no summary"
 
+    # words fused together (e.g. "wordscome") show up as improbably long letter runs
+    m = re.search(r"[A-Za-z]{25,}", body)
+    if m:
+        return None, "merged words %r" % m.group(0)[:40]
+
     reason_out = "\n%s\n\n%s\n\n%s\n" % (CANONICAL_RULES, TRANSITION, body)
     rebuilt = (
         "<tool_call_security>\n"
@@ -822,11 +839,12 @@ def process_single_sharegpt(sharegpt_data, tokenizer, model):
         new_content = None
         for attempt in range(MAX_GENERATION_ATTEMPTS):
             inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
-            gen_kwargs = dict(
-                max_new_tokens=2048,
-                repetition_penalty=1.05,
-                no_repeat_ngram_size=40
-            )
+            # No n-gram blocking and no repetition penalty here: the template is meant to be
+            # highly repetitive (fixed questions, fixed phrasing), so penalising repetition
+            # forces the model off the wording mid-sentence and silently corrupts the text —
+            # e.g. dropping the space in "These words come". Loops are handled instead by the
+            # fixed template, the degeneracy check in the validator, and retrying.
+            gen_kwargs = dict(max_new_tokens=2048)
             if attempt == 0:
                 gen_kwargs["do_sample"] = False
                 gen_kwargs["temperature"] = None
@@ -984,65 +1002,94 @@ def writer_process(result_queue, total_count, temp_file, initial_count):
     print(format_stats(totals), flush=True)
 
 
-def main():
-    print(f"Reading input file: {INPUT_FILE}")
-    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+def process_file(input_path, task_queue, result_queue):
+    """Run one input file through the already-running worker pool.
+
+    The workers are started once and reused across files, since loading the model on every
+    GPU again for each file would cost far more than the run itself.
+    """
+    output_file, temp_file = derive_paths(input_path)
+
+    print("\n" + "#" * 64)
+    print(f"# INPUT : {input_path}")
+    print(f"# OUTPUT: {output_file}")
+    print("#" * 64)
+
+    if not os.path.exists(input_path):
+        print(f"Input file not found, skipping: {input_path}")
+        return False
+
+    with open(input_path, "r", encoding="utf-8") as f:
         data_list = json.load(f)
     total = len(data_list)
     print(f"Total ShareGPT records: {total}")
 
     # Check progress from temp file for resume support
     processed_count = 0
-    if os.path.exists(TEMP_FILE):
-        with open(TEMP_FILE, "r", encoding="utf-8") as f:
+    if os.path.exists(temp_file):
+        with open(temp_file, "r", encoding="utf-8") as f:
             for _ in f:
                 processed_count += 1
         print(f"Found temp file, already processed: {processed_count}")
 
     if processed_count >= total:
         print("All records already processed, converting to final output...")
-        convert_jsonl_to_json_array(TEMP_FILE, OUTPUT_FILE)
-        print(f"Done. Output written to: {OUTPUT_FILE}")
-        return
+        convert_jsonl_to_json_array(temp_file, output_file)
+        print(f"Done. Output written to: {output_file}")
+        return True
+
+    # One writer per file, so each file's counters and progress stay separate
+    writer_p = mp.Process(
+        target=writer_process,
+        args=(result_queue, total, temp_file, processed_count)
+    )
+    writer_p.start()
+
+    for idx in range(processed_count, total):
+        task_queue.put((idx, total, data_list[idx]))
+
+    # the writer exits once it has seen every record for this file
+    writer_p.join()
+
+    print(f"\nConverting temp file to final JSON array: {output_file}")
+    convert_jsonl_to_json_array(temp_file, output_file)
+    print(f"Done. Total processed: {total}")
+    return True
+
+
+def main():
+    print(f"Input files queued: {len(INPUT_FILES)}")
+    for path in INPUT_FILES:
+        print(f"  - {path}")
 
     # Limit queue size to avoid excessive memory usage with large inputs
     task_queue = mp.Queue(maxsize=len(GPU_IDS) * 2)
     result_queue = mp.Queue()
 
-    # Start one worker process per GPU
+    # Start one worker process per GPU, shared by every input file
     workers = []
     for gpu_id in GPU_IDS:
         p = mp.Process(target=worker, args=(gpu_id, task_queue, result_queue))
         p.start()
         workers.append(p)
 
-    # Start a single writer process to serialize results to disk safely
-    writer_p = mp.Process(
-        target=writer_process,
-        args=(result_queue, total, TEMP_FILE, processed_count)
-    )
-    writer_p.start()
+    done = []
+    try:
+        for path in INPUT_FILES:
+            if process_file(path, task_queue, result_queue):
+                done.append(derive_paths(path)[0])
+    finally:
+        # Signal workers to exit after they finish their current tasks
+        for _ in GPU_IDS:
+            task_queue.put(None)
+        for p in workers:
+            p.join()
 
-    # Dispatch remaining tasks to workers
-    for idx in range(processed_count, total):
-        task_queue.put((idx, total, data_list[idx]))
-
-    # Signal workers to exit after they finish current tasks
-    for _ in GPU_IDS:
-        task_queue.put(None)
-
-    # Wait for all workers to finish
-    for p in workers:
-        p.join()
-
-    # Signal writer to exit and wait for it
-    result_queue.put(None)
-    writer_p.join()
-
-    # Convert temp file to final JSON array
-    print(f"\nConverting temp file to final JSON array: {OUTPUT_FILE}")
-    convert_jsonl_to_json_array(TEMP_FILE, OUTPUT_FILE)
-    print(f"Done. Total processed: {total}")
+    print("\n" + "#" * 64)
+    print("# ALL INPUT FILES COMPLETE")
+    for path in done:
+        print(f"#   {path}")
+    print("#" * 64)
 
 
 if __name__ == "__main__":
