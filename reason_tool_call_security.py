@@ -173,14 +173,18 @@ REQUIRED OUTPUT FORMAT
 ════════════════════════════════
 
 <tool_call_security>
-<tool_name>{{exact tool name}}</tool_name>
-<tool_args>{{exact arguments, copied from the corresponding tool call}}</tool_args>
+<tool_name>the exact tool name</tool_name>
+<tool_args>the exact arguments, copied from the corresponding tool call</tool_args>
 <tool_reason>
-{{THE FIXED TEMPLATE BELOW — reproduce its structure exactly}}
+the fixed template described below
 </tool_reason>
-<tool_trace>{{user_message[N] or tool_response[N]}}</tool_trace>
-<tool_security>{{safe | neutral | suspicious | unsafe}}</tool_security>
+<tool_trace>user_message[N] or tool_response[N]</tool_trace>
+<tool_security>safe or neutral or suspicious or unsafe</tool_security>
 </tool_call_security>
+
+Each line above shows what goes between the tags in plain words. Write the real value there,
+with no braces, brackets, quotation marks, or leftover punctuation around it. For example the
+last line is written as <tool_security>safe</tool_security> — a single bare word.
 
 <tool_reason> MUST follow this fixed template, in this exact order:
 
@@ -552,6 +556,11 @@ def dump_failure(conv_index, tool_names, attempt, detail, generated_text):
         pass
 
 
+def _strip_wrappers(text):
+    """Strip whitespace and stray punctuation the model copies from the format template."""
+    return text.strip().strip("{}[]()<>\"'` \t\r\n.,;:|")
+
+
 def _strip_markdown(text):
     """Remove bold/italic markers the model sometimes wraps labels in."""
     return text.replace("**", "").replace("__", "")
@@ -610,9 +619,12 @@ def normalize_security_block(block):
     if len(questions) not in (2, 6):
         return None, "%d questions (expected 2 or 6)" % len(questions)
 
-    level = parts["tool_security"].strip().lower().strip(".")
-    if level not in ("safe", "neutral", "suspicious", "unsafe"):
-        return None, "bad security level %r" % level
+    # the model sometimes drags placeholder punctuation into the value
+    level = _strip_wrappers(parts["tool_security"]).lower()
+    m = re.search(r"\b(safe|neutral|suspicious|unsafe)\b", level)
+    if not m:
+        return None, "bad security level %r" % parts["tool_security"].strip()
+    level = m.group(1)
     if level == "safe" and len(questions) != 2:
         return None, "safe with %d questions" % len(questions)
     if level != "safe" and len(questions) != 6:
@@ -651,7 +663,7 @@ def normalize_security_block(block):
         "<tool_trace>%s</tool_trace>\n"
         "<tool_security>%s</tool_security>\n"
         "</tool_call_security>"
-    ) % (parts["tool_name"].strip(), parts["tool_args"].strip(),
+    ) % (_strip_wrappers(parts["tool_name"]), parts["tool_args"].strip(),
          reason_out, trace, level)
     return rebuilt, None
 
@@ -700,6 +712,9 @@ def process_single_sharegpt(sharegpt_data, tokenizer, model):
             )
             if attempt == 0:
                 gen_kwargs["do_sample"] = False
+                gen_kwargs["temperature"] = None
+                gen_kwargs["top_p"] = None
+                gen_kwargs["top_k"] = None
             else:
                 # greedy decoding is deterministic, so a retry must vary to differ at all
                 gen_kwargs["do_sample"] = True
