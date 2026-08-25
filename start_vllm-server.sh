@@ -13,8 +13,8 @@ BASE_MODEL_ID="Qwen3Base"
 LORA_MODEL_ID="lora-model"
 MODEL_TYPE="Qwen3"               # Qwen3 | Llama3
 
-MAX_TOKENS_SECURITY=512          # max tokens for phase-2 lora security block
-REQUEST_TIMEOUT=300              # HTTP request timeout in seconds
+MAX_TOKENS_SECURITY=4096          # max tokens for phase-2 lora security block
+REQUEST_TIMEOUT=600              # HTTP request timeout in seconds
 LOG_LEVEL="info"                 # debug | info | warning | error
 
 ENABLE_THINKING=true              # true | false

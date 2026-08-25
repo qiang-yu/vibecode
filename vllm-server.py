@@ -496,7 +496,32 @@ def _render_prompt(messages: List[Dict], tools: Optional[List[Dict]]) -> str:
 # ---------------------------------------------------------------------------
 
 def _parse_qwen3(text: str) -> Tuple[List[Dict], Optional[str]]:
-    matches = list(_TOOL_CALL_RE.finditer(text))
+    # Collect spans of every COMPLETE <think>...</think> block. Tool calls that
+    # fall inside these spans are the model's internal reasoning (the model often
+    # writes example <tool_call> blocks while thinking) and must NOT be treated
+    # as real calls. Incomplete think blocks (no closing </think>) are not
+    # covered here intentionally: when phase-1 stops at </tool_call> inside an
+    # unclosed think, that single call is the one we want to assess.
+    think_spans = [(m.start(), m.end()) for m in _THINK_RE.finditer(text)]
+
+    def _inside_think(m: re.Match) -> bool:
+        return any(ts <= m.start() and m.end() <= te for ts, te in think_spans)
+
+    all_matches = list(_TOOL_CALL_RE.finditer(text))
+    spurious = [m for m in all_matches if _inside_think(m)]
+    matches   = [m for m in all_matches if not _inside_think(m)]
+
+    if spurious:
+        try:
+            names = [json.loads(m.group(1).strip()).get("name", "?") for m in spurious]
+        except Exception:
+            names = [m.group(1)[:40] for m in spurious]
+        log.error(
+            "[parse] ERROR: base model generated %d <tool_call> block(s) inside "
+            "<think>; ignoring them. names=%s",
+            len(spurious), names,
+        )
+
     if not matches:
         return [], text.strip() or None
 
@@ -885,9 +910,62 @@ async def _handle_request(
                 raw_assistant.replace("\n", "\\n"),
             )
 
+        # ── Case 1: max_tokens truncation — abort immediately ────────────────
+        if p1_finish_reason == "length":
+            log.error(
+                "[phase1] ERROR: base model hit max_tokens (finish_reason=length); "
+                "prompt_tokens~=%d max_tokens=%d — aborting, not calling lora",
+                prompt_token_count, p1_max,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Base model generation was truncated at max_tokens "
+                    f"(prompt_tokens≈{prompt_token_count}, max_tokens={p1_max}). "
+                    "The context window is too full. Reduce message history or tool definitions."
+                ),
+            )
+
+        # ── Cases 2 & 3: repair unclosed <think> then check for tool calls ───
+        # Case 2: unclosed </think> — close it so _parse_qwen3 can filter
+        # spurious <tool_call> blocks the model wrote while planning.
+        _open_idx  = raw_assistant.rfind("<think>")
+        _close_idx = raw_assistant.rfind("</think>")
+        if _open_idx != -1 and _open_idx > _close_idx:
+            log.error(
+                "[phase1] ERROR: base model output has an unclosed <think> block "
+                "(finish_reason=%s); appending </think> to restore valid structure",
+                p1_finish_reason,
+            )
+            raw_assistant = raw_assistant.rstrip() + "\n</think>"
+
+        # When stop_reason==</tool_call> that tag was consumed by vllm and is absent
+        # from text1; append it to reconstruct the complete <tool_call>…</tool_call>.
+        _full_for_parse = raw_assistant + (TOOL_CALL_END if _is_tool_call_stop(c1) else "")
+        tool_calls, content = _parse_output(_full_for_parse)
+
+        if not tool_calls:
+            log.info(
+                "[phase1] no real tool calls (finish_reason=%s, stop_reason=%r) — "
+                "skipping lora",
+                p1_finish_reason, c1.get("stop_reason"),
+            )
+            return _build_response(
+                cid, [], content,
+                acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
+            )
+
         if not _is_tool_call_stop(c1):
-            log.info("[phase1] normal stop  finish_reason=%s", p1_finish_reason)
-            tool_calls, content = _parse_output(raw_assistant)
+            # Tool calls present but stop_reason is not </tool_call>.
+            # This should not happen in normal operation: tool calls outside <think>
+            # always trigger the </tool_call> stop string, and tool calls inside <think>
+            # are filtered by _parse_qwen3 so tool_calls would be empty above.
+            # Most likely cause: </tool_call> is missing from the stop-strings config.
+            log.warning(
+                "[phase1] UNEXPECTED: tool calls found but stop_reason=%r (not </tool_call>); "
+                "finish_reason=%s — returning without lora (check stop-strings config)",
+                c1.get("stop_reason"), p1_finish_reason,
+            )
             return _build_response(
                 cid, tool_calls, content,
                 acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
@@ -979,6 +1057,23 @@ async def _handle_request(
         full_security_block = (
             TOOL_CALL_SECURITY_START + security_prefill + text2 + TOOL_CALL_SECURITY_END
         )
+
+        # Lora may write <tool_call>...</tool_call> blocks inside its security reasoning
+        # (e.g. when citing historical calls). These must be removed before full_text is
+        # assembled, because _parse_output(full_text) uses _TOOL_CALL_RE which matches
+        # ANY <tool_call> in the string — including ones inside the security block —
+        # and would return them as spurious extra tool calls in the response.
+        _spurious_tc = _TOOL_CALL_RE.findall(full_security_block)
+        if _spurious_tc:
+            log.error(
+                "[phase2] ERROR: lora generated %d spurious <tool_call> block(s) inside "
+                "<tool_call_security>; stripping them. names=%s",
+                len(_spurious_tc),
+                [json.loads(s.strip()).get("name", "?") if s.strip().startswith("{") else s[:60]
+                 for s in _spurious_tc],
+            )
+            full_security_block = _TOOL_CALL_RE.sub("", full_security_block)
+
         full_text = raw_assistant + TOOL_CALL_END + full_security_block
         log.info("[phase2] done  finish_reason=%s", p2_finish_reason)
 
