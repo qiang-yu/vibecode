@@ -203,10 +203,11 @@ def _build_security_prefill(assistant_text: str) -> str:
     ) % (call["name"], call["arguments"], SECURITY_RULES_TEXT, SECURITY_TRANSITION)
 
 # Security defence: inspect lora's <tool_security> verdict and block unsafe tool calls.
-# Defence levels from high to low: safe > neutral > suspicious > unsafe
-# A tool call whose safe_value <= TOOL_CALL_SECURITY_DEFENCE_LEVEL is blocked.
+# Defence levels from high to low: safe(3) > neutral(2) > suspicious(1) > unsafe(0)
+# A tool call passes through when safe_value >= TOOL_CALL_SECURITY_DEFENCE_LEVEL; blocked otherwise.
+# Example with default "neutral": safe and neutral pass, suspicious and unsafe are blocked.
 TOOL_CALL_SECURITY_DEFENCE_ENABLE = True
-TOOL_CALL_SECURITY_DEFENCE_LEVEL  = "suspicious"   # safe | neutral | suspicious | unsafe
+TOOL_CALL_SECURITY_DEFENCE_LEVEL  = "neutral"      # safe | neutral | suspicious | unsafe
 SECURITY_DEFENCE_DEBUG            = True            # True: keep <tool_call_security> in response; False: strip it
 SECURITY_DEFENCE_MAX_RETRIES      = 3               # max times to re-run base model after a defence block
 
@@ -790,7 +791,7 @@ def _check_defence_verdict(
         )
         return None
 
-    if _SAFETY_LEVELS[safe_value] > _SAFETY_LEVELS[TOOL_CALL_SECURITY_DEFENCE_LEVEL]:
+    if _SAFETY_LEVELS[safe_value] >= _SAFETY_LEVELS[TOOL_CALL_SECURITY_DEFENCE_LEVEL]:
         return None
 
     tool_name_match  = _TOOL_NAME_IN_SEC_RE.search(full_security_block)
@@ -1313,7 +1314,7 @@ def main():
     parser.add_argument("--security-defence-level",
                         choices=["safe", "neutral", "suspicious", "unsafe"],
                         default=None, metavar="LEVEL",
-                        help=f"block tool calls at or below this safety level (default: {TOOL_CALL_SECURITY_DEFENCE_LEVEL})")
+                        help=f"block tool calls below this safety level; calls at or above this level pass through (default: {TOOL_CALL_SECURITY_DEFENCE_LEVEL})")
     parser.add_argument("--security-defence-max-retries",
                         type=int, default=None, metavar="N",
                         help=f"max base-model retries after a defence block with no remaining tool calls (default: {SECURITY_DEFENCE_MAX_RETRIES})")

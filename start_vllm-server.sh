@@ -20,9 +20,10 @@ LOG_LEVEL="info"                 # debug | info | warning | error
 ENABLE_THINKING=true              # true | false
 STRIP_SECURITY_IN_HISTORY=true    # true | false
 
-# Security defence: block tool calls whose lora verdict is at or below SECURITY_DEFENCE_LEVEL.
+# Security defence: block tool calls whose lora verdict is below SECURITY_DEFENCE_LEVEL.
+# Calls at or above the level pass through. Example: "neutral" allows safe+neutral, blocks suspicious+unsafe.
 SECURITY_DEFENCE_ENABLE=false          # true | false
-SECURITY_DEFENCE_LEVEL="suspicious"   # safe | neutral | suspicious | unsafe
+SECURITY_DEFENCE_LEVEL="neutral"       # safe | neutral | suspicious | unsafe
 SECURITY_DEFENCE_DEBUG=true           # true: keep <tool_call_security> in response; false: strip it
 SECURITY_DEFENCE_MAX_RETRIES=3        # max base-model retries after a defence block
 
