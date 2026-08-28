@@ -22,9 +22,8 @@ import re
 from collections import Counter
 
 INPUT_FILES = [
-    "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security-more-tools-clean-clean.json",
-    "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-simple-think-8b-clean-clean-tool_call_security-more-tools-clean-clean.json",
-    "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-pretend-think-8b-clean-clean-tool_call_security-more-tools-clean-clean.json",
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-direct-think-8b-clean-clean-tool_call_security-more-tools-clean-clean.json",
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-direct-template-think-8b-clean-clean-tool_call_security-more-tools-clean-clean.json",
 ]
 
 # A quote shorter than this carries no evidence (e.g. "the words") and is not checked.
