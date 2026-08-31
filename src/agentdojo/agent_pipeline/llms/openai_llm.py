@@ -140,12 +140,13 @@ def _function_to_openai(f: Function) -> ChatCompletionToolParam:
     return ChatCompletionToolParam(type="function", function=function_definition)
 
 
-@retry(
-    wait=wait_random_exponential(multiplier=1, max=40),
-    stop=stop_after_attempt(3),
-    reraise=True,
-    retry=retry_if_not_exception_type((openai.BadRequestError, openai.UnprocessableEntityError)),
-)
+# disable retry
+# @retry(
+#     wait=wait_random_exponential(multiplier=1, max=40),
+#     stop=stop_after_attempt(3),
+#     reraise=True,
+#     retry=retry_if_not_exception_type((openai.BadRequestError, openai.UnprocessableEntityError)),
+# )
 def chat_completion_request(
     client: openai.OpenAI,
     model: str,

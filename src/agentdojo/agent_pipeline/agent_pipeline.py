@@ -118,6 +118,7 @@ def get_llm(provider: str, model: str, model_id: str | None, tool_delimiter: str
         client = openai.OpenAI(
             api_key="EMPTY",
             base_url=f"http://localhost:{port}/v1",
+            max_retries=0   # disable retry
         )
         # llm = OpenAILLM(client, _get_local_model_id(port))
         # use model_id instead
