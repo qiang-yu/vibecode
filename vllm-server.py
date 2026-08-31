@@ -911,20 +911,22 @@ async def _handle_request(
                 raw_assistant.replace("\n", "\\n"),
             )
 
-        # ── Case 1: max_tokens truncation — abort immediately ────────────────
+        # ── Case 1: max_tokens truncation — return truncated output as-is ────
         if p1_finish_reason == "length":
             log.error(
                 "[phase1] ERROR: base model hit max_tokens (finish_reason=length); "
-                "prompt_tokens~=%d max_tokens=%d — aborting, not calling lora",
+                "prompt_tokens~=%d max_tokens=%d — returning truncated output, not calling lora",
                 prompt_token_count, p1_max,
             )
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    f"Base model generation was truncated at max_tokens "
-                    f"(prompt_tokens≈{prompt_token_count}, max_tokens={p1_max}). "
-                    "The context window is too full. Reduce message history or tool definitions."
-                ),
+            _open_idx  = raw_assistant.rfind("<think>")
+            _close_idx = raw_assistant.rfind("</think>")
+            if _open_idx != -1 and _open_idx > _close_idx:
+                log.error("[phase1] unclosed <think> detected in truncated output, appending </think>")
+                raw_assistant = raw_assistant.rstrip() + "\n</think>"
+            tool_calls, content = _parse_output(raw_assistant)
+            return _build_response(
+                cid, tool_calls, content,
+                acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
             )
 
         # ── Cases 2 & 3: repair unclosed <think> then check for tool calls ───
@@ -1187,7 +1189,11 @@ async def _handle_request(
         )
 
     # Unreachable — every code path inside the loop returns or continues.
-    raise HTTPException(status_code=500, detail="unexpected exit from defence retry loop")
+    log.error("[defence] unexpected exit from defence retry loop — this should never happen")
+    return _build_response(
+        cid, [], DEFENCE_FALLBACK_CONTENT,
+        acc_prompt_tokens, acc_completion_tokens, "stop",
+    )
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -1218,9 +1224,10 @@ async def chat_completions(request: Request):
         raise
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
-    except Exception:
+    except Exception as e:
         log.exception("unhandled error in /v1/chat/completions")
-        raise HTTPException(status_code=500, detail="internal server error")
+        result = _build_response(cid, [], str(e), 0, 0, "stop")
+        return JSONResponse(result)
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
