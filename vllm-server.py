@@ -77,7 +77,12 @@ ENABLE_THINKING           = True        # Qwen3: pass enable_thinking to apply_c
 #       --generation-config vllm
 #
 # and keep tensor-parallel size, GPU set and attention backend fixed.
-DETERMINISTIC             = True
+#
+# Default OFF: forcing greedy decoding (temperature=0) drives Qwen3 into endless
+# repetition inside <think> until it hits max_tokens, which Qwen3 explicitly warns
+# against. Leaving it off lets the client's sampling params (or vllm's own defaults)
+# pass through, so use --deterministic true only when reproducibility is needed.
+DETERMINISTIC             = False
 DETERMINISTIC_SEED        = 42          # only matters if DETERMINISTIC is off but a seed is wanted
 
 # Sampling params forced on every phase when DETERMINISTIC is True. Every field
