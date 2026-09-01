@@ -57,6 +57,11 @@ LISTEN_PORT               = 29006
 STRIP_SECURITY_IN_HISTORY = True
 ENABLE_THINKING           = True        # Qwen3: pass enable_thinking to apply_chat_template
 
+# When True, a phase-1 tool call is handed to the lora model for the phase-2 security
+# check (and possible defence). When False, phase 2 is skipped entirely: the phase-1
+# output is parsed and returned directly, so no security block is ever produced.
+PHASE2_ENABLE             = True
+
 # ---------------------------------------------------------------------------
 # Deterministic inference
 # ---------------------------------------------------------------------------
@@ -980,6 +985,14 @@ async def _handle_request(
                 acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
             )
 
+        if not PHASE2_ENABLE:
+            log.info("[phase1] phase2 disabled — returning phase-1 tool calls without security check")
+            tool_calls, content = _parse_output(raw_assistant + TOOL_CALL_END)
+            return _build_response(
+                cid, tool_calls, content,
+                acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
+            )
+
         log.info("[phase1] hit </tool_call> — switching to lora model")
 
         # ── Phase 2 prompt construction ──────────────────────────────────────
@@ -1265,6 +1278,7 @@ def main():
     global VLLM_BASE_URL, BASE_MODEL_ID, LORA_MODEL_ID, BASE_MODEL_PATH, MODEL_TYPE
     global LLAMA3_TEMPLATE_PATH, MAX_TOKENS_SECURITY, REQUEST_TIMEOUT
     global LISTEN_HOST, LISTEN_PORT, STRIP_SECURITY_IN_HISTORY, ENABLE_THINKING
+    global PHASE2_ENABLE
     global VLLM_INFERENCE_DEBUG
     global DETERMINISTIC, DETERMINISTIC_SEED
     global LORA_THINK_MODE, LORA_THINK_STRING
@@ -1299,6 +1313,9 @@ def main():
     parser.add_argument("--enable_thinking",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=f"Qwen3 thinking mode (default: {str(ENABLE_THINKING).lower()})")
+    parser.add_argument("--phase2_enable",
+                        choices=["true", "false"], default=None, metavar="true|false",
+                        help=f"run phase-2 lora security check; false = phase-1 only (default: {str(PHASE2_ENABLE).lower()})")
     parser.add_argument("--vllm_inference_debug",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=f"log full assistant output of every base/lora inference (default: {str(VLLM_INFERENCE_DEBUG).lower()})")
@@ -1349,6 +1366,8 @@ def main():
         STRIP_SECURITY_IN_HISTORY = args.strip_security_in_history == "true"
     if args.enable_thinking is not None:
         ENABLE_THINKING = args.enable_thinking == "true"
+    if args.phase2_enable is not None:
+        PHASE2_ENABLE = args.phase2_enable == "true"
     if args.vllm_inference_debug is not None:
         VLLM_INFERENCE_DEBUG = args.vllm_inference_debug == "true"
     if args.deterministic is not None:
@@ -1399,6 +1418,7 @@ def main():
     log.info("  base model       : %s", BASE_MODEL_ID)
     log.info("  lora model       : %s  security_max_tokens=%d", LORA_MODEL_ID, MAX_TOKENS_SECURITY)
     log.info("  enable_thinking  : %s", ENABLE_THINKING)
+    log.info("  phase2_enable    : %s", PHASE2_ENABLE)
     log.info("  inference_debug  : %s", VLLM_INFERENCE_DEBUG)
     if DETERMINISTIC:
         log.info("  deterministic    : ON  (greedy, client sampling params ignored, seed=%d)",

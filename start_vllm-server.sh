@@ -19,6 +19,7 @@ LOG_LEVEL="info"                 # debug | info | warning | error
 
 ENABLE_THINKING=true              # true | false
 STRIP_SECURITY_IN_HISTORY=true    # true | false
+PHASE2_ENABLE=true                # true: run phase-2 security check; false: phase-1 only
 
 # Security defence: block tool calls whose lora verdict is below SECURITY_DEFENCE_LEVEL.
 # Calls at or above the level pass through. Example: "neutral" allows safe+neutral, blocks suspicious+unsafe.
@@ -45,6 +46,7 @@ python "${SCRIPT_DIR}/vllm-server.py" \
     --timeout              "${REQUEST_TIMEOUT}" \
     --log-level            "${LOG_LEVEL}" \
     --enable_thinking          "${ENABLE_THINKING}" \
+    --phase2_enable            "${PHASE2_ENABLE}" \
     --strip_security_in_history "${STRIP_SECURITY_IN_HISTORY}" \
     --security_defence_enable       "${SECURITY_DEFENCE_ENABLE}" \
     --security_defence_debug        "${SECURITY_DEFENCE_DEBUG}" \
