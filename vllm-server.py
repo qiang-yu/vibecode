@@ -62,6 +62,13 @@ ENABLE_THINKING           = True        # Qwen3: pass enable_thinking to apply_c
 # output is parsed and returned directly, so no security block is ever produced.
 PHASE2_ENABLE             = True
 
+# Retries for phase 1 when its think block overruns max_tokens (finish_reason=="length").
+# 0 disables retries (original behavior). When > 0, the truncated output is discarded and
+# phase 1 is re-run up to this many times; if the limit is still hit, the last (truncated)
+# result is returned as before. Only meaningful under sampling (DETERMINISTIC False),
+# where a fresh draw may yield a shorter think.
+PHASE1_THINK_RETRY_COUNT  = 0
+
 # ---------------------------------------------------------------------------
 # Deterministic inference
 # ---------------------------------------------------------------------------
@@ -108,6 +115,11 @@ _DETERMINISTIC_PARAMS = {
 # line (newlines shown as "\n"), including the prefix WE injected and let the model
 # continue from. The log clearly labels each line as Base Model or Lora Model.
 VLLM_INFERENCE_DEBUG      = True
+
+# When True, log the raw client input rendered into Qwen3 chat-template format BEFORE
+# any <think>/<tool_call_security> stripping is applied, so the untouched request can
+# be inspected. When False, nothing extra is logged and the flow is unchanged.
+OUTPUT_RAW_CLIENT_INPUT   = True
 
 # Think-mode for phase 2: controls whose <think> content the lora model sees.
 #   base_model_think   — send base model's original think to lora (original behavior)
@@ -351,6 +363,9 @@ app = FastAPI(title="vllm-server", docs_url=None, redoc_url=None, lifespan=lifes
 # ---------------------------------------------------------------------------
 
 _SECURITY_RE           = re.compile(r"<tool_call_security>.*?</tool_call_security>", re.DOTALL)
+# Prompt-level variant: also consumes the single trailing newline the chat template
+# emits after the block, so stripping it leaves the exact spacing native vllm produces.
+_SECURITY_BLOCK_RE     = re.compile(r"<tool_call_security>.*?</tool_call_security>\n?", re.DOTALL)
 _TOOL_CALL_RE          = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 _THINK_RE              = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 _THINK_CONTENT_RE      = re.compile(r"(<think>)(.*?)(</think>)", re.DOTALL)
@@ -372,12 +387,8 @@ _SECURITY_FULL_RE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
-# Message preprocessing before chat-template rendering
+# Message preprocessing (only for STRIP_SECURITY_IN_HISTORY = False)
 # ---------------------------------------------------------------------------
-
-def _strip_security(text: str) -> str:
-    return _SECURITY_RE.sub("", text).strip()
-
 
 def _render_tool_calls_as_text(tool_calls: List[Dict]) -> str:
     """Serialize the OpenAI tool_calls array back to the model's native text."""
@@ -399,19 +410,16 @@ def _render_tool_calls_as_text(tool_calls: List[Dict]) -> str:
     return "\n".join(parts)
 
 
-def _prepare_messages_for_model(messages: List[Dict]) -> List[Dict]:
+def _reorder_security_after_tool_calls(messages: List[Dict]) -> List[Dict]:
     """
-    Preprocess incoming messages before applying the chat template.
+    Reorder history so each <tool_call_security> block follows its <tool_call>.
 
-    For historical assistant messages:
-      - <think> is always stripped: responses now preserve <think>, so history
-        may contain it; we remove it explicitly so the base model never sees
-        historical thinking (Qwen3's template also strips it, but we do it
-        here for all model types and regardless of template behavior).
-      - <tool_call_security> handling controlled by STRIP_SECURITY_IN_HISTORY:
-        True (default): remove the security block from content.
-        False: keep the block but reorder it after <tool_call>, dropping
-        tool_calls so the template does not re-render it in the wrong slot.
+    Used only when STRIP_SECURITY_IN_HISTORY is False (the block is kept, not stripped).
+    For any assistant message carrying both a <tool_call_security> block in its content
+    and a tool_calls field, the tool_calls are serialized into text placed before the
+    security block, and the tool_calls field is dropped so the chat template does not
+    re-render the call in the wrong slot (i.e. before the security block). This must run
+    before rendering, because it rewrites the structured messages the template consumes.
     """
     result = []
     for msg in copy.deepcopy(messages):
@@ -419,7 +427,7 @@ def _prepare_messages_for_model(messages: List[Dict]) -> List[Dict]:
             content = msg.get("content") or ""
             tool_calls = msg.get("tool_calls")
 
-            # Flatten list content to a plain string for security/think detection.
+            # Flatten list content to a plain string for security detection.
             if isinstance(content, list):
                 content_str = "\n".join(
                     p.get("text", "") for p in content
@@ -428,31 +436,11 @@ def _prepare_messages_for_model(messages: List[Dict]) -> List[Dict]:
             else:
                 content_str = content if isinstance(content, str) else ""
 
-            has_security = "<tool_call_security>" in content_str
-
-            if has_security:
-                if STRIP_SECURITY_IN_HISTORY:
-                    if isinstance(content, str):
-                        msg["content"] = _strip_security(content)
-                    elif isinstance(content, list):
-                        for p in content:
-                            if isinstance(p, dict) and p.get("type") == "text":
-                                p["text"] = _strip_security(p.get("text", ""))
-                elif tool_calls:
-                    sec_match = _SECURITY_RE.search(content_str)
-                    security_block = sec_match.group(0) if sec_match else ""
-                    msg["content"] = _render_tool_calls_as_text(tool_calls) + security_block
-                    msg.pop("tool_calls", None)
-
-            # Strip <think> from all historical assistant messages.
-            cur = msg.get("content")
-            if isinstance(cur, str) and "<think>" in cur:
-                msg["content"] = _THINK_RE.sub("", cur).strip()
-            elif isinstance(cur, list):
-                for p in cur:
-                    if isinstance(p, dict) and p.get("type") == "text":
-                        if "<think>" in p.get("text", ""):
-                            p["text"] = _THINK_RE.sub("", p["text"]).strip()
+            if "<tool_call_security>" in content_str and tool_calls:
+                sec_match = _SECURITY_RE.search(content_str)
+                security_block = sec_match.group(0) if sec_match else ""
+                msg["content"] = _render_tool_calls_as_text(tool_calls) + security_block
+                msg.pop("tool_calls", None)
 
         result.append(msg)
     return result
@@ -849,12 +837,38 @@ async def _handle_request(
     client_stop: List[str],
     fwd: Dict,
 ) -> Dict:
-    msgs_for_model = _prepare_messages_for_model(messages)
-    base_prompt = _render_prompt(msgs_for_model, tools)
+    # Phase 1 should look like native vllm's input. Native vllm history never contains
+    # <tool_call_security> — that tag is injected by THIS server — so strip it before
+    # phase 1 (STRIP_SECURITY_IN_HISTORY True), leaving content native vllm would have.
+    # <think> is NOT stripped here: native Qwen3 keeps the current multi-step turn's
+    # think, so phase 1 keeps it too; historical <think> is removed later, only on the
+    # phase-2 path, so it never runs when phase 2 is skipped. When STRIP_SECURITY_IN_HISTORY
+    # is False the block is kept, so reorder messages first (a message-level edit) to
+    # place each <tool_call_security> after its <tool_call>.
+    msgs_for_render = messages
+    if not STRIP_SECURITY_IN_HISTORY:
+        msgs_for_render = _reorder_security_after_tool_calls(messages)
+    base_prompt = _render_prompt(msgs_for_render, tools)
 
-    # prompt_head is the frozen history; think_opener (possibly "") is the part of the
-    # assistant turn the template already emitted.
+    # Optionally log the rendered input — after formatting, before the security strip.
+    if OUTPUT_RAW_CLIENT_INPUT:
+        log.info("[raw_client_input] %s", base_prompt.replace("\n", "\\n"))
+
+    if STRIP_SECURITY_IN_HISTORY:
+        base_prompt = _SECURITY_BLOCK_RE.sub("", base_prompt)
+
+    # prompt_head is what phase 1 sees: native-like (security stripped, think kept).
+    # think_opener (possibly "") is the assistant-turn opener the template emitted.
     prompt_head, think_opener = _split_open_think(base_prompt)
+
+    # prompt_head with all historical <think> removed. Security was already handled before
+    # phase 1 (stripped or reordered). Computed once — history is fixed across retries.
+    # Two consumers:
+    #   - phase 2 (lora), which never needs the base model's historical thinking;
+    #   - defence retries, which rebuild the base turn with our injected <think>; starting
+    #     from this head guarantees the base model continues from ONLY that single injected
+    #     think, with no historical <think> ahead of it.
+    prompt_head_no_think = _THINK_RE.sub("", prompt_head)
 
     # Text of the current assistant turn that WE injected (defence think). Never
     # contains base-model output — the base model's own text is always appended after it.
@@ -871,7 +885,12 @@ async def _handle_request(
     acc_completion_tokens = 0
 
     for attempt in range(SECURITY_DEFENCE_MAX_RETRIES + 1):
-        current_prompt = prompt_head + assistant_prefix
+        # attempt 0 is the native phase-1 call: keep history intact (incl. its <think>).
+        # Defence retries (attempt > 0) rebuild the base turn from our injected <think>,
+        # so use the head with historical <think> stripped — the base model then continues
+        # from only that single injected think.
+        head_for_phase1 = prompt_head_no_think if attempt > 0 else prompt_head
+        current_prompt = head_for_phase1 + assistant_prefix
 
         # ── Phase 1: base model ──────────────────────────────────────────────
         # _context_window is the total context length (vllm --max-model-len); the
@@ -895,20 +914,39 @@ async def _handle_request(
 
         # TOOL_CALL_END first for deterministic logging; client stops deduped and appended.
         p1_stop = [TOOL_CALL_END] + [s for s in dict.fromkeys(client_stop) if s != TOOL_CALL_END]
-        log.info("[phase1] base model  attempt=%d  stop=%s  max_tokens=%d  prompt_tokens~=%d",
-                 attempt, p1_stop, p1_max, prompt_token_count)
-        if VLLM_INFERENCE_DEBUG:
-            log.info(
-                "[inference][Base Model] input=%s",
-                current_prompt.replace("\n", "\\n"),
+
+        # Phase-1 call, retried when the think block overruns max_tokens (finish_reason
+        # == "length"). Each retry reuses the SAME prompt and DISCARDS the previous
+        # truncated output — that output overran the limit, so it is incomplete and wrong
+        # and must not be used. Retrying only helps under sampling (DETERMINISTIC False),
+        # where a fresh draw may produce a shorter think. After PHASE1_THINK_RETRY_COUNT
+        # retries still hitting length, fall through with the last result so the original
+        # length-handling below runs unchanged.
+        text1 = ""
+        p1_finish_reason = "stop"
+        for think_try in range(PHASE1_THINK_RETRY_COUNT + 1):
+            log.info("[phase1] base model  attempt=%d  think_try=%d  stop=%s  max_tokens=%d  prompt_tokens~=%d",
+                     attempt, think_try, p1_stop, p1_max, prompt_token_count)
+            if VLLM_INFERENCE_DEBUG:
+                log.info(
+                    "[inference][Base Model] input=%s",
+                    current_prompt.replace("\n", "\\n"),
+                )
+            p1 = await _call_completions(current_prompt, BASE_MODEL_ID, p1_stop, p1_max, fwd)
+            c1 = p1["choices"][0]
+            text1 = c1.get("text") or ""
+            usage1 = p1.get("usage", {})
+            acc_prompt_tokens += usage1.get("prompt_tokens") or prompt_token_count
+            acc_completion_tokens += usage1.get("completion_tokens", 0)
+            p1_finish_reason = c1.get("finish_reason") or "stop"
+
+            if p1_finish_reason != "length" or think_try >= PHASE1_THINK_RETRY_COUNT:
+                break
+            log.warning(
+                "[phase1] hit max_tokens (finish_reason=length); discarding truncated "
+                "output and retrying think (%d/%d)",
+                think_try + 1, PHASE1_THINK_RETRY_COUNT,
             )
-        p1 = await _call_completions(current_prompt, BASE_MODEL_ID, p1_stop, p1_max, fwd)
-        c1 = p1["choices"][0]
-        text1: str = c1.get("text") or ""
-        usage1 = p1.get("usage", {})
-        acc_prompt_tokens += usage1.get("prompt_tokens") or prompt_token_count
-        acc_completion_tokens += usage1.get("completion_tokens", 0)
-        p1_finish_reason: str = c1.get("finish_reason") or "stop"
 
         # The complete assistant turn as text: our injected prefix (defence think and/or
         # the template's think opener) followed by whatever the base model produced.
@@ -1029,8 +1067,11 @@ async def _handle_request(
                 log.warning("[phase2] could not parse the tool call, "
                             "falling back to letting the lora write the whole block")
 
+        # prompt_head_no_think already has historical <think> removed and security handled;
+        # phase 1 kept them so the base model saw a native-vllm prompt. The current turn's
+        # think was handled above via LORA_THINK_MODE on assistant_for_lora.
         p2_prompt = (
-            prompt_head + assistant_for_lora + TOOL_CALL_END
+            prompt_head_no_think + assistant_for_lora + TOOL_CALL_END
             + TOOL_CALL_SECURITY_START + security_prefill
         )
 
@@ -1278,8 +1319,8 @@ def main():
     global VLLM_BASE_URL, BASE_MODEL_ID, LORA_MODEL_ID, BASE_MODEL_PATH, MODEL_TYPE
     global LLAMA3_TEMPLATE_PATH, MAX_TOKENS_SECURITY, REQUEST_TIMEOUT
     global LISTEN_HOST, LISTEN_PORT, STRIP_SECURITY_IN_HISTORY, ENABLE_THINKING
-    global PHASE2_ENABLE
-    global VLLM_INFERENCE_DEBUG
+    global PHASE2_ENABLE, PHASE1_THINK_RETRY_COUNT
+    global VLLM_INFERENCE_DEBUG, OUTPUT_RAW_CLIENT_INPUT
     global DETERMINISTIC, DETERMINISTIC_SEED
     global LORA_THINK_MODE, LORA_THINK_STRING
     global TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL
@@ -1309,16 +1350,22 @@ def main():
                         help=f"listen port (default: {LISTEN_PORT})")
     parser.add_argument("--strip_security_in_history",
                         choices=["true", "false"], default=None, metavar="true|false",
-                        help=f"strip <tool_call_security> from history before rendering (default: {str(STRIP_SECURITY_IN_HISTORY).lower()})")
+                        help=f"strip <tool_call_security> from the rendered Qwen3 prompt (default: {str(STRIP_SECURITY_IN_HISTORY).lower()})")
     parser.add_argument("--enable_thinking",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=f"Qwen3 thinking mode (default: {str(ENABLE_THINKING).lower()})")
     parser.add_argument("--phase2_enable",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=f"run phase-2 lora security check; false = phase-1 only (default: {str(PHASE2_ENABLE).lower()})")
+    parser.add_argument("--phase1_think_retry_count",
+                        type=int, default=None, metavar="N",
+                        help=f"retry phase 1 up to N times when its think overruns max_tokens (default: {PHASE1_THINK_RETRY_COUNT})")
     parser.add_argument("--vllm_inference_debug",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=f"log full assistant output of every base/lora inference (default: {str(VLLM_INFERENCE_DEBUG).lower()})")
+    parser.add_argument("--output_raw_client_input",
+                        choices=["true", "false"], default=None, metavar="true|false",
+                        help=f"log raw client input rendered as Qwen3 format before stripping (default: {str(OUTPUT_RAW_CLIENT_INPUT).lower()})")
     parser.add_argument("--deterministic",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=(f"force greedy decoding on both phases and ignore client sampling "
@@ -1368,8 +1415,12 @@ def main():
         ENABLE_THINKING = args.enable_thinking == "true"
     if args.phase2_enable is not None:
         PHASE2_ENABLE = args.phase2_enable == "true"
+    if args.phase1_think_retry_count is not None:
+        PHASE1_THINK_RETRY_COUNT = args.phase1_think_retry_count
     if args.vllm_inference_debug is not None:
         VLLM_INFERENCE_DEBUG = args.vllm_inference_debug == "true"
+    if args.output_raw_client_input is not None:
+        OUTPUT_RAW_CLIENT_INPUT = args.output_raw_client_input == "true"
     if args.deterministic is not None:
         DETERMINISTIC = args.deterministic == "true"
     if args.seed is not None:
@@ -1419,7 +1470,9 @@ def main():
     log.info("  lora model       : %s  security_max_tokens=%d", LORA_MODEL_ID, MAX_TOKENS_SECURITY)
     log.info("  enable_thinking  : %s", ENABLE_THINKING)
     log.info("  phase2_enable    : %s", PHASE2_ENABLE)
+    log.info("  p1_think_retry   : %d", PHASE1_THINK_RETRY_COUNT)
     log.info("  inference_debug  : %s", VLLM_INFERENCE_DEBUG)
+    log.info("  raw_client_input : %s", OUTPUT_RAW_CLIENT_INPUT)
     if DETERMINISTIC:
         log.info("  deterministic    : ON  (greedy, client sampling params ignored, seed=%d)",
                  DETERMINISTIC_SEED)

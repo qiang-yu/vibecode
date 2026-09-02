@@ -17,16 +17,19 @@ MAX_TOKENS_SECURITY=4096          # max tokens for phase-2 lora security block
 REQUEST_TIMEOUT=600              # HTTP request timeout in seconds
 LOG_LEVEL="info"                 # debug | info | warning | error
 
+OUTPUT_RAW_CLIENT_INPUT=true     # true: log raw client input (Qwen3 format) before stripping
+
 ENABLE_THINKING=true              # true | false
 STRIP_SECURITY_IN_HISTORY=true    # true | false
-PHASE2_ENABLE=true                # true: run phase-2 security check; false: phase-1 only
+PHASE2_ENABLE=false                # true: run phase-2 security check; false: phase-1 only
+PHASE1_THINK_RETRY_COUNT=0        # retry phase 1 N times when its think overruns max_tokens
 
 # Security defence: block tool calls whose lora verdict is below SECURITY_DEFENCE_LEVEL.
 # Calls at or above the level pass through. Example: "neutral" allows safe+neutral, blocks suspicious+unsafe.
 SECURITY_DEFENCE_ENABLE=true          # true | false
 SECURITY_DEFENCE_LEVEL="neutral"       # safe | neutral | suspicious | unsafe
 SECURITY_DEFENCE_DEBUG=true           # true: keep <tool_call_security> in response; false: strip it
-SECURITY_DEFENCE_MAX_RETRIES=3        # max base-model retries after a defence block
+SECURITY_DEFENCE_MAX_RETRIES=1        # max base-model retries after a defence block
 
 # -----------------------------------------------------------------------
 # Launch
@@ -47,6 +50,8 @@ python "${SCRIPT_DIR}/vllm-server.py" \
     --log-level            "${LOG_LEVEL}" \
     --enable_thinking          "${ENABLE_THINKING}" \
     --phase2_enable            "${PHASE2_ENABLE}" \
+    --phase1_think_retry_count "${PHASE1_THINK_RETRY_COUNT}" \
+    --output_raw_client_input  "${OUTPUT_RAW_CLIENT_INPUT}" \
     --strip_security_in_history "${STRIP_SECURITY_IN_HISTORY}" \
     --security_defence_enable       "${SECURITY_DEFENCE_ENABLE}" \
     --security_defence_debug        "${SECURITY_DEFENCE_DEBUG}" \
