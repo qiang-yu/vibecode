@@ -119,7 +119,7 @@ VLLM_INFERENCE_DEBUG      = True
 # When True, log the raw client input rendered into Qwen3 chat-template format BEFORE
 # any <think>/<tool_call_security> stripping is applied, so the untouched request can
 # be inspected. When False, nothing extra is logged and the flow is unchanged.
-OUTPUT_RAW_CLIENT_INPUT   = True
+OUTPUT_RAW_CLIENT_INPUT   = False
 
 # Think-mode for phase 2: controls whose <think> content the lora model sees.
 #   base_model_think   — send base model's original think to lora (original behavior)
