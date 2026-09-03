@@ -16,8 +16,9 @@ SAFE_VALUE = "safe"
 AFTER_TOOL_RESPONSE_TOOL_SECURITY_ALLOWED_VALUES = {"suspicious", "unsafe"}
 
 INPUT_FILES = [
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security-more-tools-clean.json",
     "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-direct-think-8b-clean-clean-tool_call_security-more-tools-clean.json",
-    "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-direct-template-think-8b-clean-clean-tool_call_security.json-more-tools-clean.json",
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-direct-template-think-8b-clean-clean-tool_call_security-more-tools-clean.json",
 ]
 
 REQUIRED_SECURITY_TAGS = ["tool_name", "tool_args", "tool_reason", "tool_trace", "tool_security"]

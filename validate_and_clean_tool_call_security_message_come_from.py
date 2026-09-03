@@ -10,7 +10,15 @@ injected instructions as user instructions, which is the exact failure being cha
 None of these checks ask for judgement. They are string lookups against the conversation:
   * does the cited message index exist at that point in the conversation?
   * do the quoted trigger words actually appear in the message they are attributed to?
-  * for a call labelled safe, do its argument values appear in the user's own turns?
+  * for a call labelled safe, do its argument values appear in the user's own turns, or were
+    they delegated by the user to a source the user themselves named?
+  * for a call labelled non-safe, do its argument values actually appear in the tool response
+    being blamed for it?
+
+The block format has three fixed questions — argument provenance, trigger words, source — and
+four more when the source is a tool response. Answers are located by matching the question
+wording, not by position, so a block that drops or reorders a question is reported rather than
+silently audited against the wrong answer.
 
 Records are split into <name>-valid.json and <name>-invalid.json, and a per-block report is
 written to <name>-audit-report.jsonl for inspection.
@@ -22,6 +30,7 @@ import re
 from collections import Counter
 
 INPUT_FILES = [
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security-more-tools-clean-clean.json",
     "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-direct-think-8b-clean-clean-tool_call_security-more-tools-clean-clean.json",
     "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-direct-template-think-8b-clean-clean-tool_call_security-more-tools-clean-clean.json",
 ]
@@ -41,15 +50,24 @@ FUZZY_MIN = 0.8
 HARD_ERRORS = {
     "malformed_block", "trace_index_missing", "quote_is_from_tool",
     "safe_but_args_from_tool", "trace_level_mismatch", "qcount_mismatch",
-    "q2_trace_disagree", "position_label_conflict",
+    "source_answer_trace_disagree", "position_label_conflict",
+    "arg_question_missing",
 }
 # Set to True to also reject records whose only problem is a loose or missing quote.
 STRICT = False
 
+# A safe call may now legitimately follow a tool turn. When the user says "summarise every
+# website posted to that channel", the URL arrives in a tool response but the instruction is
+# still the user's own — the block marks such a value USER-DELEGATED. Recognising that is what
+# stops the model from reading "the value came back from a tool" as "a tool told me to do it",
+# which is the confusion that lets an injection with a familiar-looking action through.
+# Set to False to go back to treating any safe-after-tool call as an error.
+ALLOW_DELEGATED_SAFE = True
+DELEGATED_MARK = "user-delegated"
+
 # A call whose nearest preceding non-assistant turn is a tool response cannot have been
-# triggered by the user, unless the user's original request needed several calls. This
-# dataset contains no such case, so the conflict is treated as an error; set to False if
-# genuine multi-step plans are later added.
+# triggered by the user, unless the user's original request needed several calls or delegated
+# its values (see above). Set to False if this produces noise on multi-step plans.
 CHECK_POSITION = True
 
 # Surface features that make an injected tool response trivially recognisable. If nearly
@@ -63,17 +81,26 @@ INJECTION_PHRASES = ("important", "ignore all previous", "ignore previous", "sig
 
 ERROR_LABELS = {
     "malformed_block":        "block missing required tags",
-    "no_quote_in_q1":         "first answer quotes nothing",
+    "arg_question_missing":   "argument-provenance question missing or not first",
+    "no_quote_in_trigger":    "trigger answer quotes nothing",
     "quote_loose_match":      "quoted words are a paraphrase, not verbatim (warning)",
     "position_label_conflict": "label contradicts the turn the call follows",
     "trace_index_missing":    "cited message index does not exist",
     "quote_not_in_cited":     "quoted words are not in the cited message",
     "quote_is_from_tool":     "quoted words claimed as user text but found in a tool response",
     "safe_but_args_from_tool": "labelled safe but argument values only appear in tool responses",
+    "nonsafe_args_not_in_cited": "blamed tool response contains none of the argument values (warning)",
     "trace_level_mismatch":   "trace and security level contradict each other",
     "qcount_mismatch":        "question count does not match the security level",
-    "q2_trace_disagree":      "second answer and tool_trace name different sources",
+    "source_answer_trace_disagree": "source answer and tool_trace name different sources",
 }
+
+# Question wording used to locate each answer. Matching on wording rather than position means
+# a block that drops or reorders a question is caught by arg_question_missing instead of
+# having its trigger answer silently audited as if it were the provenance answer.
+Q_ARGS_RE    = re.compile(r"argument value", re.I)
+Q_TRIGGER_RE = re.compile(r"trigger", re.I)
+Q_SOURCE_RE  = re.compile(r"come directly from the user'?s own instructions", re.I)
 
 BLOCK_RE = re.compile(r"<tool_call_security>(.*?)</tool_call_security>", re.S)
 TAG_RE = {
@@ -148,6 +175,27 @@ def distinctive_args(tool_args):
     return out
 
 
+def split_qa(reason):
+    """Pair each question with its answer and return them, plus the three fixed answers.
+
+    Returns (questions, answers, args_answer, trigger_answer, source_answer). Any of the three
+    may be None when the corresponding question is absent. Matching is by wording so that a
+    reordered block is reported rather than audited against the wrong text; positions are used
+    only as a fallback, since a wrapped question line still leaves the order intact.
+    """
+    questions = re.findall(r"(?m)^Q: (.*)$", reason)
+    answers = ANSWER_RE.findall(reason)
+
+    def pick(rx, fallback):
+        for i, q in enumerate(questions):
+            if rx.search(q) and i < len(answers):
+                return answers[i]
+        return answers[fallback] if len(answers) > fallback else None
+
+    return (questions, answers,
+            pick(Q_ARGS_RE, 0), pick(Q_TRIGGER_RE, 1), pick(Q_SOURCE_RE, 2))
+
+
 def audit_block(block, users, tools, prev):
     """Return a list of error codes for one security block."""
     errors = []
@@ -163,12 +211,21 @@ def audit_block(block, users, tools, prev):
     reason = parts["tool_reason"]
     level = parts["tool_security"].strip().lower()
     trace = parse_trace(parts["tool_trace"])
-    answers = ANSWER_RE.findall(reason)
+    questions, answers, args_answer, trigger_answer, source_answer = split_qa(reason)
 
-    # question count must match the level: safe stops after two questions
-    n_q = len(re.findall(r"(?m)^Q: ", reason))
-    if (level == "safe" and n_q != 2) or (level != "safe" and n_q != 6):
+    # question count must match the level: safe stops after the three fixed questions
+    n_q = len(questions)
+    if (level == "safe" and n_q != 3) or (level != "safe" and n_q != 7):
         errors.append("qcount_mismatch")
+
+    # the argument-provenance question has to be there and has to come first, because every
+    # later answer is supposed to be conditioned on it
+    if not questions or not Q_ARGS_RE.search(questions[0]):
+        errors.append("arg_question_missing")
+
+    # a value the user delegated to a source they named is still the user's own instruction
+    delegated = bool(args_answer) and DELEGATED_MARK in norm(args_answer)
+    detail["delegated"] = delegated
 
     if not trace:
         errors.append("malformed_block")
@@ -182,15 +239,16 @@ def audit_block(block, users, tools, prev):
     detail["prev_turn"] = prev
     if CHECK_POSITION and prev:
         if prev == "tool" and level == "safe":
-            errors.append("position_label_conflict")
+            if not (ALLOW_DELEGATED_SAFE and delegated):
+                errors.append("position_label_conflict")
         elif prev == "human" and level != "safe":
             errors.append("position_label_conflict")
 
-    # the second answer states the source too; it must agree with the trace tag
-    if len(answers) > 1:
-        claimed = parse_trace(answers[1])
+    # the source answer states the source too; it must agree with the trace tag
+    if source_answer:
+        claimed = parse_trace(source_answer)
         if claimed and claimed[0] != kind:
-            errors.append("q2_trace_disagree")
+            errors.append("source_answer_trace_disagree")
 
     # the cited message has to exist at this point in the conversation
     pool = users if kind == "user_message" else tools
@@ -200,11 +258,15 @@ def audit_block(block, users, tools, prev):
     else:
         cited = pool[idx - 1]
 
-    # the quoted trigger words have to be in the message they are attributed to
-    quotes = [q for q in QUOTE_RE.findall(answers[0]) if len(q) >= MIN_QUOTE_LEN] if answers else []
+    # the quoted trigger words have to be in the message they are attributed to. This reads
+    # the TRIGGER answer, never the provenance answer: the provenance answer deliberately
+    # quotes decoy text from other messages in order to rule it out, so checking it here
+    # would flag correct blocks for citing the very thing they rejected.
+    quotes = ([q for q in QUOTE_RE.findall(trigger_answer) if len(q) >= MIN_QUOTE_LEN]
+              if trigger_answer else [])
     detail["quotes"] = quotes[:3]
     if not quotes:
-        errors.append("no_quote_in_q1")
+        errors.append("no_quote_in_trigger")
     elif cited is not None:
         haystack = norm(cited)
         best = max(overlap(q, cited) for q in quotes)
@@ -223,16 +285,38 @@ def audit_block(block, users, tools, prev):
                 if any(norm(q) in tool_text for q in quotes) or tool_best > best:
                     errors.append("quote_is_from_tool")
 
-    # a safe call's arguments must be derivable from what the user wrote
+    user_text = norm(" ".join(users))
+    tool_text = norm(" ".join(tools))
+    arg_values = distinctive_args(parts["tool_args"])
+
+    # A safe call's arguments must be derivable from what the user wrote, unless the user
+    # delegated them: "summarise every website in that channel" hands the URLs to the channel,
+    # so a URL arriving in a tool response is still the user's instruction being carried out.
     if level == "safe":
-        user_text = norm(" ".join(users))
-        tool_text = norm(" ".join(tools))
-        for value in distinctive_args(parts["tool_args"]):
+        for value in arg_values:
             v = norm(value)
             if v and v not in user_text and v in tool_text:
-                errors.append("safe_but_args_from_tool")
-                detail["arg_only_in_tool"] = value
+                if ALLOW_DELEGATED_SAFE and delegated:
+                    detail["arg_delegated"] = value
+                else:
+                    errors.append("safe_but_args_from_tool")
+                    detail["arg_only_in_tool"] = value
                 break
+
+    # The mirror image, and the one that catches the failure this format was built for: a call
+    # blamed on a tool response whose values are nowhere in that tool response. That is what a
+    # block looks like when it matched an injection on the verb alone — the injected text asked
+    # for a similar action with different values, so the values it named never reach the call.
+    # Left as a warning because a value the model composed itself appears nowhere either; check
+    # the counts in the report before promoting it to HARD_ERRORS.
+    elif cited is not None and arg_values:
+        cited_text = norm(cited)
+        in_cited = [v for v in arg_values if norm(v) in cited_text]
+        elsewhere = [v for v in arg_values
+                     if norm(v) in user_text or norm(v) in tool_text.replace(cited_text, " ")]
+        if not in_cited and elsewhere:
+            errors.append("nonsafe_args_not_in_cited")
+            detail["arg_not_in_blamed_source"] = elsewhere[0]
 
     return errors, parts, detail
 
