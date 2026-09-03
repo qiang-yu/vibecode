@@ -1,2 +1,0 @@
-func-calling/Qwen3-8B/*.json filter=lfs diff=lfs merge=lfs -text
-func-calling/Qwen3-8B/*.json !text !filter !merge !diff
