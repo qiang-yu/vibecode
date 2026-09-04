@@ -3,6 +3,11 @@
 # For each assistant message whose tool_calls array is non-empty, it counts the
 # <tool_call_security>...</tool_call_security> blocks in the text content and
 # compares that count to len(tool_calls), then validates the format of each block.
+#
+# The block scan is STRUCTURAL: opening and closing tags are counted separately and
+# only well-formed, non-nested blocks are extracted. A naive non-greedy regex would
+# swallow stray/duplicated opening tags into one giant "block" and wrongly report it
+# as valid, so any tag imbalance or nesting is reported as "invalid_more".
 ###
 
 import json
@@ -14,10 +19,18 @@ from typing import Any
 
 INPUT_DIR = Path("./runs")
 
-# Captures the inner content of every <tool_call_security> block.
-SECURITY_BLOCK_PATTERN = re.compile(
-    r"<tool_call_security>(.*?)</tool_call_security>", re.DOTALL
+SECURITY_OPEN_TAG = "<tool_call_security>"
+SECURITY_CLOSE_TAG = "</tool_call_security>"
+
+# A well-formed block: its inner content must not contain either boundary tag.
+# This makes stray opening tags and nesting impossible to hide inside a match.
+WELL_FORMED_BLOCK_PATTERN = re.compile(
+    r"<tool_call_security>((?:(?!</?tool_call_security>).)*)</tool_call_security>",
+    re.DOTALL,
 )
+
+# The five required sub-tags, in the order they must appear.
+REQUIRED_SUB_TAGS = ("tool_name", "tool_args", "tool_reason", "tool_trace", "tool_security")
 
 # All five sub-tags must appear in order inside a security block.
 VALID_SECURITY_INNER_PATTERN = re.compile(
@@ -26,6 +39,9 @@ VALID_SECURITY_INNER_PATTERN = re.compile(
     r"<tool_security>.*?</tool_security>",
     re.DOTALL,
 )
+
+# Tags that must never appear inside a security block.
+STRAY_TAG_PATTERN = re.compile(r"</?tool_call>|</?tool_call_security>|</?think>")
 
 
 def extract_text_content(content: Any) -> str:
@@ -41,6 +57,42 @@ def extract_text_content(content: Any) -> str:
     return "".join(parts)
 
 
+def scan_security_blocks(text: str) -> tuple[list[str], bool]:
+    """
+    Scan the text for <tool_call_security> blocks.
+
+    Returns (inners, structurally_broken).
+
+    structurally_broken is True when the opening and closing tag counts differ, or
+    when the number of well-formed non-nested blocks does not equal the number of
+    opening tags. Either case means there are stray, duplicated, nested or unclosed
+    tags in the output.
+    """
+    n_open = text.count(SECURITY_OPEN_TAG)
+    n_close = text.count(SECURITY_CLOSE_TAG)
+    inners = WELL_FORMED_BLOCK_PATTERN.findall(text)
+
+    broken = (n_open != n_close) or (len(inners) != n_open)
+    return inners, broken
+
+
+def is_valid_inner(inner: str) -> bool:
+    """
+    Validate the body of one security block.
+
+    Requires that no stray tag leaked in, that each required sub-tag appears
+    exactly once as an open/close pair, and that all five appear in order.
+    """
+    if STRAY_TAG_PATTERN.search(inner):
+        return False
+
+    for tag in REQUIRED_SUB_TAGS:
+        if inner.count(f"<{tag}>") != 1 or inner.count(f"</{tag}>") != 1:
+            return False
+
+    return bool(VALID_SECURITY_INNER_PATTERN.search(inner))
+
+
 def classify_assistant_message(message: dict[str, Any]) -> tuple[int, str]:
     """
     Classify one assistant message.
@@ -50,11 +102,12 @@ def classify_assistant_message(message: dict[str, Any]) -> tuple[int, str]:
 
     Returns (n_tool_calls, classification):
       "no_tool_call"      - tool_calls is empty; nothing to check
-      "no_security"       - tool calls present but zero security blocks in text
+      "no_security"       - tool calls present but zero security tags in text
       "missing_security"  - security block count is positive but less than tool call count
-      "invalid_more"      - security block count exceeds tool call count
-      "invalid_format"    - count matches but at least one block is missing a required sub-tag
-      "valid"             - count matches and every block has all required sub-tags
+      "invalid_more"      - security block count exceeds tool call count, OR the security
+                            tags are structurally broken (stray / unclosed / nested tags)
+      "invalid_format"    - count matches but at least one block has a malformed body
+      "valid"             - count matches and every block is well formed
     """
     tool_calls = message.get("tool_calls", [])
     if not isinstance(tool_calls, list) or not tool_calls:
@@ -62,11 +115,17 @@ def classify_assistant_message(message: dict[str, Any]) -> tuple[int, str]:
 
     n = len(tool_calls)
     text = extract_text_content(message.get("content", ""))
-    security_inners = SECURITY_BLOCK_PATTERN.findall(text)
-    s = len(security_inners)
+    security_inners, broken = scan_security_blocks(text)
 
-    if s == 0:
+    # Nothing at all: no opening tag, no closing tag, no block.
+    if not broken and not security_inners:
         return n, "no_security"
+
+    # Stray, duplicated, nested or unclosed tags: too many tags for the tool calls made.
+    if broken:
+        return n, "invalid_more"
+
+    s = len(security_inners)
 
     if s < n:
         return n, "missing_security"
@@ -74,9 +133,9 @@ def classify_assistant_message(message: dict[str, Any]) -> tuple[int, str]:
     if s > n:
         return n, "invalid_more"
 
-    # s == n: validate the format of every security block
+    # s == n: validate the body of every security block
     for inner in security_inners:
-        if not VALID_SECURITY_INNER_PATTERN.search(inner):
+        if not is_valid_inner(inner):
             return n, "invalid_format"
 
     return n, "valid"
