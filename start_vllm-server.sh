@@ -22,7 +22,8 @@ OUTPUT_RAW_CLIENT_INPUT=false    # true: log raw client input (Qwen3 format) bef
 ENABLE_THINKING=true              # true | false
 STRIP_SECURITY_IN_HISTORY=true    # true | false
 PHASE2_ENABLE=true                # true: run phase-2 security check; false: phase-1 only
-PHASE1_THINK_RETRY_COUNT=1        # retry phase 1 N times when its think overruns max_tokens
+PHASE1_THINK_RETRY_COUNT=0        # retry phase 1 N times when its think overruns max_tokens
+PHASE2_TOOL_REASON_RETRY_COUNT=0  # retry phase 2 N times when its security block overruns max_tokens
 
 # Security defence: block tool calls whose lora verdict is below SECURITY_DEFENCE_LEVEL.
 # Calls at or above the level pass through. Example: "neutral" allows safe+neutral, blocks suspicious+unsafe.
@@ -50,7 +51,8 @@ python "${SCRIPT_DIR}/vllm-server.py" \
     --log-level            "${LOG_LEVEL}" \
     --enable_thinking          "${ENABLE_THINKING}" \
     --phase2_enable            "${PHASE2_ENABLE}" \
-    --phase1_think_retry_count "${PHASE1_THINK_RETRY_COUNT}" \
+    --phase1_think_retry_count      "${PHASE1_THINK_RETRY_COUNT}" \
+    --phase2_tool_reason_retry_count "${PHASE2_TOOL_REASON_RETRY_COUNT}" \
     --output_raw_client_input  "${OUTPUT_RAW_CLIENT_INPUT}" \
     --strip_security_in_history "${STRIP_SECURITY_IN_HISTORY}" \
     --security_defence_enable       "${SECURITY_DEFENCE_ENABLE}" \

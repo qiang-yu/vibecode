@@ -69,6 +69,12 @@ PHASE2_ENABLE             = True
 # where a fresh draw may yield a shorter think.
 PHASE1_THINK_RETRY_COUNT  = 0
 
+# Retries for phase 2 when its security block overruns max_tokens (finish_reason=="length").
+# 0 disables retries (original behavior). When > 0, the truncated output is discarded and
+# phase 2 is re-run up to this many times with the identical prompt; only meaningful under
+# sampling (DETERMINISTIC False), where a fresh draw may yield a shorter block.
+PHASE2_TOOL_REASON_RETRY_COUNT = 0
+
 # ---------------------------------------------------------------------------
 # Deterministic inference
 # ---------------------------------------------------------------------------
@@ -1126,20 +1132,34 @@ async def _handle_request(
             log.warning("[phase2] context nearly full, security max_tokens clamped to %d", p2_max)
 
         # ── Phase 2: lora model ──────────────────────────────────────────────
-        log.info("[phase2] lora model  stop=[%s]  max_tokens=%d  prefilled=%d chars",
-                 TOOL_CALL_SECURITY_END, p2_max, len(security_prefill))
-        if VLLM_INFERENCE_DEBUG:
+        text2 = ""
+        p2_finish_reason = "stop"
+        c2: Dict = {}
+        for reason_try in range(PHASE2_TOOL_REASON_RETRY_COUNT + 1):
             log.info(
-                "[inference][Lora Model] input=%s",
-                p2_prompt.replace("\n", "\\n"),
+                "[phase2] lora model  reason_try=%d  stop=[%s]  max_tokens=%d  prefilled=%d chars",
+                reason_try, TOOL_CALL_SECURITY_END, p2_max, len(security_prefill),
             )
-        p2 = await _call_completions(p2_prompt, LORA_MODEL_ID, [TOOL_CALL_SECURITY_END], p2_max, fwd)
-        c2 = p2["choices"][0]
-        text2: str = c2.get("text") or ""
-        usage2 = p2.get("usage", {})
-        p2_finish_reason: str = c2.get("finish_reason") or "stop"
-        acc_prompt_tokens += usage2.get("prompt_tokens", 0)
-        acc_completion_tokens += usage2.get("completion_tokens", 0)
+            if VLLM_INFERENCE_DEBUG:
+                log.info(
+                    "[inference][Lora Model] input=%s",
+                    p2_prompt.replace("\n", "\\n"),
+                )
+            p2 = await _call_completions(p2_prompt, LORA_MODEL_ID, [TOOL_CALL_SECURITY_END], p2_max, fwd)
+            c2 = p2["choices"][0]
+            text2 = c2.get("text") or ""
+            usage2 = p2.get("usage", {})
+            p2_finish_reason = c2.get("finish_reason") or "stop"
+            acc_prompt_tokens += usage2.get("prompt_tokens", 0)
+            acc_completion_tokens += usage2.get("completion_tokens", 0)
+
+            if p2_finish_reason != "length" or reason_try >= PHASE2_TOOL_REASON_RETRY_COUNT:
+                break
+            log.warning(
+                "[phase2] hit max_tokens (finish_reason=length); discarding truncated "
+                "output and retrying reason (%d/%d)",
+                reason_try + 1, PHASE2_TOOL_REASON_RETRY_COUNT,
+            )
 
         if c2.get("stop_reason") != TOOL_CALL_SECURITY_END:
             log.warning(
@@ -1350,7 +1370,7 @@ def main():
     global VLLM_BASE_URL, BASE_MODEL_ID, LORA_MODEL_ID, BASE_MODEL_PATH, MODEL_TYPE
     global LLAMA3_TEMPLATE_PATH, MAX_TOKENS_SECURITY, REQUEST_TIMEOUT
     global LISTEN_HOST, LISTEN_PORT, STRIP_SECURITY_IN_HISTORY, ENABLE_THINKING
-    global PHASE2_ENABLE, PHASE1_THINK_RETRY_COUNT
+    global PHASE2_ENABLE, PHASE1_THINK_RETRY_COUNT, PHASE2_TOOL_REASON_RETRY_COUNT
     global VLLM_INFERENCE_DEBUG, OUTPUT_RAW_CLIENT_INPUT
     global DETERMINISTIC, DETERMINISTIC_SEED
     global LORA_THINK_MODE, LORA_THINK_STRING
@@ -1391,6 +1411,9 @@ def main():
     parser.add_argument("--phase1_think_retry_count",
                         type=int, default=None, metavar="N",
                         help=f"retry phase 1 up to N times when its think overruns max_tokens (default: {PHASE1_THINK_RETRY_COUNT})")
+    parser.add_argument("--phase2_tool_reason_retry_count",
+                        type=int, default=None, metavar="N",
+                        help=f"retry phase 2 up to N times when its security block overruns max_tokens (default: {PHASE2_TOOL_REASON_RETRY_COUNT})")
     parser.add_argument("--vllm_inference_debug",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=f"log full assistant output of every base/lora inference (default: {str(VLLM_INFERENCE_DEBUG).lower()})")
@@ -1448,6 +1471,8 @@ def main():
         PHASE2_ENABLE = args.phase2_enable == "true"
     if args.phase1_think_retry_count is not None:
         PHASE1_THINK_RETRY_COUNT = args.phase1_think_retry_count
+    if args.phase2_tool_reason_retry_count is not None:
+        PHASE2_TOOL_REASON_RETRY_COUNT = args.phase2_tool_reason_retry_count
     if args.vllm_inference_debug is not None:
         VLLM_INFERENCE_DEBUG = args.vllm_inference_debug == "true"
     if args.output_raw_client_input is not None:
@@ -1502,6 +1527,7 @@ def main():
     log.info("  enable_thinking  : %s", ENABLE_THINKING)
     log.info("  phase2_enable    : %s", PHASE2_ENABLE)
     log.info("  p1_think_retry   : %d", PHASE1_THINK_RETRY_COUNT)
+    log.info("  p2_reason_retry  : %d", PHASE2_TOOL_REASON_RETRY_COUNT)
     log.info("  inference_debug  : %s", VLLM_INFERENCE_DEBUG)
     log.info("  raw_client_input : %s", OUTPUT_RAW_CLIENT_INPUT)
     if DETERMINISTIC:
