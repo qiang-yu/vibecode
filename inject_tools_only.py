@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Inject additional tools into a ShareGPT-format function calling dataset.
-
-Logic:
-1. Stream through the input JSON Array item by item.
-2. If an item has no "tools" or its tools list is empty, write it unchanged.
-3. If an item has non-empty tools, randomly pick 1 to 5 other items that also
-   have non-empty tools (cannot include the same item), merge their tools into
-   the current item's tools, and deduplicate by function name.
-4. Write the processed item to the output JSON Array.
-
-Two-pass streaming is used so the large input file is never fully loaded.
-"""
+###
+# Inject additional tools into multiple ShareGPT-format function calling
+# datasets. For each input file, an output file named "<stem>-more-tools.json"
+# is produced in the same directory.
+#
+# Logic:
+# 1. Stream through each input JSON Array item by item (two-pass).
+# 2. Items with no tools are written unchanged.
+# 3. Items with non-empty tools get 1-5 randomly sampled tool sets from other
+#    items merged in, deduplicated by function name.
+###
 
 import json
 import random
@@ -20,10 +17,11 @@ import sys
 from pathlib import Path
 
 # ==================== Configurable input/output paths ====================
-INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security.json"
-OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security-more-tools.json"
-# INPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b-clean-clean-tool_call_security.json"
-# OUTPUT_FILE = "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-think-8b-clean-clean-tool_call_security-more-tools.json"
+INPUT_FILES = [
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-think-8b-clean-tool_call_security.json",
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-direct-think-8b-clean-clean-tool_call_security.json",
+    "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-direct-template-think-8b-clean-clean-tool_call_security.json",
+]
 RANDOM_SEED = 42          # Fixed seed for reproducibility; set to None for non-deterministic runs
 PROGRESS_INTERVAL = 100  # Print progress every N items
 # =========================================================================
@@ -160,31 +158,48 @@ def process_and_write(input_path: Path, output_path: Path, tools_by_index: dict)
         fout.write("\n]\n")
 
 
-def main():
-    if RANDOM_SEED is not None:
-        random.seed(RANDOM_SEED)
+def derive_output_path(input_path: Path) -> Path:
+    """Return '<stem>-more-tools.json' in the same directory as input_path."""
+    return input_path.parent / (input_path.stem + "-more-tools.json")
 
-    input_path = Path(INPUT_FILE)
-    output_path = Path(OUTPUT_FILE)
 
-    if not input_path.exists():
-        print(f"Error: input file not found -> {input_path}", file=sys.stderr)
-        sys.exit(1)
+def process_file(input_path: Path, output_path: Path):
+    """Run the full two-pass pipeline for a single input/output pair."""
+    print(f"\n[{input_path.name}]")
 
-    print("Phase 1: scanning items with tools...")
+    print("  Phase 1: scanning items with tools...")
     pool = scan_tools_pool(input_path)
     total_with_tools = len(pool)
     print(f"  Found {total_with_tools} items with valid tools")
 
     if total_with_tools == 0:
-        print("No items with tools found; nothing to do.")
+        print("  No items with tools found; skipping.")
         return
 
     tools_by_index = build_tools_by_index(pool)
 
-    print("Phase 2: processing and writing output file...")
+    print("  Phase 2: processing and writing output file...")
     process_and_write(input_path, output_path, tools_by_index)
-    print(f"Done. Output file -> {output_path}")
+    print(f"  Done. Output -> {output_path}")
+
+
+def main():
+    if RANDOM_SEED is not None:
+        random.seed(RANDOM_SEED)
+
+    errors = []
+    for input_str in INPUT_FILES:
+        input_path = Path(input_str)
+        if not input_path.exists():
+            print(f"Error: input file not found -> {input_path}", file=sys.stderr)
+            errors.append(input_path)
+            continue
+        output_path = derive_output_path(input_path)
+        process_file(input_path, output_path)
+
+    if errors:
+        print(f"\n{len(errors)} file(s) were skipped due to missing input.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

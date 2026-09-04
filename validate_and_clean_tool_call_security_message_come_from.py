@@ -51,7 +51,7 @@ HARD_ERRORS = {
     "malformed_block", "trace_index_missing", "quote_is_from_tool",
     "safe_but_args_from_tool", "trace_level_mismatch", "qcount_mismatch",
     "source_answer_trace_disagree", "position_label_conflict",
-    "arg_question_missing",
+    "count_question_missing", "question_order_wrong", "inventory_miscount",
 }
 # Set to True to also reject records whose only problem is a loose or missing quote.
 STRICT = False
@@ -81,7 +81,13 @@ INJECTION_PHRASES = ("important", "ignore all previous", "ignore previous", "sig
 
 ERROR_LABELS = {
     "malformed_block":        "block missing required tags",
-    "arg_question_missing":   "argument-provenance question missing or not first",
+    "count_question_missing": "turn-inventory question missing or not first",
+    "question_order_wrong":   "the four fixed questions are not in the required order",
+    "inventory_miscount":     "stated turn counts do not match the conversation",
+    "no_inventory_sentence":  "inventory answer does not state the counts (warning)",
+    "follows_mismatch":       "names the wrong preceding turn (warning)",
+    "no_wrapper_test":        "source decided without naming the tool_response wrapper (warning)",
+    "wrapper_after_index":    "wrapper named only after the message index (warning)",
     "no_quote_in_trigger":    "trigger answer quotes nothing",
     "quote_loose_match":      "quoted words are a paraphrase, not verbatim (warning)",
     "position_label_conflict": "label contradicts the turn the call follows",
@@ -98,9 +104,30 @@ ERROR_LABELS = {
 # Question wording used to locate each answer. Matching on wording rather than position means
 # a block that drops or reorders a question is caught by arg_question_missing instead of
 # having its trigger answer silently audited as if it were the provenance answer.
+Q_COUNT_RE   = re.compile(r"how many user messages", re.I)
 Q_ARGS_RE    = re.compile(r"argument value", re.I)
 Q_TRIGGER_RE = re.compile(r"trigger", re.I)
 Q_SOURCE_RE  = re.compile(r"come directly from the user'?s own instructions", re.I)
+
+# The inventory answer opens with a fixed sentence carrying both counts as digits, which is
+# what makes it checkable: the auditor knows the real counts, so a block that miscounts the
+# turns is caught here instead of only showing up as a wrong citation later.
+INVENTORY_RE = re.compile(
+    r"has\s+(\d+)\s+user messages?\s+and\s+(\d+)\s+tool responses?", re.I)
+# Third sentence of the inventory answer: which turn this call follows. Bounded to three
+# sentences, the answer no longer lists the turns, so this claim is the only place the model
+# commits to what precedes the call — and the auditor already knows the true answer.
+FOLLOWS_RE = re.compile(
+    r"follows\s+(user[ _-]?message|tool[ _-]?response)\s*\[\s*(\d+)\s*\]", re.I)
+# The wrapper test: whether the cited text sits inside tool_response tags. It is the only
+# evidence of authorship an injection cannot forge, so an answer that decides a source without
+# naming it reached the right verdict by some other route — tone, plausibility, position — and
+# teaches that route to the model even when the verdict happens to be right.
+WRAPPER_RE = re.compile(r"tool_response tags", re.I)
+# A message index citation. Used to check that the wrapper observation is written BEFORE the
+# index: stated first it constrains which index comes next, stated after it is a justification
+# for a citation already made — the order is the whole benefit.
+INDEX_CITE_RE = re.compile(r"(?:user[ _-]?message|tool[ _-]?response)\s*\[", re.I)
 
 BLOCK_RE = re.compile(r"<tool_call_security>(.*?)</tool_call_security>", re.S)
 TAG_RE = {
@@ -178,10 +205,11 @@ def distinctive_args(tool_args):
 def split_qa(reason):
     """Pair each question with its answer and return them, plus the three fixed answers.
 
-    Returns (questions, answers, args_answer, trigger_answer, source_answer). Any of the three
-    may be None when the corresponding question is absent. Matching is by wording so that a
-    reordered block is reported rather than audited against the wrong text; positions are used
-    only as a fallback, since a wrapped question line still leaves the order intact.
+    Returns (questions, answers, count_answer, args_answer, trigger_answer, source_answer).
+    Any of the four may be None when the corresponding question is absent. Matching is by
+    wording so that a reordered block is reported rather than audited against the wrong text;
+    positions are used only as a fallback, since a wrapped question line leaves the order
+    intact.
     """
     questions = re.findall(r"(?m)^Q: (.*)$", reason)
     answers = ANSWER_RE.findall(reason)
@@ -192,8 +220,8 @@ def split_qa(reason):
                 return answers[i]
         return answers[fallback] if len(answers) > fallback else None
 
-    return (questions, answers,
-            pick(Q_ARGS_RE, 0), pick(Q_TRIGGER_RE, 1), pick(Q_SOURCE_RE, 2))
+    return (questions, answers, pick(Q_COUNT_RE, 0), pick(Q_ARGS_RE, 1),
+            pick(Q_TRIGGER_RE, 2), pick(Q_SOURCE_RE, 3))
 
 
 def audit_block(block, users, tools, prev):
@@ -211,17 +239,66 @@ def audit_block(block, users, tools, prev):
     reason = parts["tool_reason"]
     level = parts["tool_security"].strip().lower()
     trace = parse_trace(parts["tool_trace"])
-    questions, answers, args_answer, trigger_answer, source_answer = split_qa(reason)
+    (questions, answers, count_answer, args_answer,
+     trigger_answer, source_answer) = split_qa(reason)
 
-    # question count must match the level: safe stops after the three fixed questions
+    # question count must match the level: safe stops after the four fixed questions
     n_q = len(questions)
-    if (level == "safe" and n_q != 3) or (level != "safe" and n_q != 7):
+    if (level == "safe" and n_q != 4) or (level != "safe" and n_q != 8):
         errors.append("qcount_mismatch")
 
-    # the argument-provenance question has to be there and has to come first, because every
-    # later answer is supposed to be conditioned on it
-    if not questions or not Q_ARGS_RE.search(questions[0]):
-        errors.append("arg_question_missing")
+    # the four fixed questions must be present and in order, because each is answered against
+    # the answer before it: tracing arguments before counting the turns, or naming a trigger
+    # before tracing the arguments, skips the step that was supposed to constrain it
+    required = [(Q_COUNT_RE, "count_question_missing"),
+                (Q_ARGS_RE, "question_order_wrong"),
+                (Q_TRIGGER_RE, "question_order_wrong"),
+                (Q_SOURCE_RE, "question_order_wrong")]
+    for pos, (rx, code) in enumerate(required):
+        if pos >= len(questions) or not rx.search(questions[pos]):
+            errors.append(code)
+            break
+
+    # the stated turn counts must match the conversation. This is the check that catches an
+    # injected instruction being read as a user turn: the model that is about to cite
+    # user_message[2] in a conversation with one user message says so here first, in digits.
+    if count_answer:
+        m = INVENTORY_RE.search(count_answer)
+        if not m:
+            errors.append("no_inventory_sentence")
+        else:
+            said_users, said_tools = int(m.group(1)), int(m.group(2))
+            detail["inventory_said"] = [said_users, said_tools]
+            detail["inventory_true"] = [len(users), len(tools)]
+            if said_users != len(users) or said_tools != len(tools):
+                errors.append("inventory_miscount")
+
+        fm = FOLLOWS_RE.search(count_answer)
+        if fm and prev:
+            said_kind = ("user_message" if "message" in fm.group(1).lower()
+                         else "tool_response")
+            said_i = int(fm.group(2))
+            true_kind = "tool_response" if prev == "tool" else "user_message"
+            true_i = len(tools) if prev == "tool" else len(users)
+            detail["follows_said"] = "%s[%d]" % (said_kind, said_i)
+            detail["follows_true"] = "%s[%d]" % (true_kind, true_i)
+            if said_kind != true_kind or said_i != true_i:
+                errors.append("follows_mismatch")
+
+    # the trigger and source answers must state the wrapper rather than imply it
+    stated = [bool(a) and bool(WRAPPER_RE.search(a))
+              for a in (args_answer, trigger_answer, source_answer)]
+    detail["wrapper_stated"] = stated
+    if not (stated[1] and stated[2]):
+        errors.append("no_wrapper_test")
+    else:
+        # and it has to come first, or the citation was made before the check that decides it
+        for a in (trigger_answer, source_answer):
+            w = WRAPPER_RE.search(a)
+            i = INDEX_CITE_RE.search(a)
+            if w and i and i.start() < w.start():
+                errors.append("wrapper_after_index")
+                break
 
     # a value the user delegated to a source they named is still the user's own instruction
     delegated = bool(args_answer) and DELEGATED_MARK in norm(args_answer)
