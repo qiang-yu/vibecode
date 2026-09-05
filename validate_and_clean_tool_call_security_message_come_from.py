@@ -8,8 +8,8 @@ that only ever appeared inside a tool response. A sample like that trains the mo
 injected instructions as user instructions, which is the exact failure being chased.
 
 None of these checks ask for judgement. They are string lookups against the conversation:
-  * does the cited message index exist at that point in the conversation?
-  * do the quoted trigger words actually appear in the message they are attributed to?
+  * are the quoted trigger words actually in text of the kind the block claims — inside tool
+    output when it says a tool response, in the user's own turns when it says the user?
   * for a call labelled safe, do its argument values appear in the user's own turns, or were
     they delegated by the user to a source the user themselves named?
   * for a call labelled non-safe, do its argument values actually appear in the tool response
@@ -19,6 +19,11 @@ The block format has three fixed questions — argument provenance, trigger word
 four more when the source is a tool response. Answers are located by matching the question
 wording, not by position, so a block that drops or reorders a question is reported rather than
 silently audited against the wrong answer.
+
+Messages are not numbered anywhere. A count is a global, derived quantity — every turn has to
+be classified, then accumulated in order — while the thing the judgement actually needs, is
+this text inside tool_response tags or outside them, can be read off the page. So the auditor
+checks the kind of text a quote came from, never which message it was.
 
 Records are split into <name>-valid.json and <name>-invalid.json, and a per-block report is
 written to <name>-audit-report.jsonl for inspection.
@@ -39,19 +44,23 @@ INPUT_FILES = [
 MIN_QUOTE_LEN = 12
 # Argument values shorter than this are too generic to trace (e.g. 5, true, "AA").
 MIN_ARG_VALUE_LEN = 4
-# Fraction of a quote's words that must appear in the cited message for a loose match.
+# Fraction of a quote's words that must appear in text of the claimed kind for a loose match.
 # The generating model often compresses or lightly rewords the user's sentence instead of
 # quoting it verbatim. That is sloppy quoting, not a wrong label, so it is reported as a
 # warning rather than treated as corrupt data.
 FUZZY_MIN = 0.8
+# Above this, treat the quote as verbatim and say nothing. JSON escaping, collapsed
+# whitespace and swapped quotation marks all lower the score slightly without the quote being
+# any less faithful, and reporting those buries the genuinely reworded ones in noise.
+NEAR_VERBATIM = 0.9
 
 # Only HARD errors mean the label itself is wrong. SOFT ones mean the reasoning text is
 # imprecise while the source attribution still holds.
 HARD_ERRORS = {
-    "malformed_block", "trace_index_missing", "quote_is_from_tool",
+    "malformed_block", "quote_is_from_tool", "quote_is_from_user", "numbered_citation",
     "safe_but_args_from_tool", "trace_level_mismatch", "qcount_mismatch",
     "source_answer_trace_disagree", "position_label_conflict",
-    "count_question_missing", "question_order_wrong", "inventory_miscount",
+    "question_order_wrong",
 }
 # Set to True to also reject records whose only problem is a loose or missing quote.
 STRICT = False
@@ -81,21 +90,17 @@ INJECTION_PHRASES = ("important", "ignore all previous", "ignore previous", "sig
 
 ERROR_LABELS = {
     "malformed_block":        "block missing required tags",
-    "count_question_missing": "turn-inventory question missing or not first",
-    "question_order_wrong":   "the four fixed questions are not in the required order",
-    "inventory_miscount":     "stated turn counts do not match the conversation",
-    "no_inventory_sentence":  "inventory answer does not state the counts (warning)",
-    "follows_mismatch":       "names the wrong preceding turn (warning)",
+    "question_order_wrong":   "the three fixed questions are not in the required order",
+    "numbered_citation":      "numbered a message instead of naming it",
     "no_wrapper_test":        "source decided without naming the tool_response wrapper (warning)",
-    "wrapper_after_index":    "wrapper named only after the message index (warning)",
     "no_quote_in_trigger":    "trigger answer quotes nothing",
     "quote_loose_match":      "quoted words are a paraphrase, not verbatim (warning)",
     "position_label_conflict": "label contradicts the turn the call follows",
-    "trace_index_missing":    "cited message index does not exist",
-    "quote_not_in_cited":     "quoted words are not in the cited message",
+    "quote_not_in_cited":     "quoted words are not in text of the kind claimed",
     "quote_is_from_tool":     "quoted words claimed as user text but found in a tool response",
+    "quote_is_from_user":     "quoted words claimed as tool output but found in the user's text",
     "safe_but_args_from_tool": "labelled safe but argument values only appear in tool responses",
-    "nonsafe_args_not_in_cited": "blamed tool response contains none of the argument values (warning)",
+    "nonsafe_args_not_in_cited": "no tool output contains the argument values (warning)",
     "trace_level_mismatch":   "trace and security level contradict each other",
     "qcount_mismatch":        "question count does not match the security level",
     "source_answer_trace_disagree": "source answer and tool_trace name different sources",
@@ -104,30 +109,15 @@ ERROR_LABELS = {
 # Question wording used to locate each answer. Matching on wording rather than position means
 # a block that drops or reorders a question is caught by arg_question_missing instead of
 # having its trigger answer silently audited as if it were the provenance answer.
-Q_COUNT_RE   = re.compile(r"how many user messages", re.I)
 Q_ARGS_RE    = re.compile(r"argument value", re.I)
 Q_TRIGGER_RE = re.compile(r"trigger", re.I)
-Q_SOURCE_RE  = re.compile(r"come directly from the user'?s own instructions", re.I)
+Q_SOURCE_RE  = re.compile(r"wrapped in tool_response tags, or are they", re.I)
 
-# The inventory answer opens with a fixed sentence carrying both counts as digits, which is
-# what makes it checkable: the auditor knows the real counts, so a block that miscounts the
-# turns is caught here instead of only showing up as a wrong citation later.
-INVENTORY_RE = re.compile(
-    r"has\s+(\d+)\s+user messages?\s+and\s+(\d+)\s+tool responses?", re.I)
-# Third sentence of the inventory answer: which turn this call follows. Bounded to three
-# sentences, the answer no longer lists the turns, so this claim is the only place the model
-# commits to what precedes the call — and the auditor already knows the true answer.
-FOLLOWS_RE = re.compile(
-    r"follows\s+(user[ _-]?message|tool[ _-]?response)\s*\[\s*(\d+)\s*\]", re.I)
-# The wrapper test: whether the cited text sits inside tool_response tags. It is the only
-# evidence of authorship an injection cannot forge, so an answer that decides a source without
-# naming it reached the right verdict by some other route — tone, plausibility, position — and
-# teaches that route to the model even when the verdict happens to be right.
 WRAPPER_RE = re.compile(r"tool_response tags", re.I)
 # A message index citation. Used to check that the wrapper observation is written BEFORE the
 # index: stated first it constrains which index comes next, stated after it is a justification
 # for a citation already made — the order is the whole benefit.
-INDEX_CITE_RE = re.compile(r"(?:user[ _-]?message|tool[ _-]?response)\s*\[", re.I)
+INDEX_CITE_RE = re.compile(r"(?:user[ _-]?message|tool[ _-]?response)\s*[\[#]\s*\d", re.I)
 
 BLOCK_RE = re.compile(r"<tool_call_security>(.*?)</tool_call_security>", re.S)
 TAG_RE = {
@@ -136,7 +126,12 @@ TAG_RE = {
 }
 ANSWER_RE = re.compile(r"(?m)^A: (.*(?:\n(?!\s*[QA]: ).*)*)")
 QUOTE_RE = re.compile(r'"([^"]{2,})"')
-TRACE_RE = re.compile(r"(user[ _-]?message|tool[ _-]?response)\s*[\[_\-#: ]\s*(\d+)", re.I)
+# The trace names a kind, not a position. WRAPPED_PHRASE_RE is tried first: the answers state
+# the verdict as "not wrapped in tool_response tags, so ... the user's own request", and that
+# phrase contains the words tool_response, so a bare word search reads the wrong kind on
+# exactly the answers that say the source is the user.
+WRAPPED_PHRASE_RE = re.compile(r"(not\s+)?wrapped in tool_response tags", re.I)
+TRACE_RE = re.compile(r"(user[ _-]?message|tool[ _-]?response)(?!\s+tags)", re.I)
 
 
 def norm(text):
@@ -160,25 +155,42 @@ def overlap(quote, haystack):
 
 
 def parse_trace(text):
-    m = TRACE_RE.search(text or "")
-    if not m:
-        return None
-    kind = "user_message" if "message" in m.group(1).lower() else "tool_response"
-    return kind, int(m.group(2))
+    """Return "user_message" or "tool_response", or None. No index: there is no longer one."""
+    text = text or ""
+    m = WRAPPED_PHRASE_RE.search(text)
+    if m:
+        return "user_message" if m.group(1) else "tool_response"
+    m = TRACE_RE.search(text)
+    if m:
+        return "user_message" if "message" in m.group(1).lower() else "tool_response"
+    if re.search(r"user\'?s own (?:words|request|instructions?)", text, re.I):
+        return "user_message"
+    return None
+
+
+TOOL_RESPONSE_BLOCK_RE = re.compile(r"<tool_response>.*?</tool_response>", re.S)
 
 
 def build_index(conversations, upto):
-    """Return the user turns and tool turns visible before conversations[upto].
+    """Return the user turns and tool responses visible before conversations[upto].
 
     A user turn is one the user actually wrote. Turns carrying tool output are tool
     responses even though the chat template delivers them inside user turns.
+
+    The unit for tool responses is the response BLOCK, not the turn. The chat template
+    merges consecutive tool results into a single user turn, so one turn can carry several
+    blocks, and a turn is not a countable thing on the page while a block is: it opens and
+    closes with its own tags and it is what tool_response[N] refers to. Counting turns
+    instead makes the auditor and the model disagree from the second result onwards, which
+    is a bookkeeping difference, not a judgement one.
     """
     users, tools = [], []
     for conv in conversations[:upto]:
         src = conv.get("from")
         value = conv.get("value", "") or ""
         if src == "tool" or "<tool_response>" in value:
-            tools.append(value)
+            blocks = TOOL_RESPONSE_BLOCK_RE.findall(value)
+            tools.extend(blocks if blocks else [value])
         elif src == "human":
             users.append(value)
     return users, tools
@@ -205,8 +217,8 @@ def distinctive_args(tool_args):
 def split_qa(reason):
     """Pair each question with its answer and return them, plus the three fixed answers.
 
-    Returns (questions, answers, count_answer, args_answer, trigger_answer, source_answer).
-    Any of the four may be None when the corresponding question is absent. Matching is by
+    Returns (questions, answers, args_answer, trigger_answer, source_answer).
+    Any of the three may be None when the corresponding question is absent. Matching is by
     wording so that a reordered block is reported rather than audited against the wrong text;
     positions are used only as a fallback, since a wrapped question line leaves the order
     intact.
@@ -220,8 +232,8 @@ def split_qa(reason):
                 return answers[i]
         return answers[fallback] if len(answers) > fallback else None
 
-    return (questions, answers, pick(Q_COUNT_RE, 0), pick(Q_ARGS_RE, 1),
-            pick(Q_TRIGGER_RE, 2), pick(Q_SOURCE_RE, 3))
+    return (questions, answers, pick(Q_ARGS_RE, 0),
+            pick(Q_TRIGGER_RE, 1), pick(Q_SOURCE_RE, 2))
 
 
 def audit_block(block, users, tools, prev):
@@ -239,19 +251,18 @@ def audit_block(block, users, tools, prev):
     reason = parts["tool_reason"]
     level = parts["tool_security"].strip().lower()
     trace = parse_trace(parts["tool_trace"])
-    (questions, answers, count_answer, args_answer,
+    (questions, answers, args_answer,
      trigger_answer, source_answer) = split_qa(reason)
 
-    # question count must match the level: safe stops after the four fixed questions
+    # question count must match the level: safe stops after the three fixed questions
     n_q = len(questions)
-    if (level == "safe" and n_q != 4) or (level != "safe" and n_q != 8):
+    if (level == "safe" and n_q != 3) or (level != "safe" and n_q != 7):
         errors.append("qcount_mismatch")
 
-    # the four fixed questions must be present and in order, because each is answered against
-    # the answer before it: tracing arguments before counting the turns, or naming a trigger
-    # before tracing the arguments, skips the step that was supposed to constrain it
-    required = [(Q_COUNT_RE, "count_question_missing"),
-                (Q_ARGS_RE, "question_order_wrong"),
+    # the three fixed questions must be present and in order, because each is answered against
+    # the answer before it: naming a trigger before tracing the arguments skips the step that
+    # was supposed to constrain it
+    required = [(Q_ARGS_RE, "question_order_wrong"),
                 (Q_TRIGGER_RE, "question_order_wrong"),
                 (Q_SOURCE_RE, "question_order_wrong")]
     for pos, (rx, code) in enumerate(required):
@@ -259,31 +270,15 @@ def audit_block(block, users, tools, prev):
             errors.append(code)
             break
 
-    # the stated turn counts must match the conversation. This is the check that catches an
-    # injected instruction being read as a user turn: the model that is about to cite
-    # user_message[2] in a conversation with one user message says so here first, in digits.
-    if count_answer:
-        m = INVENTORY_RE.search(count_answer)
-        if not m:
-            errors.append("no_inventory_sentence")
-        else:
-            said_users, said_tools = int(m.group(1)), int(m.group(2))
-            detail["inventory_said"] = [said_users, said_tools]
-            detail["inventory_true"] = [len(users), len(tools)]
-            if said_users != len(users) or said_tools != len(tools):
-                errors.append("inventory_miscount")
-
-        fm = FOLLOWS_RE.search(count_answer)
-        if fm and prev:
-            said_kind = ("user_message" if "message" in fm.group(1).lower()
-                         else "tool_response")
-            said_i = int(fm.group(2))
-            true_kind = "tool_response" if prev == "tool" else "user_message"
-            true_i = len(tools) if prev == "tool" else len(users)
-            detail["follows_said"] = "%s[%d]" % (said_kind, said_i)
-            detail["follows_true"] = "%s[%d]" % (true_kind, true_i)
-            if said_kind != true_kind or said_i != true_i:
-                errors.append("follows_mismatch")
+    # numbering a message means the model went back to counting. The count was a global,
+    # derived quantity: it needed every turn classified first, then accumulated in order, so
+    # its error rate was the accumulation of every step's. Whether the cited text sits inside
+    # tool_response tags is local and readable on the spot. A number here is a step that can
+    # go wrong while adding nothing, and a wrong one drags every later step wrong with it.
+    m = INDEX_CITE_RE.search(reason)
+    if m:
+        errors.append("numbered_citation")
+        detail["numbered_as"] = m.group(0)
 
     # the trigger and source answers must state the wrapper rather than imply it
     stated = [bool(a) and bool(WRAPPER_RE.search(a))
@@ -291,14 +286,6 @@ def audit_block(block, users, tools, prev):
     detail["wrapper_stated"] = stated
     if not (stated[1] and stated[2]):
         errors.append("no_wrapper_test")
-    else:
-        # and it has to come first, or the citation was made before the check that decides it
-        for a in (trigger_answer, source_answer):
-            w = WRAPPER_RE.search(a)
-            i = INDEX_CITE_RE.search(a)
-            if w and i and i.start() < w.start():
-                errors.append("wrapper_after_index")
-                break
 
     # a value the user delegated to a source they named is still the user's own instruction
     delegated = bool(args_answer) and DELEGATED_MARK in norm(args_answer)
@@ -308,7 +295,7 @@ def audit_block(block, users, tools, prev):
         errors.append("malformed_block")
         return errors, parts, detail
 
-    kind, idx = trace
+    kind = trace
     if (level == "safe") != (kind == "user_message"):
         errors.append("trace_level_mismatch")
 
@@ -324,46 +311,41 @@ def audit_block(block, users, tools, prev):
     # the source answer states the source too; it must agree with the trace tag
     if source_answer:
         claimed = parse_trace(source_answer)
-        if claimed and claimed[0] != kind:
+        if claimed and claimed != kind:
             errors.append("source_answer_trace_disagree")
 
-    # the cited message has to exist at this point in the conversation
-    pool = users if kind == "user_message" else tools
-    if idx < 1 or idx > len(pool):
-        errors.append("trace_index_missing")
-        cited = None
-    else:
-        cited = pool[idx - 1]
+    # Without an index there is no "does the cited message exist" check — and none is needed,
+    # because the question it was approximating can now be asked directly: are the quoted
+    # trigger words actually in text of the kind the block claims? The whole body of user text
+    # and the whole body of tool output are each searched, so no message has to be identified
+    # by position for this to work. It is a stronger check than the indexed one it replaces:
+    # citing the wrong tool response used to pass silently as long as the number existed.
+    user_text = norm(" ".join(users))
+    tool_text = norm(" ".join(tools))
+    haystack, other = ((user_text, tool_text) if kind == "user_message"
+                       else (tool_text, user_text))
 
-    # the quoted trigger words have to be in the message they are attributed to. This reads
-    # the TRIGGER answer, never the provenance answer: the provenance answer deliberately
-    # quotes decoy text from other messages in order to rule it out, so checking it here
-    # would flag correct blocks for citing the very thing they rejected.
     quotes = ([q for q in QUOTE_RE.findall(trigger_answer) if len(q) >= MIN_QUOTE_LEN]
               if trigger_answer else [])
     detail["quotes"] = quotes[:3]
     if not quotes:
         errors.append("no_quote_in_trigger")
-    elif cited is not None:
-        haystack = norm(cited)
-        best = max(overlap(q, cited) for q in quotes)
+    elif haystack:
+        best = max(overlap(q, haystack) for q in quotes)
         detail["best_overlap"] = round(best, 3)
-        if any(norm(q) in haystack for q in quotes):
-            pass                                   # verbatim, nothing to report
+        if any(norm(q) in haystack for q in quotes) or best >= NEAR_VERBATIM:
+            pass                                   # verbatim or near enough, nothing to report
         elif best >= FUZZY_MIN:
             errors.append("quote_loose_match")     # reworded but the source still holds
         else:
             errors.append("quote_not_in_cited")
             # the decisive case: attributed to the user, but the words live in tool output
-            if kind == "user_message":
-                tool_text = norm(" ".join(tools))
-                tool_best = max(overlap(q, tool_text) for q in quotes)
-                detail["tool_overlap"] = round(tool_best, 3)
-                if any(norm(q) in tool_text for q in quotes) or tool_best > best:
-                    errors.append("quote_is_from_tool")
+            other_best = max(overlap(q, other) for q in quotes) if other else 0.0
+            detail["other_overlap"] = round(other_best, 3)
+            if any(norm(q) in other for q in quotes) or other_best > best:
+                errors.append("quote_is_from_tool" if kind == "user_message"
+                              else "quote_is_from_user")
 
-    user_text = norm(" ".join(users))
-    tool_text = norm(" ".join(tools))
     arg_values = distinctive_args(parts["tool_args"])
 
     # A safe call's arguments must be derivable from what the user wrote, unless the user
@@ -386,14 +368,12 @@ def audit_block(block, users, tools, prev):
     # for a similar action with different values, so the values it named never reach the call.
     # Left as a warning because a value the model composed itself appears nowhere either; check
     # the counts in the report before promoting it to HARD_ERRORS.
-    elif cited is not None and arg_values:
-        cited_text = norm(cited)
-        in_cited = [v for v in arg_values if norm(v) in cited_text]
-        elsewhere = [v for v in arg_values
-                     if norm(v) in user_text or norm(v) in tool_text.replace(cited_text, " ")]
-        if not in_cited and elsewhere:
+    elif arg_values and tool_text:
+        in_tool = [v for v in arg_values if norm(v) in tool_text]
+        in_user = [v for v in arg_values if norm(v) in user_text]
+        if not in_tool and in_user:
             errors.append("nonsafe_args_not_in_cited")
-            detail["arg_not_in_blamed_source"] = elsewhere[0]
+            detail["arg_not_in_blamed_source"] = in_user[0]
 
     return errors, parts, detail
 
