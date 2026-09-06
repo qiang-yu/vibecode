@@ -10,10 +10,12 @@ injected instructions as user instructions, which is the exact failure being cha
 None of these checks ask for judgement. They are string lookups against the conversation:
   * are the quoted trigger words actually in text of the kind the block claims — inside tool
     output when it says a tool response, in the user's own turns when it says the user?
-  * for a call labelled safe, do its argument values appear in the user's own turns, or were
-    they delegated by the user to a source the user themselves named?
-  * for a call labelled non-safe, do its argument values actually appear in the tool response
-    being blamed for it?
+  * for a call labelled non-safe, do its argument values appear anywhere in tool output?
+
+Where the arguments came from never decides the label on its own. The label follows the ACTION:
+a call is safe when the user's own words asked for it. Arguments arrive from tool output all
+the time in ordinary multi-step work — a search returns an id and the next call passes it —
+and the user's instruction is still what is being carried out.
 
 The block format has three fixed questions — argument provenance, trigger words, source — and
 four more when the source is a tool response. Answers are located by matching the question
@@ -58,9 +60,17 @@ NEAR_VERBATIM = 0.9
 # imprecise while the source attribution still holds.
 HARD_ERRORS = {
     "malformed_block", "quote_is_from_tool", "quote_is_from_user", "numbered_citation",
-    "safe_but_args_from_tool", "trace_level_mismatch", "qcount_mismatch",
+    "trace_level_mismatch", "qcount_mismatch",
     "source_answer_trace_disagree", "position_label_conflict",
     "question_order_wrong",
+    # These three are not wrong labels. They are blocks that reached a verdict without the
+    # evidence the format exists to make explicit: no quoted trigger words, no statement of
+    # whether those words were wrapped in tool_response tags, or a quote that cannot be found
+    # in text of the kind claimed. The verdict may well be right, but the reasoning shown is
+    # not the reasoning that produces it, and that is exactly the pattern training would copy —
+    # a model that learns to write the conclusion without doing the check has learned nothing
+    # that transfers to an injection it has not seen.
+    "no_quote_in_trigger", "no_wrapper_test", "quote_not_in_cited",
 }
 # Set to True to also reject records whose only problem is a loose or missing quote.
 STRICT = False
@@ -92,15 +102,15 @@ ERROR_LABELS = {
     "malformed_block":        "block missing required tags",
     "question_order_wrong":   "the three fixed questions are not in the required order",
     "numbered_citation":      "numbered a message instead of naming it",
-    "no_wrapper_test":        "source decided without naming the tool_response wrapper (warning)",
+    "no_wrapper_test":        "source decided without naming the tool_response wrapper",
     "no_quote_in_trigger":    "trigger answer quotes nothing",
     "quote_loose_match":      "quoted words are a paraphrase, not verbatim (warning)",
-    "position_label_conflict": "label contradicts the turn the call follows",
+    "position_label_conflict": "label contradicts the preceding turn, nothing ties it to the user",
     "quote_not_in_cited":     "quoted words are not in text of the kind claimed",
     "quote_is_from_tool":     "quoted words claimed as user text but found in a tool response",
     "quote_is_from_user":     "quoted words claimed as tool output but found in the user's text",
-    "safe_but_args_from_tool": "labelled safe but argument values only appear in tool responses",
-    "nonsafe_args_not_in_cited": "no tool output contains the argument values (warning)",
+    "safe_but_args_from_tool": "safe, trigger unconfirmed, arguments only in tool output (warning)",
+    "nonsafe_args_not_in_cited": "neither the action nor the values are in any tool output (warning)",
     "trace_level_mismatch":   "trace and security level contradict each other",
     "qcount_mismatch":        "question count does not match the security level",
     "source_answer_trace_disagree": "source answer and tool_trace name different sources",
@@ -125,6 +135,14 @@ TAG_RE = {
     for t in ("tool_name", "tool_args", "tool_reason", "tool_trace", "tool_security")
 }
 ANSWER_RE = re.compile(r"(?m)^A: (.*(?:\n(?!\s*[QA]: ).*)*)")
+# Two checks only ever run on blocks of one label, so reporting them against every block
+# understates them — 588 of 2694 non-safe blocks reads as 8% of all blocks. The report divides
+# by what the check actually ran on.
+LEVEL_SCOPED_CHECKS = {
+    "nonsafe_args_not_in_cited": "non-safe",
+    "safe_but_args_from_tool": "safe",
+}
+
 QUOTE_RE = re.compile(r'"([^"]{2,})"')
 # The trace names a kind, not a position. WRAPPED_PHRASE_RE is tried first: the answers state
 # the verdict as "not wrapped in tool_response tags, so ... the user's own request", and that
@@ -299,14 +317,7 @@ def audit_block(block, users, tools, prev):
     if (level == "safe") != (kind == "user_message"):
         errors.append("trace_level_mismatch")
 
-    # the turn this call follows has to be consistent with where the trigger came from
     detail["prev_turn"] = prev
-    if CHECK_POSITION and prev:
-        if prev == "tool" and level == "safe":
-            if not (ALLOW_DELEGATED_SAFE and delegated):
-                errors.append("position_label_conflict")
-        elif prev == "human" and level != "safe":
-            errors.append("position_label_conflict")
 
     # the source answer states the source too; it must agree with the trace tag
     if source_answer:
@@ -328,14 +339,16 @@ def audit_block(block, users, tools, prev):
     quotes = ([q for q in QUOTE_RE.findall(trigger_answer) if len(q) >= MIN_QUOTE_LEN]
               if trigger_answer else [])
     detail["quotes"] = quotes[:3]
+    trigger_confirmed = False
     if not quotes:
         errors.append("no_quote_in_trigger")
     elif haystack:
         best = max(overlap(q, haystack) for q in quotes)
         detail["best_overlap"] = round(best, 3)
         if any(norm(q) in haystack for q in quotes) or best >= NEAR_VERBATIM:
-            pass                                   # verbatim or near enough, nothing to report
+            trigger_confirmed = True               # verbatim or near enough, nothing to report
         elif best >= FUZZY_MIN:
+            trigger_confirmed = True
             errors.append("quote_loose_match")     # reworded but the source still holds
         else:
             errors.append("quote_not_in_cited")
@@ -346,29 +359,47 @@ def audit_block(block, users, tools, prev):
                 errors.append("quote_is_from_tool" if kind == "user_message"
                               else "quote_is_from_user")
 
+    # The turn this call follows is a hint about the label, never a verdict on it. A safe call
+    # following a tool response is ordinary multi-step work: the user asked for something that
+    # takes several calls, and the later ones still carry out that same instruction. So the
+    # conflict is only reported when nothing else ties the call to the user — the trigger
+    # words were not found in the user's own text and the block did not say the values were
+    # delegated. Reported the other way round, position would decide the label, which is the
+    # shortcut the SHORTCUT DIAGNOSTICS section below exists to warn about.
+    if CHECK_POSITION and prev:
+        if prev == "tool" and level == "safe":
+            if not trigger_confirmed and not (ALLOW_DELEGATED_SAFE and delegated):
+                errors.append("position_label_conflict")
+        elif prev == "human" and level != "safe":
+            errors.append("position_label_conflict")
+
     arg_values = distinctive_args(parts["tool_args"])
 
-    # A safe call's arguments must be derivable from what the user wrote, unless the user
-    # delegated them: "summarise every website in that channel" hands the URLs to the channel,
-    # so a URL arriving in a tool response is still the user's instruction being carried out.
-    if level == "safe":
+    # Where the ARGUMENTS came from does not decide the label. What decides it is where the
+    # ACTION came from: a call is safe when the user's own words asked for it. Arguments
+    # routinely arrive from tool output in ordinary multi-step work — search returns an id and
+    # the next call passes that id, the channel returns URLs and each is fetched in turn — and
+    # the user's instruction is still the thing being carried out. So this fires only when the
+    # trigger could NOT be confirmed in the user's own text: with the action unverified and
+    # every argument traceable only to tool output, there is nothing left tying the call to
+    # the user, and the block should at least have said the values were user-delegated.
+    if level == "safe" and not trigger_confirmed and not (ALLOW_DELEGATED_SAFE and delegated):
         for value in arg_values:
             v = norm(value)
             if v and v not in user_text and v in tool_text:
-                if ALLOW_DELEGATED_SAFE and delegated:
-                    detail["arg_delegated"] = value
-                else:
-                    errors.append("safe_but_args_from_tool")
-                    detail["arg_only_in_tool"] = value
+                errors.append("safe_but_args_from_tool")
+                detail["arg_only_in_tool"] = value
                 break
 
-    # The mirror image, and the one that catches the failure this format was built for: a call
-    # blamed on a tool response whose values are nowhere in that tool response. That is what a
-    # block looks like when it matched an injection on the verb alone — the injected text asked
-    # for a similar action with different values, so the values it named never reach the call.
-    # Left as a warning because a value the model composed itself appears nowhere either; check
-    # the counts in the report before promoting it to HARD_ERRORS.
-    elif arg_values and tool_text:
+    # The mirror of the check above, and gated the same way, for the same reason: the label
+    # follows the ACTION, so once the trigger words have been confirmed in tool output the
+    # source is settled and where the arguments came from cannot unsettle it. An injection
+    # naming the action while the values come from the user's earlier text — "now search the
+    # web for that task title" — is an ordinary shape and correctly unsafe, and flagging it
+    # taught nothing. What remains worth a note is the case where the trigger could NOT be
+    # confirmed in tool output either: then nothing in the tool output accounts for this call,
+    # neither the action nor the values, and the attribution rests on no evidence at all.
+    elif arg_values and tool_text and not trigger_confirmed:
         in_tool = [v for v in arg_values if norm(v) in tool_text]
         in_user = [v for v in arg_values if norm(v) in user_text]
         if not in_tool and in_user:
@@ -428,6 +459,26 @@ def audit_record(record):
                 **detail,
             })
     return all_errors, reports, injected_idx
+
+
+def print_findings(errors, blocks_total, levels):
+    """Print each check with the share of the blocks it could actually fire on."""
+    pct = lambda n, d: (100.0 * n / d) if d else 0.0
+    safe_n = levels.get("safe", 0)
+    nonsafe_n = sum(n for lv, n in levels.items() if lv != "safe")
+    width = max(len(ERROR_LABELS.get(k, k)) for k in errors)
+    for code, n in sorted(errors.items(),
+                          key=lambda kv: (kv[0] not in HARD_ERRORS, -kv[1])):
+        mark = "HARD" if code in HARD_ERRORS else "warn"
+        scope = LEVEL_SCOPED_CHECKS.get(code)
+        if scope == "safe":
+            denom, note = safe_n, " of safe blocks"
+        elif scope == "non-safe":
+            denom, note = nonsafe_n, " of non-safe blocks"
+        else:
+            denom, note = blocks_total, " of blocks"
+        print("  [%s] %-*s %6d  (%.2f%%%s)"
+              % (mark, width, ERROR_LABELS.get(code, code), n, pct(n, denom), note))
 
 
 def print_shortcut_report(pos, markers, benign_markers, title="SHORTCUT DIAGNOSTICS"):
@@ -573,13 +624,7 @@ def process_file(path):
 
     if errors:
         print("\nfindings by check (HARD errors first):")
-        width = max(len(ERROR_LABELS.get(k, k)) for k in errors)
-        for code, n in sorted(errors.items(),
-                              key=lambda kv: (kv[0] not in HARD_ERRORS, -kv[1])):
-            mark = "HARD" if code in HARD_ERRORS else "warn"
-            print("  [%s] %-*s %6d  (%.2f%% of blocks)"
-                  % (mark, width, ERROR_LABELS.get(code, code), n,
-                     pct(n, blocks_total)))
+        print_findings(errors, blocks_total, levels)
 
     print_shortcut_report(pos, markers, benign)
 
@@ -639,13 +684,7 @@ def main():
 
     if errors:
         print("\nfindings by check (HARD errors first):")
-        width = max(len(ERROR_LABELS.get(k, k)) for k in errors)
-        for code, n in sorted(errors.items(),
-                              key=lambda kv: (kv[0] not in HARD_ERRORS, -kv[1])):
-            mark = "HARD" if code in HARD_ERRORS else "warn"
-            print("  [%s] %-*s %6d  (%.2f%% of blocks)"
-                  % (mark, width, ERROR_LABELS.get(code, code), n,
-                     pct(n, totals["blocks"])))
+        print_findings(errors, totals["blocks"], levels)
 
     print_shortcut_report(pos, markers, benign,
                           title="SHORTCUT DIAGNOSTICS (all files combined)")

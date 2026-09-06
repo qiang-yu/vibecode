@@ -20,7 +20,7 @@
 import json
 from openai import OpenAI
 
-VLLM_BASE_URL = "http://localhost:29001/v1"
+VLLM_BASE_URL = "http://localhost:29003/v1"
 
 # This is the LoRA module name registered in the vLLM server via
 # --lora-modules my-lora-model=/home/qiangyu/Models/FineTune/Qwen/train_20260614
