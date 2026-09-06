@@ -65,7 +65,7 @@ loss_calc_ce_tool_call_security_tag: tool_call_security
 loss_calc_ce_tool_call_security_with_security_weight: 1.0
 # Extra CE weight added on top of loss_calc_ce_tool_call_security_with_security_weight for the
 # tag tokens themselves. Set to 0.0 to disable.
-loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight: 2.0
+loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight: 10.0
 # Inner structural tags whose opening/closing tokens receive the plus-weight boost.
 # The outer tag (loss_calc_ce_tool_call_security_tag) is always included automatically.
 loss_calc_ce_tool_call_security_inner_tags:
@@ -95,14 +95,14 @@ no_security_to_security_turn_ratio: 0.0
 # ---------------------------------------------------------------------------
 stage: sft
 do_train: true
-output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260816_ce_0.0_nosecurity_2.0_tagw_8epochs_8B_nothink
+output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260906_ce_0.0_nosecurity_10.0_tagw_4epochs_8B_nothink
 overwrite_output_dir: false
 seed: 42
-num_train_epochs: 8.0
+num_train_epochs: 4.0
 gradient_checkpointing: true
 per_device_train_batch_size: 1
 per_device_eval_batch_size: 1
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 4
 learning_rate: 5.0e-05
 lr_scheduler_type: cosine
 warmup_steps: 0
