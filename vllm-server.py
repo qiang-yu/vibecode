@@ -809,6 +809,12 @@ def _is_tool_call_stop(choice: Dict) -> bool:
 
 # Below this, a fuzzy match is not trustworthy: short spans hit high similarity by accident.
 DEFENCE_FUZZY_MIN_RATIO = 0.80
+# Separator between two words of the span. It is any run of non-word characters, plus the
+# escape sequences JSON uses: a real newline inside a tool response is stored as a backslash
+# followed by the letter n, and that letter is a word character, so a plain non-word
+# separator stops dead at exactly the place a wrapped injection needs to be matched across.
+_DEFENCE_WORD_SEP = r"(?:\W|\\[nrtbf\"'])+"
+
 # Fuzzy scanning is quadratic-ish; skip it on very large tool responses.
 DEFENCE_FUZZY_MAX_CHARS = 200_000
 
@@ -842,7 +848,7 @@ def _find_trigger_span(haystack: str, needle: str) -> Optional[Tuple[int, int]]:
     if not words:
         return None
 
-    pattern = r"\W+".join(re.escape(w) for w in words)
+    pattern = _DEFENCE_WORD_SEP.join(re.escape(w) for w in words)
     m = re.search(pattern, haystack, re.IGNORECASE)
     if m:
         return m.start(), m.end()
@@ -1709,7 +1715,6 @@ def main():
     global LORA_THINK_MODE, LORA_THINK_STRING
     global TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL
     global SECURITY_DEFENCE_DEBUG, SECURITY_DEFENCE_MAX_RETRIES
-    global DEFENCE_FALLBACK_TO_IGNORE_INJECTION, FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE
     global tokenizer, _llama3_template
 
     parser = argparse.ArgumentParser(description="vllm two-phase inference proxy")
@@ -1785,12 +1790,6 @@ def main():
     parser.add_argument("--security-defence-max-retries",
                         type=int, default=None, metavar="N",
                         help=f"max base-model retries after a defence block with no remaining tool calls (default: {SECURITY_DEFENCE_MAX_RETRIES})")
-    parser.add_argument("--defence_fallback_to_ignore_injection",
-                        choices=["true", "false"], default=None, metavar="true|false",
-                        help=f"fall back to ignore-injection defence when trigger words cannot be located (default: {str(DEFENCE_FALLBACK_TO_IGNORE_INJECTION).lower()})")
-    parser.add_argument("--fuzzy_search_trigger_words_in_tool_response",
-                        choices=["true", "false"], default=None, metavar="true|false",
-                        help=f"allow fuzzy matching when locating trigger words in tool responses (default: {str(FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE).lower()})")
     parser.add_argument("--log-level",             default="info",
                         help="log level: debug/info/warning/error (default: info)")
     args = parser.parse_args()
@@ -1836,10 +1835,6 @@ def main():
         TOOL_CALL_SECURITY_DEFENCE_LEVEL = args.security_defence_level
     if args.security_defence_max_retries is not None:
         SECURITY_DEFENCE_MAX_RETRIES = args.security_defence_max_retries
-    if args.defence_fallback_to_ignore_injection is not None:
-        DEFENCE_FALLBACK_TO_IGNORE_INJECTION = args.defence_fallback_to_ignore_injection == "true"
-    if args.fuzzy_search_trigger_words_in_tool_response is not None:
-        FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE = args.fuzzy_search_trigger_words_in_tool_response == "true"
 
     # Set log level and attach a dated file handler so all output goes to both console and file.
     log_level = args.log_level.upper()
@@ -1888,8 +1883,6 @@ def main():
     log.info("  defence          : enable=%s  level=%s  debug=%s  max_retries=%d",
              TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL,
              SECURITY_DEFENCE_DEBUG, SECURITY_DEFENCE_MAX_RETRIES)
-    log.info("  fallback_ignore  : %s  fuzzy_search=%s",
-             DEFENCE_FALLBACK_TO_IGNORE_INJECTION, FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE)
     log.info("  strip security   : %s  timeout=%ds", STRIP_SECURITY_IN_HISTORY, REQUEST_TIMEOUT)
     log.info("  context window   : fetched from vllm at startup")
 
