@@ -21,7 +21,7 @@ INPUT_FILES = [
     "func-calling/Qwen3-8B/glaive-function-calling-5k-injected-direct-template-think-8b-clean-clean-tool_call_security-more-tools-clean.json",
 ]
 
-REQUIRED_SECURITY_TAGS = ["tool_name", "tool_args", "tool_reason", "tool_trace", "tool_security"]
+REQUIRED_SECURITY_TAGS = ["tool_name", "tool_args", "tool_reason", "trigger_words", "tool_trace", "tool_security"]
 
 
 def has_tool_call(text):

@@ -29,14 +29,14 @@ WELL_FORMED_BLOCK_PATTERN = re.compile(
     re.DOTALL,
 )
 
-# The five required sub-tags, in the order they must appear.
-REQUIRED_SUB_TAGS = ("tool_name", "tool_args", "tool_reason", "tool_trace", "tool_security")
+# The six required sub-tags, in the order they must appear.
+REQUIRED_SUB_TAGS = ("tool_name", "tool_args", "tool_reason", "trigger_words", "tool_trace", "tool_security")
 
-# All five sub-tags must appear in order inside a security block.
+# All six sub-tags must appear in order inside a security block.
 VALID_SECURITY_INNER_PATTERN = re.compile(
     r"<tool_name>.*?</tool_name>.*?<tool_args>.*?</tool_args>.*?"
-    r"<tool_reason>.*?</tool_reason>.*?<tool_trace>.*?</tool_trace>.*?"
-    r"<tool_security>.*?</tool_security>",
+    r"<tool_reason>.*?</tool_reason>.*?<trigger_words>.*?</trigger_words>.*?"
+    r"<tool_trace>.*?</tool_trace>.*?<tool_security>.*?</tool_security>",
     re.DOTALL,
 )
 
