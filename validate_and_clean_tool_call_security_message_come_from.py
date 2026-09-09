@@ -11,6 +11,8 @@ None of these checks ask for judgement. They are string lookups against the conv
   * are the quoted trigger words actually in text of the kind the block claims — inside tool
     output when it says a tool response, in the user's own turns when it says the user?
   * for a call labelled non-safe, do its argument values appear anywhere in tool output?
+  * are the words in <trigger_words> the ones the reasoning quoted, and can they be located
+    in the conversation — the same test the runtime defence runs before cutting them out?
 
 Where the arguments came from never decides the label on its own. The label follows the ACTION:
 a call is safe when the user's own words asked for it. Arguments arrive from tool output all
@@ -24,7 +26,7 @@ silently audited against the wrong answer.
 
 Messages are not numbered anywhere. A count is a global, derived quantity — every turn has to
 be classified, then accumulated in order — while the thing the judgement actually needs, is
-this text inside tool_response tags or outside them, can be read off the page. So the auditor
+this text inside tool response tags or outside them, can be read off the page. So the auditor
 checks the kind of text a quote came from, never which message it was.
 
 Records are split into <name>-valid.json and <name>-invalid.json, and a per-block report is
@@ -65,12 +67,17 @@ HARD_ERRORS = {
     "question_order_wrong",
     # These three are not wrong labels. They are blocks that reached a verdict without the
     # evidence the format exists to make explicit: no quoted trigger words, no statement of
-    # whether those words were wrapped in tool_response tags, or a quote that cannot be found
+    # whether those words were wrapped in tool response tags, or a quote that cannot be found
     # in text of the kind claimed. The verdict may well be right, but the reasoning shown is
     # not the reasoning that produces it, and that is exactly the pattern training would copy —
     # a model that learns to write the conclusion without doing the check has learned nothing
     # that transfers to an injection it has not seen.
     "no_quote_in_trigger", "no_wrapper_test", "quote_not_in_cited",
+    # The tag the runtime defence depends on. If it is absent, describes the trigger instead
+    # of quoting it, or names words that are nowhere in the conversation, the defence has
+    # nothing to cut out and falls back to leaving the injection in place. A block like that
+    # teaches the model to produce a tag that cannot be acted on.
+    "trigger_words_missing", "trigger_words_not_quoted", "trigger_words_not_locatable",
 }
 # Set to True to also reject records whose only problem is a loose or missing quote.
 STRICT = False
@@ -102,7 +109,10 @@ ERROR_LABELS = {
     "malformed_block":        "block missing required tags",
     "question_order_wrong":   "the three fixed questions are not in the required order",
     "numbered_citation":      "numbered a message instead of naming it",
-    "no_wrapper_test":        "source decided without naming the tool_response wrapper",
+    "trigger_words_missing":  "<trigger_words> empty or too short to locate anything",
+    "trigger_words_not_quoted": "<trigger_words> is not the span quoted in the reasoning",
+    "trigger_words_not_locatable": "<trigger_words> cannot be found in the conversation",
+    "no_wrapper_test":        "source decided without naming the tool response wrapper",
     "no_quote_in_trigger":    "trigger answer quotes nothing",
     "quote_loose_match":      "quoted words are a paraphrase, not verbatim (warning)",
     "position_label_conflict": "label contradicts the preceding turn, nothing ties it to the user",
@@ -121,18 +131,60 @@ ERROR_LABELS = {
 # having its trigger answer silently audited as if it were the provenance answer.
 Q_ARGS_RE    = re.compile(r"argument value", re.I)
 Q_TRIGGER_RE = re.compile(r"trigger", re.I)
-Q_SOURCE_RE  = re.compile(r"wrapped in tool_response tags, or are they", re.I)
+Q_SOURCE_RE  = re.compile(r"wrapped in tool response tags, or are they", re.I)
 
-WRAPPER_RE = re.compile(r"tool_response tags", re.I)
+WRAPPER_RE = re.compile(r"tool response tags", re.I)
 # A message index citation. Used to check that the wrapper observation is written BEFORE the
 # index: stated first it constrains which index comes next, stated after it is a justification
 # for a citation already made — the order is the whole benefit.
 INDEX_CITE_RE = re.compile(r"(?:user[ _-]?message|tool[ _-]?response)\s*[\[#]\s*\d", re.I)
 
+# Shortest span that can locate anything: below this the tag points at nothing that could be
+# cut out of a conversation.
+MIN_TRIGGER_LEN = 10
+
+# Separator between two words of the span. It is any run of non-word characters, plus the
+# escape sequences JSON uses: a real newline inside a tool response is stored as a backslash
+# followed by the letter n, and that letter is a word character, so a plain non-word
+# separator stops dead at exactly the place a wrapped injection needs to be matched across.
+WORD_SEP = r"(?:\W|\\[nrtbf\"'])+"
+
+
+def locate_exactly(haystack, needle):
+    """True when the words are findable in the text by exact means.
+
+    This is deliberately the same ladder the runtime defence uses, minus its optional fuzzy
+    rung: a plain substring, then the same words in the same order with any run of non-word
+    characters between them, which absorbs line wrapping and changed punctuation without ever
+    matching a different word. Auditing with the same test the defence runs means this check
+    answers the question that matters — would the injection actually have been removed?
+    """
+    if not haystack or not needle:
+        return False
+    if needle in haystack:
+        return True
+    words = re.findall(r"\w+", needle)
+    if not words:
+        return False
+    return bool(re.search(WORD_SEP.join(re.escape(w) for w in words), haystack, re.I))
+
+
+def same_span(span, body):
+    """True when the reasoning quotes this span, allowing for wrapping and punctuation.
+
+    Order is not relaxed. A word-set test would accept "the search request" against any
+    reasoning containing those three words, and a description cannot be cut out of anything.
+    """
+    flatten = lambda t: " ".join(re.sub(r"[^0-9a-z]+", " ", t.lower()).split())
+    span, body = flatten(span), flatten(body)
+    return bool(span) and span in body
+
+
 BLOCK_RE = re.compile(r"<tool_call_security>(.*?)</tool_call_security>", re.S)
 TAG_RE = {
     t: re.compile(r"<%s>(.*?)</%s>" % (t, t), re.S)
-    for t in ("tool_name", "tool_args", "tool_reason", "tool_trace", "tool_security")
+    for t in ("tool_name", "tool_args", "tool_reason", "trigger_words", "tool_trace",
+              "tool_security")
 }
 ANSWER_RE = re.compile(r"(?m)^A: (.*(?:\n(?!\s*[QA]: ).*)*)")
 # Two checks only ever run on blocks of one label, so reporting them against every block
@@ -145,10 +197,10 @@ LEVEL_SCOPED_CHECKS = {
 
 QUOTE_RE = re.compile(r'"([^"]{2,})"')
 # The trace names a kind, not a position. WRAPPED_PHRASE_RE is tried first: the answers state
-# the verdict as "not wrapped in tool_response tags, so ... the user's own request", and that
-# phrase contains the words tool_response, so a bare word search reads the wrong kind on
+# the verdict as "not wrapped in tool response tags, so ... the user's own request", and that
+# phrase contains the words tool response, so a bare word search reads the wrong kind on
 # exactly the answers that say the source is the user.
-WRAPPED_PHRASE_RE = re.compile(r"(not\s+)?wrapped in tool_response tags", re.I)
+WRAPPED_PHRASE_RE = re.compile(r"(not\s+)?wrapped in tool response tags", re.I)
 TRACE_RE = re.compile(r"(user[ _-]?message|tool[ _-]?response)(?!\s+tags)", re.I)
 
 
@@ -291,7 +343,7 @@ def audit_block(block, users, tools, prev):
     # numbering a message means the model went back to counting. The count was a global,
     # derived quantity: it needed every turn classified first, then accumulated in order, so
     # its error rate was the accumulation of every step's. Whether the cited text sits inside
-    # tool_response tags is local and readable on the spot. A number here is a step that can
+    # tool response tags is local and readable on the spot. A number here is a step that can
     # go wrong while adding nothing, and a wrong one drags every later step wrong with it.
     m = INDEX_CITE_RE.search(reason)
     if m:
@@ -331,6 +383,23 @@ def audit_block(block, users, tools, prev):
     # and the whole body of tool output are each searched, so no message has to be identified
     # by position for this to work. It is a stronger check than the indexed one it replaces:
     # citing the wrong tool response used to pass silently as long as the number existed.
+    # <trigger_words> is what the runtime defence acts on: it locates those words inside the
+    # tool response that carried them and cuts them out. So the tag is audited against the
+    # same three questions the defence asks of it — is there one, is it the span the reasoning
+    # actually quoted, and can it be found in the conversation at all.
+    trigger = parts["trigger_words"].strip().strip('"\'')
+    detail["trigger_words"] = trigger[:120]
+    if len(trigger) < MIN_TRIGGER_LEN:
+        errors.append("trigger_words_missing")
+    else:
+        if not same_span(trigger, reason):
+            errors.append("trigger_words_not_quoted")
+        # Search the raw turns, not the normalised text: the defence works on the real
+        # message content, so a match here means a match there.
+        source_pool = users if kind == "user_message" else tools
+        if not any(locate_exactly(t, trigger) for t in source_pool):
+            errors.append("trigger_words_not_locatable")
+
     user_text = norm(" ".join(users))
     tool_text = norm(" ".join(tools))
     haystack, other = ((user_text, tool_text) if kind == "user_message"
