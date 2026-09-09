@@ -80,7 +80,7 @@ class TrainingConfig:
     loss_calc_ce_tool_call_security_with_security_weight: float = 1.0  # loss weight for tool_call_security content
     loss_calc_ce_tool_call_security_tag_ce_loss_plus_weight: float = 1.0  # extra CE weight added to the tag tokens themselves (e.g. <tool_name>, </tool_name>, <tool_call_security>, etc.)
     loss_calc_ce_tool_call_security_inner_tags: List[str] = field(
-        default_factory=lambda: ["tool_name", "tool_args", "tool_reason", "tool_trace", "tool_security"]
+        default_factory=lambda: ["tool_name", "tool_args", "tool_reason", "trigger_words", "tool_trace", "tool_security"]
     )  # inner structural tags whose opening/closing tokens get the plus-weight boost
     loss_calc_ce_think_tag: Optional[str] = "think"  # weighted think block
     loss_calc_ce_think_weight: float = -100.0  # CE weight for <think> content in all assistant turns; <=0 ignores the span (labels=-100)

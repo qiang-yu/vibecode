@@ -72,6 +72,7 @@ loss_calc_ce_tool_call_security_inner_tags:
   - tool_name
   - tool_args
   - tool_reason
+  - trigger_words
   - tool_trace
   - tool_security
 loss_calc_ce_think_tag: think
@@ -95,7 +96,7 @@ no_security_to_security_turn_ratio: 0.0
 # ---------------------------------------------------------------------------
 stage: sft
 do_train: true
-output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260906_ce_0.0_nosecurity_10.0_tagw_4epochs_8B_nothink
+output_dir: /home/qiangyu/Models/FineTune/Qwen/cekl_train_20260909_ce_0.0_nosecurity_10.0_tagw_4epochs_8B_nothink
 overwrite_output_dir: false
 seed: 42
 num_train_epochs: 4.0
