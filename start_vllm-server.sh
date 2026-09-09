@@ -32,6 +32,8 @@ SECURITY_DEFENCE_ENABLE=false          # true | false
 SECURITY_DEFENCE_LEVEL="neutral"       # safe | neutral | suspicious | unsafe
 SECURITY_DEFENCE_DEBUG=true           # true: keep <tool_call_security> in response; false: strip it
 SECURITY_DEFENCE_MAX_RETRIES=3        # max base-model retries after a defence block
+DEFENCE_FALLBACK_TO_IGNORE_INJECTION=false   # true: fall back to ignore-injection when trigger words not found
+FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE=false  # true: allow fuzzy matching when locating trigger words
 
 # -----------------------------------------------------------------------
 # Launch
@@ -60,4 +62,6 @@ python "${SCRIPT_DIR}/vllm-server.py" \
     --security_defence_enable       "${SECURITY_DEFENCE_ENABLE}" \
     --security_defence_debug        "${SECURITY_DEFENCE_DEBUG}" \
     --security-defence-level        "${SECURITY_DEFENCE_LEVEL}" \
-    --security-defence-max-retries  "${SECURITY_DEFENCE_MAX_RETRIES}"
+    --security-defence-max-retries  "${SECURITY_DEFENCE_MAX_RETRIES}" \
+    --defence_fallback_to_ignore_injection       "${DEFENCE_FALLBACK_TO_IGNORE_INJECTION}" \
+    --fuzzy_search_trigger_words_in_tool_response "${FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE}"
