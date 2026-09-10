@@ -35,7 +35,7 @@ while IFS= read -r -d '' file; do
     fi
     echo "----------------------------------------------------"
     ((count++))
-done < <(find "$TARGET_DIR" -type f -name "*.json" -size +99M -print0)
+done < <(find "$TARGET_DIR" -type f \( -name "*.json" -o -name "*.jsonl" \) -size +99M -print0)
 
 if [ $count -eq 0 ]; then
     echo "🎉 No .json files larger than 99MB were found."
