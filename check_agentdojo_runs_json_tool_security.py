@@ -8,6 +8,9 @@
 # only well-formed, non-nested blocks are extracted. A naive non-greedy regex would
 # swallow stray/duplicated opening tags into one giant "block" and wrongly report it
 # as valid, so any tag imbalance or nesting is reported as "invalid_more".
+#
+# In addition to the existing per-classification summary, this script also reports
+# per-sub-tag missing counts and percentages across all extracted blocks.
 ###
 
 import json
@@ -44,6 +47,10 @@ VALID_SECURITY_INNER_PATTERN = re.compile(
 STRAY_TAG_PATTERN = re.compile(r"</?tool_call>|</?tool_call_security>|</?think>")
 
 
+def _empty_missing() -> dict[str, int]:
+    return {tag: 0 for tag in REQUIRED_SUB_TAGS}
+
+
 def extract_text_content(content: Any) -> str:
     """Concatenate all text-type content blocks into a single string."""
     if isinstance(content, str):
@@ -76,6 +83,15 @@ def scan_security_blocks(text: str) -> tuple[list[str], bool]:
     return inners, broken
 
 
+def get_missing_tags(inner: str) -> list[str]:
+    """Return the list of required sub-tags absent or duplicated in a block inner content."""
+    missing = []
+    for tag in REQUIRED_SUB_TAGS:
+        if inner.count(f"<{tag}>") != 1 or inner.count(f"</{tag}>") != 1:
+            missing.append(tag)
+    return missing
+
+
 def is_valid_inner(inner: str) -> bool:
     """
     Validate the body of one security block.
@@ -93,14 +109,18 @@ def is_valid_inner(inner: str) -> bool:
     return bool(VALID_SECURITY_INNER_PATTERN.search(inner))
 
 
-def classify_assistant_message(message: dict[str, Any]) -> tuple[int, str]:
+def classify_assistant_message(
+    message: dict[str, Any],
+) -> tuple[int, str, dict[str, int], int]:
     """
     Classify one assistant message.
 
-    Uses tool_calls (the parsed array) to determine how many tool calls were made,
-    then counts <tool_call_security> blocks in the text content and compares.
+    Returns (n_tool_calls, classification, missing_tag_counts, n_blocks_inspected).
 
-    Returns (n_tool_calls, classification):
+    missing_tag_counts: for each sub-tag, how many well-formed blocks are missing it.
+    n_blocks_inspected: number of well-formed blocks whose inner content was examined.
+
+    Classification values:
       "no_tool_call"      - tool_calls is empty; nothing to check
       "no_security"       - tool calls present but zero security tags in text
       "missing_security"  - security block count is positive but less than tool call count
@@ -111,7 +131,7 @@ def classify_assistant_message(message: dict[str, Any]) -> tuple[int, str]:
     """
     tool_calls = message.get("tool_calls", [])
     if not isinstance(tool_calls, list) or not tool_calls:
-        return 0, "no_tool_call"
+        return 0, "no_tool_call", _empty_missing(), 0
 
     n = len(tool_calls)
     text = extract_text_content(message.get("content", ""))
@@ -119,43 +139,55 @@ def classify_assistant_message(message: dict[str, Any]) -> tuple[int, str]:
 
     # Nothing at all: no opening tag, no closing tag, no block.
     if not broken and not security_inners:
-        return n, "no_security"
+        return n, "no_security", _empty_missing(), 0
 
-    # Stray, duplicated, nested or unclosed tags: too many tags for the tool calls made.
+    # Stray, duplicated, nested or unclosed tags.
     if broken:
-        return n, "invalid_more"
+        return n, "invalid_more", _empty_missing(), 0
 
     s = len(security_inners)
 
+    # Inspect all extracted blocks for per-tag missing counts regardless of s vs n.
+    missing_counts = _empty_missing()
+    has_invalid = False
+    for inner in security_inners:
+        for tag in get_missing_tags(inner):
+            missing_counts[tag] += 1
+        if not is_valid_inner(inner):
+            has_invalid = True
+
     if s < n:
-        return n, "missing_security"
+        return n, "missing_security", missing_counts, s
 
     if s > n:
-        return n, "invalid_more"
+        return n, "invalid_more", _empty_missing(), 0
 
-    # s == n: validate the body of every security block
-    for inner in security_inners:
-        if not is_valid_inner(inner):
-            return n, "invalid_format"
+    # s == n
+    if has_invalid:
+        return n, "invalid_format", missing_counts, s
 
-    return n, "valid"
+    return n, "valid", missing_counts, s
 
 
-def check_json_file(path: Path) -> tuple[dict[str, int], str]:
+def check_json_file(
+    path: Path,
+) -> tuple[dict[str, int], str, dict[str, int], int]:
     """
     Check one JSON file.
 
-    Iterates all assistant messages and aggregates per-type tool call counts.
-
-    Returns (counts, classification) where classification is the worst issue found:
-      "valid", "no_security", "invalid_more", "invalid_format", "no_tool_call", "parse_error"
+    Returns (counts, classification, missing_tag_counts, n_blocks_inspected).
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as exc:
         print(f"[ERROR] Failed to read {path}: {exc}")
-        return {"valid": 0, "no_security": 0, "missing_security": 0, "invalid_more": 0, "invalid_format": 0}, "parse_error"
+        return (
+            {"valid": 0, "no_security": 0, "missing_security": 0, "invalid_more": 0, "invalid_format": 0},
+            "parse_error",
+            _empty_missing(),
+            0,
+        )
 
     messages = []
     if isinstance(data, dict):
@@ -170,26 +202,31 @@ def check_json_file(path: Path) -> tuple[dict[str, int], str]:
         "invalid_more": 0,
         "invalid_format": 0,
     }
+    file_missing: dict[str, int] = _empty_missing()
+    file_blocks_inspected = 0
 
     for message in messages:
         if not (isinstance(message, dict) and message.get("role") == "assistant"):
             continue
-        n, cls = classify_assistant_message(message)
+        n, cls, msg_missing, n_blocks = classify_assistant_message(message)
         if cls in total_counts:
             total_counts[cls] += n
+        for tag in REQUIRED_SUB_TAGS:
+            file_missing[tag] += msg_missing[tag]
+        file_blocks_inspected += n_blocks
 
     total_tc = sum(total_counts.values())
     if total_tc == 0:
-        return total_counts, "no_tool_call"
+        return total_counts, "no_tool_call", file_missing, file_blocks_inspected
 
     # File-level classification: worst issue wins
     if total_counts["no_security"] > 0:
-        return total_counts, "no_security"
+        return total_counts, "no_security", file_missing, file_blocks_inspected
     if total_counts["invalid_more"] > 0:
-        return total_counts, "invalid_more"
+        return total_counts, "invalid_more", file_missing, file_blocks_inspected
     if total_counts["invalid_format"] > 0:
-        return total_counts, "invalid_format"
-    return total_counts, "valid"
+        return total_counts, "invalid_format", file_missing, file_blocks_inspected
+    return total_counts, "valid", file_missing, file_blocks_inspected
 
 
 def print_path_list(title: str, paths: list[Path]) -> None:
@@ -228,6 +265,10 @@ def main() -> int:
     invalid_more_tc = 0
     invalid_format_tc = 0
 
+    # Per-sub-tag global missing counts and total inspected blocks.
+    global_missing: dict[str, int] = _empty_missing()
+    global_blocks_inspected = 0
+
     valid_paths: list[Path] = []
     no_security_paths: list[Path] = []
     missing_security_paths: list[Path] = []
@@ -237,7 +278,7 @@ def main() -> int:
 
     for json_path in json_files:
         total_files += 1
-        counts, classification = check_json_file(json_path)
+        counts, classification, file_missing, n_blocks = check_json_file(json_path)
 
         total_tc += sum(counts.values())
         valid_tc += counts["valid"]
@@ -246,13 +287,16 @@ def main() -> int:
         invalid_more_tc += counts["invalid_more"]
         invalid_format_tc += counts["invalid_format"]
 
+        for tag in REQUIRED_SUB_TAGS:
+            global_missing[tag] += file_missing[tag]
+        global_blocks_inspected += n_blocks
+
         if classification == "parse_error":
             parse_error_files += 1
         elif classification == "no_tool_call":
             no_tool_call_files += 1
             no_tool_call_paths.append(json_path)
         else:
-            # A file may have multiple issue types; add it to every relevant list.
             has_error = False
             if counts["no_security"] > 0:
                 no_security_files += 1
@@ -298,6 +342,23 @@ def main() -> int:
     print(f"Missing security tool calls:                  {missing_security_tc}")
     print(f"Invalid more tool calls:                      {invalid_more_tc}")
     print(f"Invalid format tool calls:                    {invalid_format_tc}")
+
+    print()
+    print("=" * 80)
+    print("Missing Sub-Tag Breakdown")
+    print(f"(across {global_blocks_inspected} inspected tool_call_security blocks)")
+    print("=" * 80)
+    if global_blocks_inspected == 0:
+        print("No blocks inspected.")
+    else:
+        col_w = max(len(t) for t in REQUIRED_SUB_TAGS) + 2
+        header = f"  {'Sub-tag':<{col_w}}  {'Missing':>8}  {'/ Total':>8}  {'Percent':>8}"
+        print(header)
+        print("-" * len(header))
+        for tag in REQUIRED_SUB_TAGS:
+            count = global_missing[tag]
+            pct = count / global_blocks_inspected * 100
+            print(f"  {tag:<{col_w}}  {count:>8}  {global_blocks_inspected:>8}  {pct:>7.2f}%")
 
     return 0
 
