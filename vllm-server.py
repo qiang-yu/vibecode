@@ -1715,6 +1715,7 @@ def main():
     global LORA_THINK_MODE, LORA_THINK_STRING
     global TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL
     global SECURITY_DEFENCE_DEBUG, SECURITY_DEFENCE_MAX_RETRIES
+    global DEFENCE_FALLBACK_TO_IGNORE_INJECTION, FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE
     global tokenizer, _llama3_template
 
     parser = argparse.ArgumentParser(description="vllm two-phase inference proxy")
@@ -1790,6 +1791,12 @@ def main():
     parser.add_argument("--security-defence-max-retries",
                         type=int, default=None, metavar="N",
                         help=f"max base-model retries after a defence block with no remaining tool calls (default: {SECURITY_DEFENCE_MAX_RETRIES})")
+    parser.add_argument("--defence_fallback_to_ignore_injection",
+                        choices=["true", "false"], default=None, metavar="true|false",
+                        help=f"fall back to ignore-injection when trigger words are not found (default: {str(DEFENCE_FALLBACK_TO_IGNORE_INJECTION).lower()})")
+    parser.add_argument("--fuzzy_search_trigger_words_in_tool_response",
+                        choices=["true", "false"], default=None, metavar="true|false",
+                        help=f"allow fuzzy matching when locating trigger words in tool response (default: {str(FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE).lower()})")
     parser.add_argument("--log-level",             default="info",
                         help="log level: debug/info/warning/error (default: info)")
     args = parser.parse_args()
@@ -1835,6 +1842,10 @@ def main():
         TOOL_CALL_SECURITY_DEFENCE_LEVEL = args.security_defence_level
     if args.security_defence_max_retries is not None:
         SECURITY_DEFENCE_MAX_RETRIES = args.security_defence_max_retries
+    if args.defence_fallback_to_ignore_injection is not None:
+        DEFENCE_FALLBACK_TO_IGNORE_INJECTION = args.defence_fallback_to_ignore_injection == "true"
+    if args.fuzzy_search_trigger_words_in_tool_response is not None:
+        FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE = args.fuzzy_search_trigger_words_in_tool_response == "true"
 
     # Set log level and attach a dated file handler so all output goes to both console and file.
     log_level = args.log_level.upper()
