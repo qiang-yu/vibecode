@@ -49,7 +49,7 @@ LORA_MODEL_ID             = "lora-model"
 BASE_MODEL_PATH           = "/home/qiangyu/Models/Qwen/Qwen3-8B"           # required: local path to load tokenizer
 MODEL_TYPE                = "Qwen3"     # Qwen3 | Llama3
 LLAMA3_TEMPLATE_PATH      = str(Path(__file__).parent / "tool_chat_template_llama3.1_json.jinja")
-MAX_TOKENS_SECURITY       = 512         # hard limit for phase 2 / security block
+MAX_TOKENS_SECURITY       = 1024        # hard limit for phase 2 / security block
 REQUEST_TIMEOUT           = 300         # seconds
 
 LISTEN_HOST               = "localhost"
@@ -356,7 +356,7 @@ FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE = False
 #
 # Keep quotation marks and backslashes out of it: tool output is often JSON, and this is
 # inserted inside a string value.
-DEFENCE_REMOVED_PLACEHOLDER = " ... "
+DEFENCE_REMOVED_PLACEHOLDER = " (nothing) "
 
 # Visible answer returned when the retry budget is exhausted; without it the
 # response would carry a <think> block and nothing else, which most clients
@@ -1127,7 +1127,7 @@ async def _handle_request(
     client_max_tokens: Optional[int],
     client_stop: List[str],
     fwd: Dict,
-) -> Dict:
+) -> Tuple[Dict, List[Dict]]:
     # Phase 1 should look like native vllm's input. Native vllm history never contains
     # <tool_call_security> — that tag is injected by THIS server — so strip it before
     # phase 1 (STRIP_SECURITY_IN_HISTORY True), leaving content native vllm would have.
@@ -1283,7 +1283,7 @@ async def _handle_request(
             return _build_response(
                 cid, tool_calls, content,
                 acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
-            )
+            ), work_messages
 
         # ── Cases 2 & 3: repair unclosed <think> then check for tool calls ───
         # Case 2: unclosed </think> — close it so _parse_qwen3 can filter
@@ -1312,7 +1312,7 @@ async def _handle_request(
             return _build_response(
                 cid, [], content,
                 acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
-            )
+            ), work_messages
 
         if not _is_tool_call_stop(c1):
             # Tool calls present but stop_reason is not </tool_call>.
@@ -1328,7 +1328,7 @@ async def _handle_request(
             return _build_response(
                 cid, tool_calls, content,
                 acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
-            )
+            ), work_messages
 
         if not PHASE2_ENABLE:
             log.info("[phase1] phase2 disabled — returning phase-1 tool calls without security check")
@@ -1336,7 +1336,7 @@ async def _handle_request(
             return _build_response(
                 cid, tool_calls, content,
                 acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
-            )
+            ), work_messages
 
         log.info("[phase1] hit </tool_call> — switching to lora model")
 
@@ -1395,7 +1395,7 @@ async def _handle_request(
             return _build_response(
                 cid, tool_calls, content,
                 acc_prompt_tokens, acc_completion_tokens, "length",
-            )
+            ), work_messages
 
         p2_max = min(MAX_TOKENS_SECURITY, p2_available)
         if p2_max < MAX_TOKENS_SECURITY:
@@ -1481,7 +1481,7 @@ async def _handle_request(
             return _build_response(
                 cid, tool_calls, content,
                 acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
-            )
+            ), work_messages
 
         verdict = _check_defence_verdict(full_security_block)
 
@@ -1493,7 +1493,7 @@ async def _handle_request(
             return _build_response(
                 cid, tool_calls, content,
                 acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
-            )
+            ), work_messages
 
         safe_value, tool_name, tool_args, tool_trace, trigger_words = verdict
 
@@ -1526,7 +1526,7 @@ async def _handle_request(
                 return _build_response(
                     cid, [], DEFENCE_FALLBACK_CONTENT,
                     acc_prompt_tokens, acc_completion_tokens, "stop",
-                )
+                ), work_messages
             # The assistant turn just produced was reasoned against the poisoned history, so
             # it is discarded rather than continued: nothing of it is carried into the retry.
             # Re-render from the repaired conversation and run phase 1 again from scratch.
@@ -1564,7 +1564,7 @@ async def _handle_request(
             return _build_response(
                 cid, tool_calls, content,
                 acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
-            )
+            ), work_messages
 
         log.warning("[defence] falling back to the ignore-injection defence")
         native_turn = False
@@ -1595,7 +1595,7 @@ async def _handle_request(
             return _build_response(
                 cid, remaining_tool_calls, content_out,
                 acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
-            )
+            ), work_messages
 
         # Step 5: no tool call left after removal — wipe this assistant turn (its think
         # included), inject the defence think without a closing </think>, and let the base
@@ -1627,7 +1627,7 @@ async def _handle_request(
             return _build_response(
                 cid, [], final_content,
                 acc_prompt_tokens, acc_completion_tokens, "stop",
-            )
+            ), work_messages
 
         # Rebuild the assistant turn for the retry: the think opener (reused from the
         # template when it produced one, otherwise our own) plus every warning so far,
@@ -1643,7 +1643,7 @@ async def _handle_request(
     return _build_response(
         cid, [], DEFENCE_FALLBACK_CONTENT,
         acc_prompt_tokens, acc_completion_tokens, "stop",
-    )
+    ), work_messages
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -1668,7 +1668,8 @@ async def chat_completions(request: Request):
     cid = f"chatcmpl-{uuid.uuid4().hex}"
 
     try:
-        result = await _handle_request(cid, messages, tools, client_max_tokens, client_stop, fwd)
+        result, out_messages = await _handle_request(cid, messages, tools, client_max_tokens, client_stop, fwd)
+        result["messages"] = out_messages
         return JSONResponse(result)
     except HTTPException:
         raise
