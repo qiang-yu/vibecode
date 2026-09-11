@@ -1516,8 +1516,7 @@ async def _handle_request(
         verdict = _check_defence_verdict(full_security_block)
 
         if verdict is _VERDICT_MALFORMED:
-            # Structurally broken block — log it for diagnosis, then pass through.
-            log.info(
+            log.error(
                 "[defence] security_block=%s",
                 full_security_block.replace("\n", "\\n"),
             )
@@ -1530,7 +1529,10 @@ async def _handle_request(
             ), work_messages
 
         if verdict is None:
-            # Clean safe verdict — pass the tool call through silently.
+            log.info(
+                "[defence] security_block=%s",
+                full_security_block.replace("\n", "\\n"),
+            )
             tool_calls, content = _parse_output(full_text)
             if not SECURITY_DEFENCE_DEBUG and content:
                 content = _SECURITY_RE.sub("", content).strip() or None
@@ -1541,11 +1543,11 @@ async def _handle_request(
 
         safe_value, tool_name, tool_args, tool_trace, trigger_words = verdict
 
-        log.info(
+        log.warning(
             "[defence] security_block=%s",
             full_security_block.replace("\n", "\\n"),
         )
-        log.info(
+        log.warning(
             "[defence] tool_call BLOCKED safe_value=%s defence_level=%s tool_name=%s "
             "trigger_words=%s",
             safe_value, TOOL_CALL_SECURITY_DEFENCE_LEVEL, tool_name,
