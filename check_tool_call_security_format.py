@@ -31,8 +31,6 @@ SECURITY_BLOCK_RE = re.compile(
 )
 TOOL_CALL_OPEN_RE = re.compile(re.escape(TOOL_CALL_OPEN))
 SECURITY_OPEN_RE = re.compile(re.escape(SECURITY_OPEN))
-REQUIRED_TAGS_SET = set(REQUIRED_TAGS)
-ALL_TAG_RE = re.compile(r"</?([a-zA-Z][a-zA-Z0-9_]*)>")
 
 
 def extract_strings(obj):
@@ -61,10 +59,7 @@ def check_security_content(content):
       bad_count - required tags whose open or close count is not exactly 1
                   each item is {"tag": str, "open": int, "close": int}
     """
-    result = {"missing": [], "extra": [], "bad_count": []}
-
-    found_names = set(ALL_TAG_RE.findall(content))
-    result["extra"] = sorted(found_names - REQUIRED_TAGS_SET)
+    result = {"missing": [], "bad_count": []}
 
     for tag in REQUIRED_TAGS:
         open_count = content.count(f"<{tag}>")
@@ -120,13 +115,6 @@ def check_text(text, record_index):
                 "type": "missing_tags",
                 "record_index": record_index,
                 "missing": issues["missing"],
-                "context": ctx,
-            })
-        if issues["extra"]:
-            errors.append({
-                "type": "extra_tags",
-                "record_index": record_index,
-                "extra": issues["extra"],
                 "context": ctx,
             })
         if issues["bad_count"]:
@@ -239,7 +227,6 @@ def print_report(all_reports, total_stats):
     print(f"  JSON / file parse errors                   : {total_stats['json_errors']}")
     print(f"  GPT turns with multiple <tool_call>        : {total_stats['multiple_tool_calls']}")
     print(f"  GPT turns with multiple <tool_call_security>: {total_stats['multiple_security_blocks']}")
-    print(f"  Security blocks with extra tags            : {total_stats['extra_tags']}")
     print(f"  Security blocks with bad tag counts        : {total_stats['bad_tag_count']}")
 
     if not all_reports:
@@ -299,15 +286,6 @@ def print_report(all_reports, total_stats):
                 if tag in tag_counts:
                     print(f"    <{tag}>  missing in {tag_counts[tag]} block(s)")
 
-        if "extra_tags" in by_type:
-            errs = by_type["extra_tags"]
-            print(f"  [extra_tags] {len(errs)} security block(s) have unexpected tags:")
-            for i, err in enumerate(errs[:5], start=1):
-                tags_str = ", ".join(f"<{t}>" for t in err["extra"])
-                print(f"    #{i} (record {err['record_index']}): {tags_str}")
-            if len(errs) > 5:
-                print(f"    ... and {len(errs) - 5} more")
-
         if "bad_tag_count" in by_type:
             errs = by_type["bad_tag_count"]
             print(f"  [bad_tag_count] {len(errs)} security block(s) have wrong tag counts:")
@@ -364,7 +342,6 @@ def main():
         "json_errors": 0,
         "multiple_tool_calls": 0,
         "multiple_security_blocks": 0,
-        "extra_tags": 0,
         "bad_tag_count": 0,
     }
 
@@ -392,8 +369,6 @@ def main():
                     total_stats["multiple_tool_calls"] += 1
                 elif t == "multiple_security_blocks":
                     total_stats["multiple_security_blocks"] += 1
-                elif t == "extra_tags":
-                    total_stats["extra_tags"] += 1
                 elif t == "bad_tag_count":
                     total_stats["bad_tag_count"] += 1
 

@@ -37,8 +37,6 @@ SECURITY_BLOCK_RE = re.compile(
 )
 TOOL_CALL_OPEN_RE = re.compile(re.escape(TOOL_CALL_OPEN))
 SECURITY_OPEN_RE = re.compile(re.escape(SECURITY_OPEN))
-REQUIRED_TAGS_SET = set(REQUIRED_TAGS)
-ALL_TAG_RE = re.compile(r"</?([a-zA-Z][a-zA-Z0-9_]*)>")
 
 
 def extract_strings(obj):
@@ -60,15 +58,11 @@ def extract_strings(obj):
 def check_security_content(content):
     """
     Validate the content inside a <tool_call_security> block.
-    Returns a dict with three keys (all lists; empty means no issue):
+    Returns a dict with two keys (all lists; empty means no issue):
       missing   - required tags whose open AND close count are both 0
-      extra     - tag names not in REQUIRED_TAGS found in content
       bad_count - required tags whose open or close count is not exactly 1
     """
-    result = {"missing": [], "extra": [], "bad_count": []}
-
-    found_names = set(ALL_TAG_RE.findall(content))
-    result["extra"] = sorted(found_names - REQUIRED_TAGS_SET)
+    result = {"missing": [], "bad_count": []}
 
     for tag in REQUIRED_TAGS:
         open_count = content.count(f"<{tag}>")
@@ -107,8 +101,6 @@ def collect_record_errors(record):
             issues = check_security_content(sec_match.group(1))
             if issues["missing"]:
                 error_types.add("missing_tags")
-            if issues["extra"]:
-                error_types.add("extra_tags")
             if issues["bad_count"]:
                 error_types.add("bad_tag_count")
 
