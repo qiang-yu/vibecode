@@ -809,49 +809,67 @@ def _is_tool_call_stop(choice: Dict) -> bool:
 
 # Below this, a fuzzy match is not trustworthy: short spans hit high similarity by accident.
 DEFENCE_FUZZY_MIN_RATIO = 0.80
-# Separator between two words of the span. It is any run of non-word characters, plus the
-# escape sequences JSON uses: a real newline inside a tool response is stored as a backslash
-# followed by the letter n, and that letter is a word character, so a plain non-word
-# separator stops dead at exactly the place a wrapped injection needs to be matched across.
-_DEFENCE_WORD_SEP = r"(?:\W|\\[nrtbf\"'])+"
 
 # Fuzzy scanning is quadratic-ish; skip it on very large tool responses.
 DEFENCE_FUZZY_MAX_CHARS = 200_000
 
 
-def _norm_for_match(text: str) -> str:
-    """Lowercase and reduce to words separated by single spaces."""
-    return " ".join(re.findall(r"\w+", (text or "").lower()))
+def _strip_punct_and_normalize(text: str) -> Tuple[str, List[int]]:
+    """Lower-case text, replace every non-alphanumeric character with a space,
+    collapse consecutive spaces into one, strip leading/trailing spaces.
+
+    Returns (normalized, pos_map) where pos_map[i] is the index in the original
+    string that produced normalized[i].  Used to do punctuation-insensitive
+    substring matching and then map the matched span back to the original offsets.
+    """
+    norm: List[str] = []
+    pos_map: List[int] = []
+    in_space = True  # absorb leading non-alnum
+    for i, ch in enumerate(text):
+        if ch.isalnum():
+            norm.append(ch.lower())
+            pos_map.append(i)
+            in_space = False
+        else:
+            if not in_space:
+                norm.append(' ')
+                pos_map.append(i)
+                in_space = True
+    if norm and norm[-1] == ' ':
+        norm.pop()
+        pos_map.pop()
+    return ''.join(norm), pos_map
 
 
 def _find_trigger_span(haystack: str, needle: str) -> Optional[Tuple[int, int]]:
-    """Return (start, end) of the words inside haystack, or None.
+    """Return (start, end) of the trigger words inside haystack, or None.
 
-    Rung 1: the words verbatim.
-    Rung 2: the same words with any run of non-word characters between them, which covers
-            line wrapping, changed punctuation and smart quotes. Still an exact match — the
-            words and their order have to be identical, only the separators may differ.
-    Rung 3: a fuzzy window scan, for the case where the lora reworded a little. The window is
-            searched at word granularity and scored by sequence similarity, so word order
-            still has to match, but the words themselves need not. This rung can delete text
-            that was not the injection, so it runs only when
-            FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE is on.
+    Rung 1: verbatim substring — fast path when the lora reproduced the exact text.
+    Rung 2: punctuation-insensitive match — strip all punctuation from both strings,
+            find the needle in the stripped haystack, then map the match boundaries
+            back to original character positions.  Handles newlines, brackets, dots,
+            dashes, smart quotes, and any other punctuation that may differ between
+            the tool response and what the lora reports.
+    Rung 3: fuzzy window scan — for the case where the lora reworded a little.
+            Runs only when FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE is on.
     """
     if not haystack or not needle:
         return None
 
+    # Rung 1: verbatim
     idx = haystack.find(needle)
     if idx != -1:
         return idx, idx + len(needle)
 
-    words = re.findall(r"\w+", needle)
-    if not words:
-        return None
-
-    pattern = _DEFENCE_WORD_SEP.join(re.escape(w) for w in words)
-    m = re.search(pattern, haystack, re.IGNORECASE)
-    if m:
-        return m.start(), m.end()
+    # Rung 2: punctuation-insensitive
+    norm_hay, hay_pos = _strip_punct_and_normalize(haystack)
+    norm_needle, _ = _strip_punct_and_normalize(needle)
+    if norm_needle:
+        idx = norm_hay.find(norm_needle)
+        if idx != -1:
+            orig_start = hay_pos[idx]
+            orig_end = hay_pos[idx + len(norm_needle) - 1] + 1
+            return orig_start, orig_end
 
     if not FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE:
         return None
@@ -862,6 +880,10 @@ def _find_trigger_span(haystack: str, needle: str) -> Optional[Tuple[int, int]]:
         )
         return None
 
+    # Rung 3: fuzzy window scan
+    words = re.findall(r"\w+", needle)
+    if not words:
+        return None
     # word positions in the haystack, so a matched window maps back to character offsets
     tokens = [(m.group(0).lower(), m.start(), m.end())
               for m in re.finditer(r"\w+", haystack)]
@@ -900,9 +922,21 @@ def _tool_response_text(msg: Dict[str, Any]) -> Optional[str]:
     Tool results reach us either as a tool-role message or, when a client folds them into the
     transcript itself, as a user turn containing tool response blocks. Both are tool output;
     neither is the user speaking.
+
+    Content may arrive as a plain string or as a list of content blocks
+    (e.g. [{"type": "text", "text": "..."} or {"type": "text", "content": "..."}]).
+    Both forms are normalised to a string here so the caller always sees plain text.
     """
     content = msg.get("content")
-    if not isinstance(content, str):
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict):
+                text = p.get("text") or p.get("content", "")
+                if text:
+                    parts.append(str(text))
+        content = "\n".join(parts) if parts else None
+    if not isinstance(content, str) or not content:
         return None
     if msg.get("role") == "tool":
         return content
