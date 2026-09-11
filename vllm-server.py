@@ -516,6 +516,11 @@ _SECURITY_FULL_RE = re.compile(
     re.DOTALL,
 )
 
+# Sentinel returned by _check_defence_verdict when the security block is malformed
+# (missing tags, unrecognised verdict word, etc.).  Distinct from None (safe pass-through)
+# so the caller can log the block for diagnosis without printing it on every safe call.
+_VERDICT_MALFORMED = object()
+
 # ---------------------------------------------------------------------------
 # Message preprocessing (only for STRIP_SECURITY_IN_HISTORY = False)
 # ---------------------------------------------------------------------------
@@ -1083,27 +1088,24 @@ def _check_defence_verdict(
     full_security_block: str,
 ) -> Optional[Tuple[str, str, str, str, str]]:
     """
-    Inspect the lora security block and return
-    (safe_value, tool_name, tool_args, tool_trace, trigger_words) when defence should fire,
-    or None to let the tool call through (format error or safe level).
+    Inspect the lora security block and return:
+      (safe_value, tool_name, tool_args, tool_trace, trigger_words) — defence should fire;
+      None        — clean safe verdict, let the tool call through silently;
+      _VERDICT_MALFORMED — block is structurally broken; caller should log it for diagnosis.
     """
     # Check 1: the block must have the full expected shape.
     if not _SECURITY_FULL_RE.match(full_security_block):
         log.info(
             "[defence] lora output does not match "
             "<tool_call_security>...<tool_security>...</tool_security>...</tool_call_security>; "
-            "security check skipped. content=%s",
-            full_security_block.replace("\n", "\\n"),
+            "security check skipped.",
         )
-        return None
+        return _VERDICT_MALFORMED
 
     sec_val_match = _TOOL_SECURITY_VAL_RE.search(full_security_block)
     if not sec_val_match:
-        log.info(
-            "[defence] lora output missing <tool_security> tag; security check skipped. content=%s",
-            full_security_block.replace("\n", "\\n"),
-        )
-        return None
+        log.info("[defence] lora output missing <tool_security> tag; security check skipped.")
+        return _VERDICT_MALFORMED
 
     safe_value = sec_val_match.group(1).strip()
     if safe_value not in _SAFETY_LEVELS:
@@ -1111,7 +1113,7 @@ def _check_defence_verdict(
             "[defence] <tool_security> content is %r, not one of %s; security check skipped",
             safe_value.replace("\n", "\\n"), sorted(_SAFETY_LEVELS),
         )
-        return None
+        return _VERDICT_MALFORMED
 
     if _SAFETY_LEVELS[safe_value] >= _SAFETY_LEVELS[TOOL_CALL_SECURITY_DEFENCE_LEVEL]:
         return None
@@ -1502,12 +1504,6 @@ async def _handle_request(
             )
 
         # ── Defence ──────────────────────────────────────────────────────────
-        # Step 1: always log the full security block on one line.
-        log.info(
-            "[defence] security_block=%s",
-            full_security_block.replace("\n", "\\n"),
-        )
-
         if not TOOL_CALL_SECURITY_DEFENCE_ENABLE:
             tool_calls, content = _parse_output(full_text)
             if not SECURITY_DEFENCE_DEBUG and content:
@@ -1519,8 +1515,22 @@ async def _handle_request(
 
         verdict = _check_defence_verdict(full_security_block)
 
+        if verdict is _VERDICT_MALFORMED:
+            # Structurally broken block — log it for diagnosis, then pass through.
+            log.info(
+                "[defence] security_block=%s",
+                full_security_block.replace("\n", "\\n"),
+            )
+            tool_calls, content = _parse_output(full_text)
+            if not SECURITY_DEFENCE_DEBUG and content:
+                content = _SECURITY_RE.sub("", content).strip() or None
+            return _build_response(
+                cid, tool_calls, content,
+                acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
+            ), work_messages
+
         if verdict is None:
-            # Safe level, or malformed verdict — pass the tool call through.
+            # Clean safe verdict — pass the tool call through silently.
             tool_calls, content = _parse_output(full_text)
             if not SECURITY_DEFENCE_DEBUG and content:
                 content = _SECURITY_RE.sub("", content).strip() or None
@@ -1531,6 +1541,10 @@ async def _handle_request(
 
         safe_value, tool_name, tool_args, tool_trace, trigger_words = verdict
 
+        log.info(
+            "[defence] security_block=%s",
+            full_security_block.replace("\n", "\\n"),
+        )
         log.info(
             "[defence] tool_call BLOCKED safe_value=%s defence_level=%s tool_name=%s "
             "trigger_words=%s",
