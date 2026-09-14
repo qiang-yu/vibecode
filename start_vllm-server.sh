@@ -35,7 +35,8 @@ SECURITY_DEFENCE_MAX_RETRIES=10        # max base-model retries after a defence 
 # Defence methods applied in order until one succeeds; if none does, the turn passes through
 # undefended. Available: remove_trigger_words | fake_tool_response | ignore_injection_in_think
 DEFENCE_METHOD_LIST="remove_trigger_words,fake_tool_response"
-FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE=true  # true: allow fuzzy matching when locating trigger words (part of remove_trigger_words)
+REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL=true  # true: treat trigger words that belong to a tool call (name/args) as a false positive
+REMOVE_TRIGGER_WORDS_FUZZY_SEARCH=true  # true: allow fuzzy matching when locating trigger words (part of remove_trigger_words)
 
 # -----------------------------------------------------------------------
 # Launch
@@ -66,4 +67,5 @@ python "${SCRIPT_DIR}/vllm-server.py" \
     --security-defence-level        "${SECURITY_DEFENCE_LEVEL}" \
     --security-defence-max-retries  "${SECURITY_DEFENCE_MAX_RETRIES}" \
     --defence_method_list           "${DEFENCE_METHOD_LIST}" \
-    --fuzzy_search_trigger_words_in_tool_response "${FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE}"
+    --remove_trigger_words_match_tool_call "${REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL}" \
+    --remove_trigger_words_fuzzy_search "${REMOVE_TRIGGER_WORDS_FUZZY_SEARCH}"

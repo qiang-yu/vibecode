@@ -312,7 +312,7 @@ SECURITY_DEFENCE_MAX_RETRIES      = 3               # max times to re-run base m
 #                                 it survives however many turns later the text is read again.
 #                                 Locating the words uses a verbatim and a punctuation-
 #                                 insensitive search, plus an optional fuzzy search (see
-#                                 FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE). Fails when the
+#                                 REMOVE_TRIGGER_WORDS_FUZZY_SEARCH). Fails when the
 #                                 words cannot be located: the lora may paraphrase them, or
 #                                 report words that are not in any tool response.
 #   "fake_tool_response"        — keep the blocked tool call in the conversation but fabricate
@@ -338,6 +338,18 @@ DEFENCE_METHOD_LIST = ["remove_trigger_words", "fake_tool_response", "ignore_inj
 # inside <tool_response> tags.
 FAKE_TOOL_RESPONSE_CONTENT = '{"success": true, "data":"", "comment":"no data returned, do not retry"}'
 
+# Part of the "remove_trigger_words" method: a false-positive guard.
+#
+# When the exact search finds the trigger words in no tool response, they may not be an injection
+# at all — the verdict can flag words that are actually part of a tool CALL (a message body the
+# model composed, a function name), not of any tool response. When this is on, before falling
+# back to fuzzy matching, the reported trigger words are checked against every tool call in the
+# conversation (the current turn first, then history backwards): if they are a slice of a call's
+# arguments OR its name, the verdict is treated as a false positive, the <tool_security> word is
+# annotated with ",match_tool_call", and the call is let through as a success. Off disables this
+# step, so a miss in the tool responses goes straight to the fuzzy fallback.
+REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL = True
+
 # Whether the search for the trigger words inside a tool response may fall back to fuzzy
 # matching.
 #
@@ -353,7 +365,7 @@ FAKE_TOOL_RESPONSE_CONTENT = '{"success": true, "data":"", "comment":"no data re
 # silent. Off by default; turn it on only after the logs show how often the exact rungs miss,
 # and note that every fuzzy hit is logged with the text it removed so the deletions can be
 # audited afterwards.
-FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE = False
+REMOVE_TRIGGER_WORDS_FUZZY_SEARCH = False
 
 # What is left behind in place of the removed words.
 #
@@ -404,6 +416,14 @@ DEFENCE_IGNORE_INJECTION_AND_CONTINUE = (
     "I should keep silent and give no message or warning to user. "
     "Now i should continue the conversation, let us re-think the original user message "
 )
+
+# Longest placeholder-free slice of the ignore-injection text. Used to recognise, in later
+# history, an assistant turn that a previous ignore_injection_in_think defence produced, so a
+# tool call handled that way is not later mistaken for a legitimate call. Derived from the
+# template so it stays correct if the wording is edited, as long as some literal chunk remains.
+_DEFENCE_IGNORE_LITERAL = max(
+    re.split(r"\{[^}]*\}", DEFENCE_IGNORE_INJECTION_AND_CONTINUE), key=len,
+).strip()
 
 # Headers that must not cross HTTP hops; httpx already decompresses content,
 # so forwarding content-encoding would cause the client to double-decompress.
@@ -870,7 +890,9 @@ def _strip_punct_and_normalize(text: str) -> Tuple[str, List[int]]:
     return ''.join(norm), pos_map
 
 
-def _find_trigger_span(haystack: str, needle: str) -> Optional[Tuple[int, int]]:
+def _find_trigger_span(
+    haystack: str, needle: str, allow_fuzzy: bool = False,
+) -> Optional[Tuple[int, int]]:
     """Return (start, end) of the trigger words inside haystack, or None.
 
     Rung 1: verbatim substring — fast path when the lora reproduced the exact text.
@@ -880,7 +902,10 @@ def _find_trigger_span(haystack: str, needle: str) -> Optional[Tuple[int, int]]:
             dashes, smart quotes, and any other punctuation that may differ between
             the tool response and what the lora reports.
     Rung 3: fuzzy window scan — for the case where the lora reworded a little.
-            Runs only when FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE is on.
+            Runs only when allow_fuzzy is True AND
+            REMOVE_TRIGGER_WORDS_FUZZY_SEARCH is on. Rungs 1 and 2 are exact;
+            the caller drives them separately from the fuzzy pass so that an exact check
+            against the tool call's own arguments can be interposed in between.
     """
     if not haystack or not needle:
         return None
@@ -900,7 +925,7 @@ def _find_trigger_span(haystack: str, needle: str) -> Optional[Tuple[int, int]]:
             orig_end = hay_pos[idx + len(norm_needle) - 1] + 1
             return orig_start, orig_end
 
-    if not FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE:
+    if not allow_fuzzy or not REMOVE_TRIGGER_WORDS_FUZZY_SEARCH:
         return None
     if len(haystack) > DEFENCE_FUZZY_MAX_CHARS:
         log.info(
@@ -975,13 +1000,18 @@ def _tool_response_text(msg: Dict[str, Any]) -> Optional[str]:
 
 
 def _excise_trigger_words(
-    messages: List[Dict[str, Any]], trigger_words: str,
+    messages: List[Dict[str, Any]], trigger_words: str, allow_fuzzy: bool = False,
 ) -> Optional[Tuple[List[Dict[str, Any]], int, str]]:
     """Cut the trigger words out of the tool response that carried them.
 
     Walks the conversation backwards, because the injected text is usually in the most recent
     tool response but not always: the model may read a page early and act on it several calls
     later, and the words have to be found wherever they actually are.
+
+    allow_fuzzy chooses which matching rungs run: False does the two exact rungs only,
+    True adds the fuzzy rung (itself still gated by REMOVE_TRIGGER_WORDS_FUZZY_SEARCH).
+    The caller runs an exact pass first, checks the tool call's own arguments, and only then a
+    fuzzy pass.
 
     Returns (new_messages, index, removed_text) or None when nothing matched. The input list
     is not modified; the one message that changes is copied.
@@ -994,7 +1024,7 @@ def _excise_trigger_words(
         text = _tool_response_text(messages[i])
         if not text:
             continue
-        span = _find_trigger_span(text, trigger)
+        span = _find_trigger_span(text, trigger, allow_fuzzy=allow_fuzzy)
         if not span:
             continue
         start, end = span
@@ -1018,6 +1048,141 @@ def _excise_trigger_words(
         new_messages[i] = new_msg
         return new_messages, i, removed
     return None
+
+
+def _tool_calls_in_message(msg: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Return [(name, arguments_str), ...] for every tool call carried by a message.
+
+    Handles both the structured OpenAI shape (tool_calls[].function.name / .arguments), the
+    AgentDojo shape (function is a bare name string with a separate args field), and tool calls
+    embedded as <tool_call> text inside the message content. Arguments are always returned as a
+    string so the trigger-word matcher can scan them directly.
+    """
+    calls: List[Tuple[str, str]] = []
+
+    if msg.get("role") == "assistant":
+        for tc in (msg.get("tool_calls") or []):
+            fn = tc.get("function", {})
+            if isinstance(fn, dict):
+                name = fn.get("name", "") or ""
+                args = fn.get("arguments", "")
+            else:
+                name = fn or ""
+                args = tc.get("args", "")
+            if not isinstance(args, str):
+                args = json.dumps(args, ensure_ascii=False)
+            calls.append((name, args))
+
+    content = msg.get("content")
+    if isinstance(content, list):
+        content = "\n".join(
+            p.get("text") or p.get("content", "") for p in content if isinstance(p, dict)
+        )
+    if isinstance(content, str) and "<tool_call>" in content:
+        for m in _TOOL_CALL_RE.finditer(content):
+            try:
+                obj = json.loads(m.group(1).strip())
+            except json.JSONDecodeError:
+                continue
+            a = obj.get("arguments", obj.get("parameters", {}))
+            calls.append((
+                obj.get("name", "") or "",
+                a if isinstance(a, str) else json.dumps(a, ensure_ascii=False),
+            ))
+
+    return calls
+
+
+def _is_defence_handled_followup(msg: Optional[Dict[str, Any]]) -> bool:
+    """True when a message shows that the tool call right before it was already handled by a
+    defence method, so that call must not be trusted as a genuine one.
+
+    Two signatures, matching the two methods that leave a call in the history:
+      - the fake_tool_response method fabricates a tool response of FAKE_TOOL_RESPONSE_CONTENT
+        immediately after the blocked call;
+      - the ignore_injection_in_think method leaves an assistant turn carrying the
+        DEFENCE_IGNORE_INJECTION_AND_CONTINUE text.
+    """
+    if not msg:
+        return False
+
+    tool_text = _tool_response_text(msg)
+    if tool_text is not None and FAKE_TOOL_RESPONSE_CONTENT and FAKE_TOOL_RESPONSE_CONTENT in tool_text:
+        return True
+
+    if msg.get("role") == "assistant":
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "\n".join(
+                p.get("text") or p.get("content", "") for p in content if isinstance(p, dict)
+            )
+        if isinstance(content, str) and _DEFENCE_IGNORE_LITERAL and _DEFENCE_IGNORE_LITERAL in content:
+            return True
+
+    return False
+
+
+def _find_trigger_in_tool_calls(
+    messages: List[Dict[str, Any]],
+    current_calls: List[Tuple[str, str]],
+    trigger_words: str,
+) -> Optional[Tuple[str, str]]:
+    """Reverse-search tool calls for one whose name or arguments the trigger words are a slice of.
+
+    Order is most-recent first: the current turn's call(s), then the history walked backwards, so
+    the words may match an earlier call rather than the latest one. The same exact matching used
+    against tool responses (verbatim + punctuation-insensitive, no fuzzy) is reused. Returns the
+    matched (name, arguments) or None.
+
+    A history tool call is skipped when the message right after it shows it was already handled by
+    a defence method (a fabricated fake tool response, or an ignore-injection assistant turn):
+    such a call is itself a flagged one, so it must not be used to excuse the current call. The
+    current turn's own calls have nothing after them yet and are always considered.
+    """
+    trigger = (trigger_words or "").strip().strip('"\'')
+    if len(trigger) < 8:
+        return None
+
+    def _matches(name: str, args: str) -> bool:
+        if args and _find_trigger_span(args, trigger, allow_fuzzy=False) is not None:
+            return True
+        if name and _find_trigger_span(name, trigger, allow_fuzzy=False) is not None:
+            return True
+        return False
+
+    for name, args in current_calls:
+        if _matches(name, args):
+            return name, args
+
+    for i in range(len(messages) - 1, -1, -1):
+        calls = _tool_calls_in_message(messages[i])
+        if not calls:
+            continue
+        nxt = messages[i + 1] if i + 1 < len(messages) else None
+        if _is_defence_handled_followup(nxt):
+            log.info(
+                "[defence] remove_trigger_words: skipping tool call(s) %s at message index %d — "
+                "the following message shows it was already handled by a defence method",
+                [c[0] for c in calls], i,
+            )
+            continue
+        for name, args in calls:
+            if _matches(name, args):
+                return name, args
+    return None
+
+
+def _mark_tool_security_verdict(security_block: str, safe_value: str, marker: str) -> str:
+    """Append ",<marker>" to the <tool_security> verdict word, e.g. suspicious -> suspicious,match_tool_args.
+
+    Used to record why a blocked verdict was overridden and let through, without discarding the
+    original verdict word. A function replacement is used so the value cannot be misread as a
+    regex backreference template.
+    """
+    return _TOOL_SECURITY_VAL_RE.sub(
+        lambda _m: f"<tool_security>{safe_value},{marker}</tool_security>",
+        security_block, count=1,
+    )
 
 
 def _parse_args_loosely(raw: str) -> Optional[Any]:
@@ -1595,16 +1760,66 @@ async def _handle_request(
                 # removes the thing to obey. The search runs backwards over the whole conversation
                 # rather than only the last tool response, because a page fetched early can be
                 # acted on several calls later.
-                excised = _excise_trigger_words(work_messages, trigger_words) if trigger_words else None
+                #
+                # Three ordered steps:
+                #   1. exact search across the tool responses (verbatim + punctuation-insensitive);
+                #   2. if that misses AND REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL is on, test whether
+                #      the words are a slice of any tool call's name or arguments (current turn
+                #      first, then history backwards) — if so the verdict is a false positive, so
+                #      annotate it and let the call through (a success, no further methods);
+                #   3. only then fall back to a fuzzy search across the tool responses.
+
+                # Step 1: exact search in the tool responses.
+                excised = (
+                    _excise_trigger_words(work_messages, trigger_words, allow_fuzzy=False)
+                    if trigger_words else None
+                )
+
+                # Step 2: exact match against a tool call's name or arguments — a false positive.
+                matched_call = None
+                if excised is None and REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL and trigger_words:
+                    cur_calls, _ = _parse_output(raw_assistant + TOOL_CALL_END)
+                    cur_pairs = [(c["name"], c["arguments"]) for c in cur_calls]
+                    matched_call = _find_trigger_in_tool_calls(work_messages, cur_pairs, trigger_words)
+                if matched_call is not None:
+                    m_name, m_args = matched_call
+                    marked_block = _mark_tool_security_verdict(
+                        full_security_block, safe_value, "match_tool_call",
+                    )
+                    log.warning(
+                        "[defence] remove_trigger_words: trigger words are a slice of a tool call "
+                        "(name=%s args=%s), not a tool response — treating the verdict as a false "
+                        "positive (%s,match_tool_call) and letting the call through.",
+                        m_name, (m_args or "").replace("\n", "\\n")[:400], safe_value,
+                    )
+                    marked_full_text = raw_assistant + TOOL_CALL_END + marked_block
+                    tool_calls, content = _parse_output(marked_full_text)
+                    if not SECURITY_DEFENCE_DEBUG and content:
+                        content = _SECURITY_RE.sub("", content).strip() or None
+                    defence_response = _build_response(
+                        cid, tool_calls, content,
+                        acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
+                    )
+                    defence_action = "return"
+                    break
+
+                # Step 3: fuzzy search in the tool responses (still gated by the fuzzy flag).
+                if excised is None:
+                    excised = (
+                        _excise_trigger_words(work_messages, trigger_words, allow_fuzzy=True)
+                        if trigger_words else None
+                    )
+
                 if excised is None:
                     # The words could not be located — the lora may have reworded them past
                     # recognition, or named text that is not in the conversation at all. Fall
                     # through to the next configured defence method.
                     log.error(
                         "[defence] remove_trigger_words: trigger words not found in any tool "
-                        "response (exact match%s); trying the next defence method. trigger_words=%s",
-                        " and fuzzy match" if FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE
-                        else " only, fuzzy matching is off",
+                        "response (exact%s) and not in the tool call arguments; trying the next "
+                        "defence method. trigger_words=%s",
+                        " and fuzzy" if REMOVE_TRIGGER_WORDS_FUZZY_SEARCH
+                        else ", fuzzy matching is off",
                         (trigger_words or "<empty>").replace("\n", "\\n"),
                     )
                     continue
@@ -1889,7 +2104,8 @@ def main():
     global LORA_THINK_MODE, LORA_THINK_STRING
     global TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL
     global SECURITY_DEFENCE_DEBUG, SECURITY_DEFENCE_MAX_RETRIES
-    global DEFENCE_METHOD_LIST, FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE
+    global DEFENCE_METHOD_LIST, REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL
+    global REMOVE_TRIGGER_WORDS_FUZZY_SEARCH
     global tokenizer, _llama3_template
 
     parser = argparse.ArgumentParser(description="vllm two-phase inference proxy")
@@ -1969,9 +2185,14 @@ def main():
                         default=None, metavar="M1,M2,...",
                         help=(f"comma-separated defence methods applied in order until one succeeds "
                               f"(default: {','.join(DEFENCE_METHOD_LIST)})"))
-    parser.add_argument("--fuzzy_search_trigger_words_in_tool_response",
+    parser.add_argument("--remove_trigger_words_match_tool_call",
                         choices=["true", "false"], default=None, metavar="true|false",
-                        help=f"allow fuzzy matching when locating trigger words in tool response (default: {str(FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE).lower()})")
+                        help=(f"remove_trigger_words: when trigger words are not in any tool response, "
+                              f"check whether they belong to a tool call (name/args) and treat as a "
+                              f"false positive (default: {str(REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL).lower()})"))
+    parser.add_argument("--remove_trigger_words_fuzzy_search",
+                        choices=["true", "false"], default=None, metavar="true|false",
+                        help=f"allow fuzzy matching when locating trigger words in tool response (default: {str(REMOVE_TRIGGER_WORDS_FUZZY_SEARCH).lower()})")
     parser.add_argument("--log-level",             default="info",
                         help="log level: debug/info/warning/error (default: info)")
     args = parser.parse_args()
@@ -2019,8 +2240,10 @@ def main():
         SECURITY_DEFENCE_MAX_RETRIES = args.security_defence_max_retries
     if args.defence_method_list is not None:
         DEFENCE_METHOD_LIST = [m.strip() for m in args.defence_method_list.split(",") if m.strip()]
-    if args.fuzzy_search_trigger_words_in_tool_response is not None:
-        FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE = args.fuzzy_search_trigger_words_in_tool_response == "true"
+    if args.remove_trigger_words_match_tool_call is not None:
+        REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL = args.remove_trigger_words_match_tool_call == "true"
+    if args.remove_trigger_words_fuzzy_search is not None:
+        REMOVE_TRIGGER_WORDS_FUZZY_SEARCH = args.remove_trigger_words_fuzzy_search == "true"
 
     # Set log level and attach a dated file handler so all output goes to both console and file.
     log_level = args.log_level.upper()
@@ -2069,8 +2292,9 @@ def main():
     log.info("  defence          : enable=%s  level=%s  debug=%s  max_retries=%d",
              TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL,
              SECURITY_DEFENCE_DEBUG, SECURITY_DEFENCE_MAX_RETRIES)
-    log.info("  defence methods  : %s  fuzzy_trigger_search=%s",
-             DEFENCE_METHOD_LIST, FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE)
+    log.info("  defence methods  : %s  fuzzy_trigger_search=%s  match_tool_call=%s",
+             DEFENCE_METHOD_LIST, REMOVE_TRIGGER_WORDS_FUZZY_SEARCH,
+             REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL)
     log.info("  fake_tool_resp   : %r", FAKE_TOOL_RESPONSE_CONTENT)
     log.info("  strip security   : %s  timeout=%ds", STRIP_SECURITY_IN_HISTORY, REQUEST_TIMEOUT)
     log.info("  context window   : fetched from vllm at startup")
