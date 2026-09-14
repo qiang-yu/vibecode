@@ -16,24 +16,26 @@ MODEL_TYPE="Qwen3"               # Qwen3 | Llama3
 MAX_TOKENS_SECURITY=4096          # max tokens for phase-2 lora security block
 REQUEST_TIMEOUT=600              # HTTP request timeout in seconds
 LOG_LEVEL="info"                 # debug | info | warning | error
-LOG_FILE_NAME="vllm.log"         # log file base name; runtime prepends YYYYMMDD_
+LOG_FILE_NAME="154_attack_slack_defence_remove_fake.log"         # log file base name; runtime prepends YYYYMMDD_
 
 OUTPUT_RAW_CLIENT_INPUT=false    # true: log raw client input (Qwen3 format) before stripping
 
 ENABLE_THINKING=true              # true | false
 STRIP_SECURITY_IN_HISTORY=true    # true | false
 PHASE2_ENABLE=true                # true: run phase-2 security check; false: phase-1 only
-PHASE1_THINK_RETRY_COUNT=1        # retry phase 1 N times when its think overruns max_tokens
+PHASE1_THINK_RETRY_COUNT=0        # retry phase 1 N times when its think overruns max_tokens
 PHASE2_TOOL_REASON_RETRY_COUNT=1  # retry phase 2 N times when its security block overruns max_tokens
 
 # Security defence: block tool calls whose lora verdict is below SECURITY_DEFENCE_LEVEL.
 # Calls at or above the level pass through. Example: "neutral" allows safe+neutral, blocks suspicious+unsafe.
-SECURITY_DEFENCE_ENABLE=false          # true | false
+SECURITY_DEFENCE_ENABLE=true          # true | false
 SECURITY_DEFENCE_LEVEL="neutral"       # safe | neutral | suspicious | unsafe
 SECURITY_DEFENCE_DEBUG=true           # true: keep <tool_call_security> in response; false: strip it
-SECURITY_DEFENCE_MAX_RETRIES=3        # max base-model retries after a defence block
-DEFENCE_FALLBACK_TO_IGNORE_INJECTION=false   # true: fall back to ignore-injection when trigger words not found
-FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE=false  # true: allow fuzzy matching when locating trigger words
+SECURITY_DEFENCE_MAX_RETRIES=10        # max base-model retries after a defence block
+# Defence methods applied in order until one succeeds; if none does, the turn passes through
+# undefended. Available: remove_trigger_words | fake_tool_response | ignore_injection_in_think
+DEFENCE_METHOD_LIST="remove_trigger_words,fake_tool_response"
+FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE=true  # true: allow fuzzy matching when locating trigger words (part of remove_trigger_words)
 
 # -----------------------------------------------------------------------
 # Launch
@@ -63,5 +65,5 @@ python "${SCRIPT_DIR}/vllm-server.py" \
     --security_defence_debug        "${SECURITY_DEFENCE_DEBUG}" \
     --security-defence-level        "${SECURITY_DEFENCE_LEVEL}" \
     --security-defence-max-retries  "${SECURITY_DEFENCE_MAX_RETRIES}" \
-    --defence_fallback_to_ignore_injection       "${DEFENCE_FALLBACK_TO_IGNORE_INJECTION}" \
+    --defence_method_list           "${DEFENCE_METHOD_LIST}" \
     --fuzzy_search_trigger_words_in_tool_response "${FUZZY_SEARCH_TRIGGER_WORDS_IN_TOOL_RESPONSE}"
