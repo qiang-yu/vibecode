@@ -295,6 +295,20 @@ TOOL_CALL_SECURITY_DEFENCE_LEVEL  = "neutral"      # safe | neutral | suspicious
 SECURITY_DEFENCE_DEBUG            = True            # True: keep <tool_call_security> in response; False: strip it
 SECURITY_DEFENCE_MAX_RETRIES      = 3               # max times to re-run base model after a defence block
 
+# Validate the trigger words of a tool call the lora rated exactly "safe".
+#
+# The lora sometimes rates a call "safe" while the words it names as having triggered the call
+# actually come from a tool response, not from the user — a misjudgement that lets an injected
+# instruction through. When this is True, a "safe" verdict (ONLY "safe"; "neutral" and every
+# other passing level are untouched) is not trusted blindly: its trigger words are searched for,
+# newest-first, across the USER messages using the same exact matching as remove_trigger_words
+# (verbatim + punctuation-insensitive, NO fuzzy). If a user message carries them the call is
+# genuinely user-driven and passes through; if none does, the words did not come from the user,
+# so the call is handed to the DEFENCE_METHOD_LIST methods exactly like a blocked call. A "safe"
+# verdict with no reported trigger words carries no evidence to validate and passes through.
+# When False the original behaviour is kept: a passing verdict is let through with no check.
+DEFENCE_SAFE_TOOLCALL = True
+
 # What to do when a tool call is blocked.
 #
 # Defence is split into independent methods, applied in the order they appear in this list.
@@ -999,6 +1013,55 @@ def _tool_response_text(msg: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _user_message_text(msg: Dict[str, Any]) -> Optional[str]:
+    """Return the text of a genuine user turn, else None.
+
+    Mirror of _tool_response_text for the opposite side of the conversation. A user turn that
+    only carries folded tool output (<tool_response> blocks) is not the user speaking, so it is
+    excluded here just as _tool_response_text claims it as tool output. Content may arrive as a
+    plain string or as a list of content blocks; both are normalised to a string.
+    """
+    if msg.get("role") != "user":
+        return None
+    content = msg.get("content")
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict):
+                text = p.get("text") or p.get("content", "")
+                if text:
+                    parts.append(str(text))
+        content = "\n".join(parts) if parts else None
+    if not isinstance(content, str) or not content:
+        return None
+    if "<tool_response>" in content:
+        return None
+    return content
+
+
+def _trigger_words_in_user_message(
+    messages: List[Dict[str, Any]], trigger_words: str,
+) -> Optional[Tuple[int, str]]:
+    """Search the user turns (newest first) for the trigger words, exact match only.
+
+    Uses the same exact matching rungs as remove_trigger_words (verbatim + punctuation-
+    insensitive) with fuzzy matching disabled, so a hit means the user really wrote the words.
+    Returns (index, matched_text) of the first user turn that carries them, or None when no
+    user turn does — which means the words did not originate from the user.
+    """
+    trigger = (trigger_words or "").strip().strip('"\'')
+    if len(trigger) < 8:
+        return None
+    for i in range(len(messages) - 1, -1, -1):
+        text = _user_message_text(messages[i])
+        if not text:
+            continue
+        span = _find_trigger_span(text, trigger, allow_fuzzy=False)
+        if span:
+            return i, text[span[0]:span[1]]
+    return None
+
+
 def _excise_trigger_words(
     messages: List[Dict[str, Any]], trigger_words: str, allow_fuzzy: bool = False,
 ) -> Optional[Tuple[List[Dict[str, Any]], int, str]]:
@@ -1305,7 +1368,13 @@ def _check_defence_verdict(
         return _VERDICT_MALFORMED
 
     if _SAFETY_LEVELS[safe_value] >= _SAFETY_LEVELS[TOOL_CALL_SECURITY_DEFENCE_LEVEL]:
-        return None
+        # A passing verdict is normally let through silently. The one exception is a verdict of
+        # exactly "safe" when DEFENCE_SAFE_TOOLCALL is on: its trigger
+        # words still have to be validated against the user messages, so return the verdict
+        # tuple and let the caller decide. "neutral" (and anything else above the threshold)
+        # keeps passing silently.
+        if not (DEFENCE_SAFE_TOOLCALL and safe_value == "safe"):
+            return None
 
     tool_name_match  = _TOOL_NAME_IN_SEC_RE.search(full_security_block)
     tool_args_match  = _TOOL_ARGS_IN_SEC_RE.search(full_security_block)
@@ -1732,6 +1801,39 @@ async def _handle_request(
 
         safe_value, tool_name, tool_args, tool_trace, trigger_words = verdict
 
+        # ── Safe-verdict trigger-word validation ─────────────────────────────
+        # A verdict of exactly "safe" only reaches here when
+        # DEFENCE_SAFE_TOOLCALL is on. Trust it only if its trigger
+        # words actually came from a user message; otherwise the lora rated an injected
+        # instruction as safe, so the call is handed to the defence methods like any block.
+        if DEFENCE_SAFE_TOOLCALL and safe_value == "safe":
+            trigger = (trigger_words or "").strip().strip('"\'')
+            user_hit = _trigger_words_in_user_message(work_messages, trigger_words) if trigger else None
+            if not trigger:
+                log.info(
+                    "[defence] safe tool call has no trigger words to validate — letting it "
+                    "through (tool_name=%s)", tool_name,
+                )
+            elif user_hit is not None:
+                log.info(
+                    "[defence] safe tool call: trigger words found in user message at index %d "
+                    "— genuinely user-driven, letting it through (tool_name=%s)",
+                    user_hit[0], tool_name,
+                )
+            if not trigger or user_hit is not None:
+                tool_calls, content = _parse_output(full_text)
+                if not SECURITY_DEFENCE_DEBUG and content:
+                    content = _SECURITY_RE.sub("", content).strip() or None
+                return _build_response(
+                    cid, tool_calls, content,
+                    acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
+                ), work_messages
+            log.warning(
+                "[defence] safe tool call: trigger words NOT found in any user message — they "
+                "are not from the user; running defence methods. tool_name=%s trigger_words=%s",
+                tool_name, trigger_words.replace("\n", "\\n"),
+            )
+
         log.warning(
             "[defence] security_block=%s",
             full_security_block.replace("\n", "\\n"),
@@ -2105,7 +2207,7 @@ def main():
     global TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL
     global SECURITY_DEFENCE_DEBUG, SECURITY_DEFENCE_MAX_RETRIES
     global DEFENCE_METHOD_LIST, REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL
-    global REMOVE_TRIGGER_WORDS_FUZZY_SEARCH
+    global REMOVE_TRIGGER_WORDS_FUZZY_SEARCH, DEFENCE_SAFE_TOOLCALL
     global tokenizer, _llama3_template
 
     parser = argparse.ArgumentParser(description="vllm two-phase inference proxy")
@@ -2193,6 +2295,11 @@ def main():
     parser.add_argument("--remove_trigger_words_fuzzy_search",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=f"allow fuzzy matching when locating trigger words in tool response (default: {str(REMOVE_TRIGGER_WORDS_FUZZY_SEARCH).lower()})")
+    parser.add_argument("--defence_safe_toolcall",
+                        choices=["true", "false"], default=None, metavar="true|false",
+                        help=(f"validate a 'safe' verdict's trigger words against the user messages; "
+                              f"if they are not from the user, run the defence methods (default: "
+                              f"{str(DEFENCE_SAFE_TOOLCALL).lower()})"))
     parser.add_argument("--log-level",             default="info",
                         help="log level: debug/info/warning/error (default: info)")
     args = parser.parse_args()
@@ -2244,6 +2351,8 @@ def main():
         REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL = args.remove_trigger_words_match_tool_call == "true"
     if args.remove_trigger_words_fuzzy_search is not None:
         REMOVE_TRIGGER_WORDS_FUZZY_SEARCH = args.remove_trigger_words_fuzzy_search == "true"
+    if args.defence_safe_toolcall is not None:
+        DEFENCE_SAFE_TOOLCALL = args.defence_safe_toolcall == "true"
 
     # Set log level and attach a dated file handler so all output goes to both console and file.
     log_level = args.log_level.upper()
@@ -2295,6 +2404,7 @@ def main():
     log.info("  defence methods  : %s  fuzzy_trigger_search=%s  match_tool_call=%s",
              DEFENCE_METHOD_LIST, REMOVE_TRIGGER_WORDS_FUZZY_SEARCH,
              REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL)
+    log.info("  safe_validate    : %s", DEFENCE_SAFE_TOOLCALL)
     log.info("  fake_tool_resp   : %r", FAKE_TOOL_RESPONSE_CONTENT)
     log.info("  strip security   : %s  timeout=%ds", STRIP_SECURITY_IN_HISTORY, REQUEST_TIMEOUT)
     log.info("  context window   : fetched from vllm at startup")
