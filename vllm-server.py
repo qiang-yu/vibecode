@@ -2404,7 +2404,7 @@ def main():
     log.info("  defence methods  : %s  fuzzy_trigger_search=%s  match_tool_call=%s",
              DEFENCE_METHOD_LIST, REMOVE_TRIGGER_WORDS_FUZZY_SEARCH,
              REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL)
-    log.info("  safe_validate    : %s", DEFENCE_SAFE_TOOLCALL)
+    log.info("  defence_safe     : %s", DEFENCE_SAFE_TOOLCALL)
     log.info("  fake_tool_resp   : %r", FAKE_TOOL_RESPONSE_CONTENT)
     log.info("  strip security   : %s  timeout=%ds", STRIP_SECURITY_IN_HISTORY, REQUEST_TIMEOUT)
     log.info("  context window   : fetched from vllm at startup")

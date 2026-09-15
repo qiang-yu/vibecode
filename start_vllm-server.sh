@@ -16,7 +16,7 @@ MODEL_TYPE="Qwen3"               # Qwen3 | Llama3
 MAX_TOKENS_SECURITY=4096          # max tokens for phase-2 lora security block
 REQUEST_TIMEOUT=600              # HTTP request timeout in seconds
 LOG_LEVEL="info"                 # debug | info | warning | error
-LOG_FILE_NAME="154_attack_slack_defence_remove_fake.log"         # log file base name; runtime prepends YYYYMMDD_
+LOG_FILE_NAME="154_attack_slack_defence_safe_remove_fake.log"         # log file base name; runtime prepends YYYYMMDD_
 
 OUTPUT_RAW_CLIENT_INPUT=false    # true: log raw client input (Qwen3 format) before stripping
 
