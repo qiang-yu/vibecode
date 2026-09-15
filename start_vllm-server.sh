@@ -16,7 +16,7 @@ MODEL_TYPE="Qwen3"               # Qwen3 | Llama3
 MAX_TOKENS_SECURITY=4096          # max tokens for phase-2 lora security block
 REQUEST_TIMEOUT=600              # HTTP request timeout in seconds
 LOG_LEVEL="info"                 # debug | info | warning | error
-LOG_FILE_NAME="154_attack_slack_defence_safe_remove_fake.log"         # log file base name; runtime prepends YYYYMMDD_
+LOG_FILE_NAME="153_attack_slack_defence_safe_remove_fake_checkpoint-1700.log"         # log file base name; runtime prepends YYYYMMDD_
 
 OUTPUT_RAW_CLIENT_INPUT=false    # true: log raw client input (Qwen3 format) before stripping
 
@@ -40,6 +40,9 @@ REMOVE_TRIGGER_WORDS_FUZZY_SEARCH=true  # true: allow fuzzy matching when locati
 # true: for a "safe" verdict, validate its trigger words against the user messages (exact match, no fuzzy);
 # if they are not from the user, run the defence methods instead of trusting the "safe" rating.
 DEFENCE_SAFE_TOOLCALL=true
+# Defence methods for the safe-verdict path (used only when DEFENCE_SAFE_TOOLCALL=true), applied in
+# order until one succeeds; if none does, the call passes through. Same names as DEFENCE_METHOD_LIST.
+DEFENCE_SAFE_METHOD_LIST="remove_trigger_words"
 
 # -----------------------------------------------------------------------
 # Launch
@@ -72,4 +75,5 @@ python "${SCRIPT_DIR}/vllm-server.py" \
     --defence_method_list           "${DEFENCE_METHOD_LIST}" \
     --remove_trigger_words_match_tool_call "${REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL}" \
     --remove_trigger_words_fuzzy_search "${REMOVE_TRIGGER_WORDS_FUZZY_SEARCH}" \
-    --defence_safe_toolcall "${DEFENCE_SAFE_TOOLCALL}"
+    --defence_safe_toolcall "${DEFENCE_SAFE_TOOLCALL}" \
+    --defence_safe_method_list "${DEFENCE_SAFE_METHOD_LIST}"

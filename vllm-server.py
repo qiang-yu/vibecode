@@ -345,6 +345,15 @@ DEFENCE_SAFE_TOOLCALL = True
 # in _handle_request.
 DEFENCE_METHOD_LIST = ["remove_trigger_words", "fake_tool_response", "ignore_injection_in_think"]
 
+# Defence methods for the safe-verdict path (DEFENCE_SAFE_TOOLCALL). When a "safe" verdict's
+# trigger words are found NOT to come from a user message, the call is handed to THIS list rather
+# than DEFENCE_METHOD_LIST — the two paths are tuned independently. The methods, their order, and
+# their semantics are identical to DEFENCE_METHOD_LIST (same branches in the dispatch loop):
+# a method that neutralises the call triggers a phase-1 re-run; if every method fails the call is
+# let through unchanged. Defaults to just remove_trigger_words, but any subset of the methods
+# listed above is valid.
+DEFENCE_SAFE_METHOD_LIST = ["remove_trigger_words"]
+
 # Body of the tool response fabricated by the "fake_tool_response" defence method. It signals a
 # successful call that carried back no data, so the model cannot read anything actionable out of
 # it and simply concludes the call completed. Kept as a plain string (JSON here, but any string
@@ -1854,7 +1863,15 @@ async def _handle_request(
         defence_action: Optional[str] = None
         defence_response: Optional[Dict] = None
 
-        for method in DEFENCE_METHOD_LIST:
+        # The safe-verdict path (reached only for safe_value == "safe" under DEFENCE_SAFE_TOOLCALL)
+        # uses its own method list; every other blocked call uses DEFENCE_METHOD_LIST.
+        active_defence_methods = (
+            DEFENCE_SAFE_METHOD_LIST
+            if (DEFENCE_SAFE_TOOLCALL and safe_value == "safe")
+            else DEFENCE_METHOD_LIST
+        )
+
+        for method in active_defence_methods:
             if method == "remove_trigger_words":
                 # Cut the injected words out of the tool response that carried them. Telling the
                 # model to ignore an instruction leaves it in the conversation, where it is read
@@ -2105,7 +2122,7 @@ async def _handle_request(
 
             else:
                 log.warning(
-                    "[defence] unknown defence method %r in DEFENCE_METHOD_LIST; skipping", method,
+                    "[defence] unknown defence method %r in the defence method list; skipping", method,
                 )
                 continue
 
@@ -2207,7 +2224,7 @@ def main():
     global TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL
     global SECURITY_DEFENCE_DEBUG, SECURITY_DEFENCE_MAX_RETRIES
     global DEFENCE_METHOD_LIST, REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL
-    global REMOVE_TRIGGER_WORDS_FUZZY_SEARCH, DEFENCE_SAFE_TOOLCALL
+    global REMOVE_TRIGGER_WORDS_FUZZY_SEARCH, DEFENCE_SAFE_TOOLCALL, DEFENCE_SAFE_METHOD_LIST
     global tokenizer, _llama3_template
 
     parser = argparse.ArgumentParser(description="vllm two-phase inference proxy")
@@ -2300,6 +2317,10 @@ def main():
                         help=(f"validate a 'safe' verdict's trigger words against the user messages; "
                               f"if they are not from the user, run the defence methods (default: "
                               f"{str(DEFENCE_SAFE_TOOLCALL).lower()})"))
+    parser.add_argument("--defence_safe_method_list",
+                        default=None, metavar="M1,M2,...",
+                        help=(f"comma-separated defence methods for the safe-verdict path, applied "
+                              f"in order until one succeeds (default: {','.join(DEFENCE_SAFE_METHOD_LIST)})"))
     parser.add_argument("--log-level",             default="info",
                         help="log level: debug/info/warning/error (default: info)")
     args = parser.parse_args()
@@ -2353,6 +2374,8 @@ def main():
         REMOVE_TRIGGER_WORDS_FUZZY_SEARCH = args.remove_trigger_words_fuzzy_search == "true"
     if args.defence_safe_toolcall is not None:
         DEFENCE_SAFE_TOOLCALL = args.defence_safe_toolcall == "true"
+    if args.defence_safe_method_list is not None:
+        DEFENCE_SAFE_METHOD_LIST = [m.strip() for m in args.defence_safe_method_list.split(",") if m.strip()]
 
     # Set log level and attach a dated file handler so all output goes to both console and file.
     log_level = args.log_level.upper()
@@ -2404,7 +2427,7 @@ def main():
     log.info("  defence methods  : %s  fuzzy_trigger_search=%s  match_tool_call=%s",
              DEFENCE_METHOD_LIST, REMOVE_TRIGGER_WORDS_FUZZY_SEARCH,
              REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL)
-    log.info("  defence_safe     : %s", DEFENCE_SAFE_TOOLCALL)
+    log.info("  defence_safe     : %s  safe_methods=%s", DEFENCE_SAFE_TOOLCALL, DEFENCE_SAFE_METHOD_LIST)
     log.info("  fake_tool_resp   : %r", FAKE_TOOL_RESPONSE_CONTENT)
     log.info("  strip security   : %s  timeout=%ds", STRIP_SECURITY_IN_HISTORY, REQUEST_TIMEOUT)
     log.info("  context window   : fetched from vllm at startup")
