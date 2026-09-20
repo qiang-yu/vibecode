@@ -1307,6 +1307,14 @@ async def _validate_and_fix_tool_reason(
             return block_body, added_pt, added_ct
 
         truncate_at, append_text, reason = fix
+        # Print the block that was found faulty BEFORE the deviation message, so the exact
+        # tool_call_security under inspection can be read to see what went wrong. On round 1 this
+        # is the original phase-2 output; on later rounds it is the previous regeneration.
+        log.info(
+            "[phase2][validate] tool_call_security under inspection (round %d)=%s",
+            attempt + 1,
+            (TOOL_CALL_SECURITY_START + block_body + TOOL_CALL_SECURITY_END).replace("\n", "\\n"),
+        )
         if attempt >= SECURITY_TOOL_REASON_MAX_FIX:
             log.error(
                 "[phase2][validate] tool_reason still invalid after %d fix round(s) (%s); "
