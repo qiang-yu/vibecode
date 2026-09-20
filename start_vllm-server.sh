@@ -11,7 +11,6 @@ LISTEN_PORT=29001
 BASE_MODEL_PATH="/home/qiangyu/Models/Qwen/Qwen3-8B"
 BASE_MODEL_ID="Qwen3Base"
 LORA_MODEL_ID="lora-model"
-MODEL_TYPE="Qwen3"               # Qwen3 | Llama3
 
 MAX_TOKENS_SECURITY=4096          # max tokens for phase-2 lora security block
 REQUEST_TIMEOUT=600              # HTTP request timeout in seconds
@@ -61,7 +60,6 @@ python "${SCRIPT_DIR}/vllm-server.py" \
     --base-model-path      "${BASE_MODEL_PATH}" \
     --base-model-id        "${BASE_MODEL_ID}" \
     --lora-model-id        "${LORA_MODEL_ID}" \
-    --model-type           "${MODEL_TYPE}" \
     --max-tokens-security  "${MAX_TOKENS_SECURITY}" \
     --timeout              "${REQUEST_TIMEOUT}" \
     --log-level            "${LOG_LEVEL}" \

@@ -4,19 +4,14 @@
 # /v1/completions (raw-prompt), parses tool_calls from the combined
 # output, and returns a proper OpenAI chat.completion response.
 #
-# Usage (Qwen3):
+# This server targets Qwen3 only.
+#
+# Usage:
 #   python vllm-server.py \
 #     --base-model-path /path/to/Qwen3-8B \
-#     --model-type Qwen3 \
 #     [--vllm-url http://localhost:19001/v1] \
 #     [--base-model-id Qwen3Base] [--lora-model-id lora-model] \
 #     [--host localhost] [--port 29001]
-#
-# Usage (Llama3):
-#   python vllm-server.py \
-#     --base-model-path /path/to/llama3 \
-#     --model-type Llama3 \
-#     [--llama3-template tool_chat_template_llama3.1_json.jinja]
 ###
 
 import argparse
@@ -47,8 +42,6 @@ VLLM_BASE_URL             = "http://localhost:19006/v1"
 BASE_MODEL_ID             = "Qwen3Base"
 LORA_MODEL_ID             = "lora-model"
 BASE_MODEL_PATH           = "/home/qiangyu/Models/Qwen/Qwen3-8B"           # required: local path to load tokenizer
-MODEL_TYPE                = "Qwen3"     # Qwen3 | Llama3
-LLAMA3_TEMPLATE_PATH      = str(Path(__file__).parent / "tool_chat_template_llama3.1_json.jinja")
 MAX_TOKENS_SECURITY       = 1024        # hard limit for phase 2 / security block
 REQUEST_TIMEOUT           = 300         # seconds
 
@@ -451,7 +444,6 @@ log = logging.getLogger(__name__)
 tokenizer: Any = None
 _http: Optional[httpx.AsyncClient] = None
 _context_window: int = 0          # max_model_len from vllm, set at startup
-_llama3_template: Optional[str] = None   # Llama3 Jinja template, cached at startup
 
 # ---------------------------------------------------------------------------
 # FastAPI lifespan: one shared connection pool for the whole process
@@ -487,43 +479,6 @@ async def lifespan(app: FastAPI):
         log.error("Startup validation failed: %s", exc)
         raise
 
-    # Probe add_special_tokens=False only for Llama3: Qwen3 has no BOS token so
-    # the probe cannot detect anything meaningful there (counts match regardless).
-    if MODEL_TYPE.lower() == "llama3":
-        try:
-            probe = "Hello"
-            local_count = len(tokenizer.encode(probe, add_special_tokens=False))
-            r = await _http.post(
-                f"{VLLM_BASE_URL.rstrip('/')}/completions",
-                json={"model": BASE_MODEL_ID, "prompt": probe, "max_tokens": 1,
-                      "add_special_tokens": False},
-            )
-            r.raise_for_status()
-            vllm_count = r.json().get("usage", {}).get("prompt_tokens", -1)
-            if vllm_count == local_count:
-                log.info("add_special_tokens=False verified for Llama3 (%d tokens)", local_count)
-            else:
-                log.warning(
-                    "add_special_tokens probe mismatch: local=%d vllm=%d — "
-                    "vllm may be ignoring add_special_tokens=False; Llama3 will get duplicate BOS",
-                    local_count, vllm_count,
-                )
-        except httpx.HTTPStatusError as exc:
-            if 400 <= exc.response.status_code < 500:
-                # vllm rejected the field — it is not supported in this version.
-                await _http.aclose()
-                log.error(
-                    "add_special_tokens=False was rejected by vllm (%d). "
-                    "This vllm version does not support the field; Llama3 will get duplicate BOS "
-                    "and prompt token counts will be off by 1.",
-                    exc.response.status_code,
-                )
-                raise
-            log.warning("add_special_tokens probe failed (non-fatal, HTTP %d): %s",
-                        exc.response.status_code, exc)
-        except Exception as exc:
-            log.warning("add_special_tokens probe failed (non-fatal): %s", exc)
-
     yield
     await _http.aclose()
     log.info("HTTP client closed")
@@ -542,7 +497,6 @@ _SECURITY_BLOCK_RE     = re.compile(r"<tool_call_security>.*?</tool_call_securit
 _TOOL_CALL_RE          = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 _THINK_RE              = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 _THINK_CONTENT_RE      = re.compile(r"(<think>)(.*?)(</think>)", re.DOTALL)
-_LLAMA3_BOT            = "<|python_tag|>"
 
 # Safety level ranking — higher number means safer.
 _SAFETY_LEVELS         = {"safe": 3, "neutral": 2, "suspicious": 1, "unsafe": 0}
@@ -570,8 +524,7 @@ _VERDICT_MALFORMED = object()
 # ---------------------------------------------------------------------------
 
 def _render_tool_calls_as_text(tool_calls: List[Dict]) -> str:
-    """Serialize the OpenAI tool_calls array back to the model's native text."""
-    mt = MODEL_TYPE.strip().lower()
+    """Serialize the OpenAI tool_calls array back to Qwen3's native <tool_call> text."""
     parts = []
     for tc in tool_calls:
         fn = tc.get("function", {})
@@ -580,12 +533,8 @@ def _render_tool_calls_as_text(tool_calls: List[Dict]) -> str:
             args = json.loads(fn.get("arguments", "{}"))
         except json.JSONDecodeError:
             args = {}
-        if mt == "qwen3":
-            obj = {"name": name, "arguments": args}
-            parts.append(f"<tool_call>\n{json.dumps(obj, ensure_ascii=False)}\n</tool_call>")
-        elif mt == "llama3":
-            obj = {"name": name, "parameters": args}
-            parts.append(json.dumps(obj, ensure_ascii=False))
+        obj = {"name": name, "arguments": args}
+        parts.append(f"<tool_call>\n{json.dumps(obj, ensure_ascii=False)}\n</tool_call>")
     return "\n".join(parts)
 
 
@@ -649,26 +598,13 @@ def _normalize_messages(messages: List[Dict]) -> List[Dict]:
 
 def _render_prompt(messages: List[Dict], tools: Optional[List[Dict]]) -> str:
     msgs = _normalize_messages(messages)
-    mt = MODEL_TYPE.strip().lower()
-    if mt == "qwen3":
-        return tokenizer.apply_chat_template(
-            msgs,
-            tools=tools or None,
-            add_generation_prompt=True,
-            tokenize=False,
-            enable_thinking=ENABLE_THINKING,
-        )
-    if mt == "llama3":
-        if _llama3_template is None:
-            raise ValueError("Llama3 template not loaded; was --model-type Llama3 set at startup?")
-        return tokenizer.apply_chat_template(
-            msgs,
-            tools=tools or None,
-            add_generation_prompt=True,
-            tokenize=False,
-            chat_template=_llama3_template,
-        )
-    raise ValueError(f"Unknown model_type: {MODEL_TYPE!r}")
+    return tokenizer.apply_chat_template(
+        msgs,
+        tools=tools or None,
+        add_generation_prompt=True,
+        tokenize=False,
+        enable_thinking=ENABLE_THINKING,
+    )
 
 # ---------------------------------------------------------------------------
 # Tool-call output parsing
@@ -727,29 +663,8 @@ def _parse_qwen3(text: str) -> Tuple[List[Dict], Optional[str]]:
     return tool_calls, content
 
 
-def _parse_llama3(text: str) -> Tuple[List[Dict], Optional[str]]:
-    bot = text.startswith(_LLAMA3_BOT)
-    if not bot and not text.startswith("{"):
-        return [], text.strip() or None
-    start = len(_LLAMA3_BOT) if bot else 0
-    try:
-        dec = json.JSONDecoder()
-        obj, end = dec.raw_decode(text[start:])
-        end += start
-        args = obj.get("arguments", obj.get("parameters", {}))
-        tool_calls = [{"name": obj.get("name", ""), "arguments": json.dumps(args, ensure_ascii=False)}]
-        return tool_calls, text[end:].strip() or None
-    except (json.JSONDecodeError, ValueError):
-        return [], text.strip() or None
-
-
 def _parse_output(text: str) -> Tuple[List[Dict], Optional[str]]:
-    mt = MODEL_TYPE.strip().lower()
-    if mt == "qwen3":
-        return _parse_qwen3(text)
-    if mt == "llama3":
-        return _parse_llama3(text)
-    return [], text.strip() or None
+    return _parse_qwen3(text)
 
 
 def _build_response(
@@ -2020,8 +1935,8 @@ async def health():
 # ---------------------------------------------------------------------------
 
 def main():
-    global VLLM_BASE_URL, BASE_MODEL_ID, LORA_MODEL_ID, BASE_MODEL_PATH, MODEL_TYPE
-    global LLAMA3_TEMPLATE_PATH, MAX_TOKENS_SECURITY, REQUEST_TIMEOUT
+    global VLLM_BASE_URL, BASE_MODEL_ID, LORA_MODEL_ID, BASE_MODEL_PATH
+    global MAX_TOKENS_SECURITY, REQUEST_TIMEOUT
     global LISTEN_HOST, LISTEN_PORT, LOG_FILE_NAME, STRIP_SECURITY_IN_HISTORY, ENABLE_THINKING
     global PHASE2_ENABLE, PHASE1_THINK_RETRY_COUNT, PHASE2_TOOL_REASON_RETRY_COUNT
     global VLLM_INFERENCE_DEBUG, OUTPUT_RAW_CLIENT_INPUT
@@ -2032,7 +1947,7 @@ def main():
     global DEFENCE_METHOD_LIST, DEFENCE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL
     global DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH, DEFENCE_SAFE_TOOLCALL, DEFENCE_SAFE_METHOD_LIST
     global DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL, DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH
-    global tokenizer, _llama3_template
+    global tokenizer
 
     parser = argparse.ArgumentParser(description="vllm two-phase inference proxy")
     parser.add_argument("--vllm-url",             default=None, metavar="URL",
@@ -2043,10 +1958,6 @@ def main():
                         help=f"vllm model ID for lora model (default: {LORA_MODEL_ID})")
     parser.add_argument("--base-model-path",       default=None, metavar="PATH",
                         help=f"local path used to load the tokenizer (default: {BASE_MODEL_PATH})")
-    parser.add_argument("--model-type",            default=None, choices=["Qwen3", "Llama3"],
-                        help=f"model type (default: {MODEL_TYPE})")
-    parser.add_argument("--llama3-template",       default=None, metavar="PATH",
-                        help=f"path to Llama3 Jinja chat template (default: {LLAMA3_TEMPLATE_PATH})")
     parser.add_argument("--max-tokens-security",   type=int, default=None, metavar="N",
                         help=f"max tokens for phase 2 / lora security block (default: {MAX_TOKENS_SECURITY})")
     parser.add_argument("--timeout",               type=int, default=None, metavar="SEC",
@@ -2148,8 +2059,6 @@ def main():
     if args.base_model_id:       BASE_MODEL_ID        = args.base_model_id
     if args.lora_model_id:       LORA_MODEL_ID        = args.lora_model_id
     if args.base_model_path:   BASE_MODEL_PATH      = args.base_model_path
-    if args.model_type:          MODEL_TYPE           = args.model_type
-    if args.llama3_template:     LLAMA3_TEMPLATE_PATH = args.llama3_template
     if args.max_tokens_security: MAX_TOKENS_SECURITY  = args.max_tokens_security
     if args.timeout:             REQUEST_TIMEOUT      = args.timeout
     if args.host:                LISTEN_HOST          = args.host
@@ -2218,16 +2127,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, trust_remote_code=True)
     log.info("Tokenizer loaded")
 
-    if MODEL_TYPE.lower() == "llama3":
-        log.info("Loading Llama3 template from %s", LLAMA3_TEMPLATE_PATH)
-        with open(LLAMA3_TEMPLATE_PATH, encoding="utf-8") as f:
-            _llama3_template = f.read()
-        log.info("Llama3 template loaded")
-
     log.info("vllm-server starting up")
     log.info("  listen           : http://%s:%d/v1", LISTEN_HOST, LISTEN_PORT)
     log.info("  vllm             : %s", VLLM_BASE_URL)
-    log.info("  model type       : %s", MODEL_TYPE)
     log.info("  base model       : %s", BASE_MODEL_ID)
     log.info("  lora model       : %s  security_max_tokens=%d", LORA_MODEL_ID, MAX_TOKENS_SECURITY)
     log.info("  enable_thinking  : %s", ENABLE_THINKING)
