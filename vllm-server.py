@@ -1189,11 +1189,14 @@ def _excise_trigger_words(
     passed through _sanitize_span_text, which keeps its URLs and data tokens and drops only the
     words that made it read as a command, so a URL a following genuine tool call needs is not lost.
     A sanitize that yields empty text, or a spaCy that is unavailable, falls back to the placeholder.
+    A sanitize that changes nothing (output equals input) is treated as no match, so the caller
+    moves on to the next steps and defence methods rather than "repairing" the span with itself.
 
-    Returns (new_messages, index, removed_text, filler) or None when nothing matched. removed_text
-    is the original matched span (what was there before) and filler is the text put in its place
-    (the sanitized span, or the placeholder), so the caller can log both. The input list is not
-    modified; the one message that changes is copied.
+    Returns (new_messages, index, removed_text, filler) or None when nothing matched (including when
+    sanitize left every matched span unchanged). removed_text is the original matched span (what was
+    there before) and filler is the text put in its place (the sanitized span, or the placeholder),
+    so the caller can log both. The input list is not modified; the one message that changes is
+    copied.
     """
     trigger = (trigger_words or "").strip().strip('"\'')
     if len(trigger) < 8:
@@ -1215,6 +1218,18 @@ def _excise_trigger_words(
         filler = _sanitize_span_text(removed) if sanitize else None
         if not filler:
             filler = DEFENCE_REMOVED_PLACEHOLDER
+        # When sanitize kept every word — its output equals the input apart from whitespace — it
+        # neutralised nothing, so this match is not a usable repair (e.g. a keyword fragment the
+        # POS/verb rules could not touch). Keep scanning the other tool responses; if none yields
+        # an effective sanitize the function returns None and the caller falls through to the next
+        # steps (match-tool-call, fuzzy) and the remaining defence methods (e.g. fake_tool_response).
+        if sanitize and re.sub(r"\s+", " ", filler).strip() == re.sub(r"\s+", " ", removed).strip():
+            log.info(
+                "[defence] remove_trigger_words: sanitize left the span unchanged at message "
+                "index %d (nothing neutralised): %r — treating as ineffective, moving on.",
+                i, removed.replace("\n", "\\n")[:400],
+            )
+            continue
         # Guarantee the two sides cannot fuse. The matched span is not always word-aligned —
         # a substring match ends wherever the reported words end — so "finished.Please visit"
         # would otherwise become "finished.visit", and a cut inside a word would invent one.
