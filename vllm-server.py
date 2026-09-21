@@ -393,10 +393,12 @@ DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH    = False
 #
 #   With sanitize on, the span is parsed with spaCy and rebuilt keeping only the tokens that name a
 #   thing or a value and therefore cannot, on their own, read as a command: URLs and e-mail
-#   addresses, plus the parts of speech in DEFENCE_SANITIZE_KEEP_POS (nouns, proper nouns, numbers,
-#   adjectives). Verbs, adverbs, prepositions, pronouns, conjunctions, ... are dropped, which is what
-#   removes the imperative that triggered the call. Punctuation and whitespace between the kept words
-#   are preserved so two survivors can never fuse. Example:
+#   addresses; anything spaCy recognises as a named entity (people, countries, cities, locations,
+#   streets/buildings, organisations, dates, money, phone/other numbers); numeric-looking tokens;
+#   and the parts of speech in DEFENCE_SANITIZE_KEEP_POS (nouns, proper nouns, numbers, adjectives).
+#   Verbs, adverbs, prepositions, pronouns, conjunctions, ... are dropped, which is what removes the
+#   imperative that triggered the call. Punctuation and whitespace between the kept words are
+#   preserved so two survivors can never fuse. Example:
 #       "visit website for details www.restaurant-zurich.com"
 #         -> "website details www.restaurant-zurich.com"   (URL kept, "visit"/"for" dropped)
 #
@@ -990,9 +992,10 @@ def _get_spacy_nlp():
     """Lazy-load and cache the spaCy model used by the sanitize mode.
 
     Returns the loaded pipeline, or None when spaCy or the model is unavailable — the caller then
-    falls back to plain removal. The parser, NER and lemmatizer components are disabled because the
-    sanitize mode only reads coarse POS tags (token.pos_), so the lighter pipeline is enough and
-    faster to load.
+    falls back to plain removal. The parser and lemmatizer are disabled (unused), but the NER
+    component is kept on: the sanitize mode reads coarse POS tags AND named-entity types
+    (token.ent_type_) so that people, places, countries, streets, organisations, dates and the like
+    are recognised as data and preserved, not just what the POS tagger happens to label PROPN/NOUN.
     """
     global _SPACY_NLP, _SPACY_LOAD_FAILED
     if _SPACY_NLP is not None:
@@ -1002,7 +1005,7 @@ def _get_spacy_nlp():
     try:
         import spacy
         _SPACY_NLP = spacy.load(
-            DEFENCE_SANITIZE_SPACY_MODEL, disable=["parser", "ner", "lemmatizer"],
+            DEFENCE_SANITIZE_SPACY_MODEL, disable=["parser", "lemmatizer"],
         )
         log.info("[defence] sanitize: loaded spaCy model %r", DEFENCE_SANITIZE_SPACY_MODEL)
     except Exception as exc:
@@ -1020,8 +1023,15 @@ def _sanitize_span_text(span_text: str) -> Optional[str]:
     """Neutralise a trigger span while keeping its URLs and data tokens.
 
     Rebuilds the span from spaCy tokens, keeping only those that cannot read as a command on their
-    own: URLs, e-mail addresses, punctuation, whitespace, and the parts of speech in
-    DEFENCE_SANITIZE_KEEP_POS. Each survivor is emitted with its trailing whitespace
+    own — everything that names a thing or carries a value:
+      - URLs and e-mail addresses (like_url / like_email);
+      - anything spaCy tagged as part of a named entity (ent_type_): people, countries, cities,
+        other locations, streets/buildings, organisations, dates, money, phone/other numbers, ...;
+      - numeric-looking tokens (like_num), so phone numbers and amounts survive even untagged;
+      - the parts of speech in DEFENCE_SANITIZE_KEEP_POS (nouns, proper nouns, numbers, adjectives);
+      - punctuation and whitespace, so survivors keep their separators.
+    Verbs, adverbs, prepositions, pronouns, conjunctions, ... are dropped, which is what removes the
+    imperative that triggered the call. Each survivor is emitted with its trailing whitespace
     (token.text_with_ws), so a dropped word between two survivors collapses to the single space the
     survivor before it already carried — two kept words can never fuse. Runs of whitespace opened up
     by the dropped tokens are then collapsed.
@@ -1041,6 +1051,8 @@ def _sanitize_span_text(span_text: str) -> Optional[str]:
             or tok.is_punct
             or tok.like_url
             or tok.like_email
+            or tok.like_num
+            or tok.ent_type_
             or tok.pos_ in DEFENCE_SANITIZE_KEEP_POS
         )
     ]
@@ -1053,7 +1065,7 @@ def _sanitize_span_text(span_text: str) -> Optional[str]:
 def _excise_trigger_words(
     messages: List[Dict[str, Any]], trigger_words: str, allow_fuzzy: bool = False,
     sanitize: bool = False,
-) -> Optional[Tuple[List[Dict[str, Any]], int, str]]:
+) -> Optional[Tuple[List[Dict[str, Any]], int, str, str]]:
     """Cut the trigger words out of the tool response that carried them.
 
     Walks the conversation backwards, because the injected text is usually in the most recent
@@ -1071,9 +1083,10 @@ def _excise_trigger_words(
     words that made it read as a command, so a URL a following genuine tool call needs is not lost.
     A sanitize that yields empty text, or a spaCy that is unavailable, falls back to the placeholder.
 
-    Returns (new_messages, index, removed_text) or None when nothing matched. removed_text is the
-    original matched span (what was there before), regardless of what replaced it. The input list
-    is not modified; the one message that changes is copied.
+    Returns (new_messages, index, removed_text, filler) or None when nothing matched. removed_text
+    is the original matched span (what was there before) and filler is the text put in its place
+    (the sanitized span, or the placeholder), so the caller can log both. The input list is not
+    modified; the one message that changes is copied.
     """
     trigger = (trigger_words or "").strip().strip('"\'')
     if len(trigger) < 8:
@@ -1110,7 +1123,7 @@ def _excise_trigger_words(
         new_msg = dict(messages[i])
         new_msg["content"] = cleaned
         new_messages[i] = new_msg
-        return new_messages, i, removed
+        return new_messages, i, removed, filler.strip()
     return None
 
 
@@ -2036,13 +2049,21 @@ async def _handle_request(
                     )
                     continue
 
-                work_messages, msg_index, removed_text = excised
-                log.info(
-                    "[defence] remove_trigger_words: %s injected words in tool response "
-                    "at message index %d: %s",
-                    "sanitized" if rtw_sanitize else "removed",
-                    msg_index, removed_text.replace("\n", "\\n")[:400],
-                )
+                work_messages, msg_index, removed_text, filler_text = excised
+                if rtw_sanitize:
+                    log.info(
+                        "[defence] remove_trigger_words: sanitized injected words in tool response "
+                        "at message index %d: %r -> %r",
+                        msg_index,
+                        removed_text.replace("\n", "\\n")[:400],
+                        filler_text.replace("\n", "\\n")[:400],
+                    )
+                else:
+                    log.info(
+                        "[defence] remove_trigger_words: removed injected words from tool response "
+                        "at message index %d: %s",
+                        msg_index, removed_text.replace("\n", "\\n")[:400],
+                    )
                 if attempt >= SECURITY_DEFENCE_MAX_RETRIES:
                     log.warning(
                         "[defence] max retries (%d) reached after excision — letting the turn "
