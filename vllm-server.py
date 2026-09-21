@@ -1148,6 +1148,27 @@ def _sanitize_span_text(span_text: str) -> Optional[str]:
     return cleaned.strip()
 
 
+def _init_sanitize_backends() -> None:
+    """Eagerly load the sanitize-mode backends (spaCy, and WordNet when the verb filter is on) at
+    startup, so their availability is known and logged up front rather than on the first tool call
+    that needs them. Runs only when a sanitize flag is enabled. _get_spacy_nlp / _get_wordnet log
+    their own detailed success/error; this adds one consolidated status line on top.
+    """
+    if not (DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE or DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE):
+        log.info("  sanitize backends: skipped (sanitize disabled on both paths)")
+        return
+    spacy_ok = _get_spacy_nlp() is not None
+    if DEFENCE_SANITIZE_WORDNET_VERB_FILTER:
+        wordnet_status = "OK" if _get_wordnet() is not None else "FAILED (POS rules only)"
+    else:
+        wordnet_status = "disabled"
+    log.info(
+        "  sanitize backends: spaCy=%s  wordnet=%s",
+        "OK" if spacy_ok else "FAILED (fallback to plain removal)",
+        wordnet_status,
+    )
+
+
 def _excise_trigger_words(
     messages: List[Dict[str, Any]], trigger_words: str, allow_fuzzy: bool = False,
     sanitize: bool = False,
@@ -2556,6 +2577,8 @@ def main():
         log.info("  sanitize spaCy   : model=%s  keep_pos=%s  wordnet_verb_filter=%s",
                  DEFENCE_SANITIZE_SPACY_MODEL, sorted(DEFENCE_SANITIZE_KEEP_POS),
                  DEFENCE_SANITIZE_WORDNET_VERB_FILTER)
+    # Eagerly load spaCy/WordNet now so their status is known and logged at startup.
+    _init_sanitize_backends()
     log.info("  fake_tool_resp   : %r", FAKE_TOOL_RESPONSE_CONTENT)
     log.info("  strip security   : %s  timeout=%ds", STRIP_SECURITY_IN_HISTORY, REQUEST_TIMEOUT)
     log.info("  context window   : fetched from vllm at startup")
