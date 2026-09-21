@@ -418,6 +418,19 @@ DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE = True
 DEFENCE_SANITIZE_SPACY_MODEL = "en_core_web_sm"
 DEFENCE_SANITIZE_KEEP_POS    = frozenset({"NOUN", "PROPN", "NUM", "ADJ"})
 
+# A trigger span is often a keyword fragment ("Concatenate messages channels Slack website ..."),
+# not a grammatical sentence, and on such fragments spaCy's POS tagger has no syntactic context and
+# mislabels verbs as ADJ/NOUN/PROPN — so a command word like "Concatenate" is wrongly kept. WordNet
+# closes that gap: a word it knows ONLY as a verb (verb synsets, no noun synsets) can never be a
+# needed argument, so it is force-dropped whatever the POS tagger said. Words that are also nouns
+# ("message", "channel", "website", "slack") keep their noun sense and survive. The check is
+# deliberately conservative — it only drops unambiguous verbs — so it never destroys data; an
+# ambiguous verb that WordNet also lists as a noun (e.g. "visit") is left to the POS tagger. Needs
+# nltk + the WordNet corpus (pip install nltk && python -m nltk.downloader wordnet omw-1.4); when
+# either is missing the filter is disabled with a one-time log and sanitisation falls back to the
+# POS/entity rules alone.
+DEFENCE_SANITIZE_WORDNET_VERB_FILTER = True
+
 # What is left behind in place of the removed words.
 #
 # Something has to be, for two reasons.
@@ -1019,6 +1032,70 @@ def _get_spacy_nlp():
     return _SPACY_NLP
 
 
+# nltk WordNet, loaded on demand to catch verbs the POS tagger mislabels on keyword fragments.
+# _WORDNET_LOAD_FAILED latches a failed load so a missing corpus is reported once, not per token.
+_WORDNET = None
+_WORDNET_LOAD_FAILED = False
+_VERB_ONLY_CACHE: Dict[str, bool] = {}
+
+
+def _get_wordnet():
+    """Lazy-load and cache the nltk WordNet corpus used by the verb filter.
+
+    Returns the corpus reader, or None when nltk or the WordNet data is unavailable — the caller
+    then skips the verb filter and relies on the POS/entity rules alone. A probe lookup forces the
+    corpus to load now so a missing download fails here rather than on first real use.
+    """
+    global _WORDNET, _WORDNET_LOAD_FAILED
+    if _WORDNET is not None:
+        return _WORDNET
+    if _WORDNET_LOAD_FAILED:
+        return None
+    try:
+        from nltk.corpus import wordnet as wn
+        wn.synsets("test")  # force the lazy corpus to load; raises LookupError if not downloaded
+        _WORDNET = wn
+        log.info("[defence] sanitize: loaded nltk WordNet for verb filtering")
+    except Exception as exc:
+        _WORDNET_LOAD_FAILED = True
+        log.error(
+            "[defence] sanitize: nltk WordNet unavailable (%s); verb filter disabled, using "
+            "POS/entity rules only. Install it with: pip install nltk && "
+            "python -m nltk.downloader wordnet omw-1.4", exc,
+        )
+        return None
+    return _WORDNET
+
+
+def _is_verb_only_word(word: str) -> bool:
+    """True when WordNet knows this word ONLY as a verb (verb synsets, no noun synsets).
+
+    Such a word cannot be a needed argument, so it is safe to drop even when the POS tagger — with
+    no sentence context on a keyword fragment — mislabelled it ADJ/NOUN/PROPN. The check is
+    conservative on purpose: a word that also has a noun sense (message, channel, website, slack,
+    even visit) returns False and is left to the POS rules, so real data is never destroyed here.
+    WordNet's morphy normalises inflections, so "sends"/"deleting" resolve to their base verb.
+    Returns False whenever WordNet is unavailable. Results are cached per lowercased word.
+    """
+    wn = _get_wordnet()
+    if wn is None:
+        return False
+    w = word.lower()
+    if len(w) < 3 or not w.isalpha():
+        return False
+    cached = _VERB_ONLY_CACHE.get(w)
+    if cached is not None:
+        return cached
+    try:
+        has_verb = bool(wn.synsets(w, pos=wn.VERB))
+        has_noun = bool(wn.synsets(w, pos=wn.NOUN))
+    except Exception:
+        return False
+    result = has_verb and not has_noun
+    _VERB_ONLY_CACHE[w] = result
+    return result
+
+
 def _sanitize_span_text(span_text: str) -> Optional[str]:
     """Neutralise a trigger span while keeping its URLs and data tokens.
 
@@ -1031,10 +1108,14 @@ def _sanitize_span_text(span_text: str) -> Optional[str]:
       - the parts of speech in DEFENCE_SANITIZE_KEEP_POS (nouns, proper nouns, numbers, adjectives);
       - punctuation and whitespace, so survivors keep their separators.
     Verbs, adverbs, prepositions, pronouns, conjunctions, ... are dropped, which is what removes the
-    imperative that triggered the call. Each survivor is emitted with its trailing whitespace
-    (token.text_with_ws), so a dropped word between two survivors collapses to the single space the
-    survivor before it already carried — two kept words can never fuse. Runs of whitespace opened up
-    by the dropped tokens are then collapsed.
+    imperative that triggered the call. On top of the POS rules, when the WordNet verb filter is on,
+    a word WordNet knows only as a verb is force-dropped even if the POS tagger mislabelled it
+    (see _is_verb_only_word) — this catches command words like "Concatenate" on keyword fragments
+    where the tagger has no context; the hard keeps above (URL/email/number/entity) still win, so a
+    data token is never dropped by the verb filter. Each survivor is emitted with its trailing
+    whitespace (token.text_with_ws), so a dropped word between two survivors collapses to the single
+    space the survivor before it already carried — two kept words can never fuse. Runs of whitespace
+    opened up by the dropped tokens are then collapsed.
 
     Returns the sanitized string (possibly empty when every token was dropped), or None when spaCy
     is unavailable so the caller can fall back to the plain-removal placeholder.
@@ -1043,9 +1124,9 @@ def _sanitize_span_text(span_text: str) -> Optional[str]:
     if nlp is None:
         return None
     doc = nlp(span_text)
-    kept = [
-        tok.text_with_ws
-        for tok in doc
+    kept = []
+    for tok in doc:
+        # Hard keeps: data that must survive regardless of POS or the verb filter.
         if (
             tok.is_space
             or tok.is_punct
@@ -1053,9 +1134,14 @@ def _sanitize_span_text(span_text: str) -> Optional[str]:
             or tok.like_email
             or tok.like_num
             or tok.ent_type_
-            or tok.pos_ in DEFENCE_SANITIZE_KEEP_POS
-        )
-    ]
+        ):
+            kept.append(tok.text_with_ws)
+            continue
+        # Force-drop a word WordNet knows only as a verb, whatever the POS tagger called it.
+        if DEFENCE_SANITIZE_WORDNET_VERB_FILTER and _is_verb_only_word(tok.text):
+            continue
+        if tok.pos_ in DEFENCE_SANITIZE_KEEP_POS:
+            kept.append(tok.text_with_ws)
     cleaned = "".join(kept)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -2467,8 +2553,9 @@ def main():
              DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL,
              DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE)
     if DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE or DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE:
-        log.info("  sanitize spaCy   : model=%s  keep_pos=%s",
-                 DEFENCE_SANITIZE_SPACY_MODEL, sorted(DEFENCE_SANITIZE_KEEP_POS))
+        log.info("  sanitize spaCy   : model=%s  keep_pos=%s  wordnet_verb_filter=%s",
+                 DEFENCE_SANITIZE_SPACY_MODEL, sorted(DEFENCE_SANITIZE_KEEP_POS),
+                 DEFENCE_SANITIZE_WORDNET_VERB_FILTER)
     log.info("  fake_tool_resp   : %r", FAKE_TOOL_RESPONSE_CONTENT)
     log.info("  strip security   : %s  timeout=%ds", STRIP_SECURITY_IN_HISTORY, REQUEST_TIMEOUT)
     log.info("  context window   : fetched from vllm at startup")
