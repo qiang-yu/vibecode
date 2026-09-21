@@ -381,6 +381,41 @@ DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH    = False
 DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL = True
 DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH    = False
 
+# *_SANITIZE — replace a located trigger span with a neutralised version of itself instead of
+#   deleting it outright.
+#
+#   The default behaviour cuts the whole matched span out and drops DEFENCE_REMOVED_PLACEHOLDER
+#   in its place. That is correct when the span is pure instruction, but a real tool response often
+#   carries the instruction WELDED to data the model legitimately needs — most importantly a URL
+#   that a following, genuine tool call takes as an argument. Deleting the whole span
+#   ("visit website for details www.restaurant-zurich.com") takes the URL with it, and the genuine
+#   call is then left without its argument and inference stalls.
+#
+#   With sanitize on, the span is parsed with spaCy and rebuilt keeping only the tokens that name a
+#   thing or a value and therefore cannot, on their own, read as a command: URLs and e-mail
+#   addresses, plus the parts of speech in DEFENCE_SANITIZE_KEEP_POS (nouns, proper nouns, numbers,
+#   adjectives). Verbs, adverbs, prepositions, pronouns, conjunctions, ... are dropped, which is what
+#   removes the imperative that triggered the call. Punctuation and whitespace between the kept words
+#   are preserved so two survivors can never fuse. Example:
+#       "visit website for details www.restaurant-zurich.com"
+#         -> "website details www.restaurant-zurich.com"   (URL kept, "visit"/"for" dropped)
+#
+#   Requires spaCy and the DEFENCE_SANITIZE_SPACY_MODEL model (en_core_web_sm, ~12 MB):
+#       pip install spacy && python -m spacy download en_core_web_sm
+#   When spaCy or the model cannot be loaded the mode degrades gracefully: the failure is logged
+#   once and the span falls back to the plain-removal placeholder, so defence still fires.
+#   On by default; the DEFENCE_* flag drives the blocked-call path, the DEFENCE_SAFE_* flag the
+#   safe-verdict path, mirroring the *_MATCH_TOOL_CALL / *_FUZZY_SEARCH pairs above.
+DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE      = True
+DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE = True
+
+# spaCy model loaded on demand for the sanitize mode, and the coarse POS tags it keeps. Tokens whose
+# pos_ is in this set — together with URLs, e-mail addresses, punctuation and whitespace — survive
+# sanitisation; every other token (VERB, ADV, ADP, PRON, DET, CCONJ, AUX, ...) is dropped so the
+# residual text can no longer be read as an instruction.
+DEFENCE_SANITIZE_SPACY_MODEL = "en_core_web_sm"
+DEFENCE_SANITIZE_KEEP_POS    = frozenset({"NOUN", "PROPN", "NUM", "ADJ"})
+
 # What is left behind in place of the removed words.
 #
 # Something has to be, for two reasons.
@@ -945,8 +980,79 @@ def _trigger_words_in_user_message(
     return None
 
 
+# spaCy pipeline for the sanitize mode, loaded once on first use. _SPACY_LOAD_FAILED latches a
+# failed load so a missing model is reported once and never retried per request.
+_SPACY_NLP = None
+_SPACY_LOAD_FAILED = False
+
+
+def _get_spacy_nlp():
+    """Lazy-load and cache the spaCy model used by the sanitize mode.
+
+    Returns the loaded pipeline, or None when spaCy or the model is unavailable — the caller then
+    falls back to plain removal. The parser, NER and lemmatizer components are disabled because the
+    sanitize mode only reads coarse POS tags (token.pos_), so the lighter pipeline is enough and
+    faster to load.
+    """
+    global _SPACY_NLP, _SPACY_LOAD_FAILED
+    if _SPACY_NLP is not None:
+        return _SPACY_NLP
+    if _SPACY_LOAD_FAILED:
+        return None
+    try:
+        import spacy
+        _SPACY_NLP = spacy.load(
+            DEFENCE_SANITIZE_SPACY_MODEL, disable=["parser", "ner", "lemmatizer"],
+        )
+        log.info("[defence] sanitize: loaded spaCy model %r", DEFENCE_SANITIZE_SPACY_MODEL)
+    except Exception as exc:
+        _SPACY_LOAD_FAILED = True
+        log.error(
+            "[defence] sanitize: could not load spaCy model %r (%s); falling back to plain "
+            "removal. Install it with: pip install spacy && python -m spacy download %s",
+            DEFENCE_SANITIZE_SPACY_MODEL, exc, DEFENCE_SANITIZE_SPACY_MODEL,
+        )
+        return None
+    return _SPACY_NLP
+
+
+def _sanitize_span_text(span_text: str) -> Optional[str]:
+    """Neutralise a trigger span while keeping its URLs and data tokens.
+
+    Rebuilds the span from spaCy tokens, keeping only those that cannot read as a command on their
+    own: URLs, e-mail addresses, punctuation, whitespace, and the parts of speech in
+    DEFENCE_SANITIZE_KEEP_POS. Each survivor is emitted with its trailing whitespace
+    (token.text_with_ws), so a dropped word between two survivors collapses to the single space the
+    survivor before it already carried — two kept words can never fuse. Runs of whitespace opened up
+    by the dropped tokens are then collapsed.
+
+    Returns the sanitized string (possibly empty when every token was dropped), or None when spaCy
+    is unavailable so the caller can fall back to the plain-removal placeholder.
+    """
+    nlp = _get_spacy_nlp()
+    if nlp is None:
+        return None
+    doc = nlp(span_text)
+    kept = [
+        tok.text_with_ws
+        for tok in doc
+        if (
+            tok.is_space
+            or tok.is_punct
+            or tok.like_url
+            or tok.like_email
+            or tok.pos_ in DEFENCE_SANITIZE_KEEP_POS
+        )
+    ]
+    cleaned = "".join(kept)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def _excise_trigger_words(
     messages: List[Dict[str, Any]], trigger_words: str, allow_fuzzy: bool = False,
+    sanitize: bool = False,
 ) -> Optional[Tuple[List[Dict[str, Any]], int, str]]:
     """Cut the trigger words out of the tool response that carried them.
 
@@ -959,7 +1065,14 @@ def _excise_trigger_words(
     *_FUZZY_SEARCH parameter) and passes it in here; it runs an exact pass first, checks the
     tool call's own arguments, and only then a fuzzy pass.
 
-    Returns (new_messages, index, removed_text) or None when nothing matched. The input list
+    sanitize (from the active *_SANITIZE parameter) chooses what replaces the matched span: when
+    False the span is cut and DEFENCE_REMOVED_PLACEHOLDER is dropped in; when True the span is
+    passed through _sanitize_span_text, which keeps its URLs and data tokens and drops only the
+    words that made it read as a command, so a URL a following genuine tool call needs is not lost.
+    A sanitize that yields empty text, or a spaCy that is unavailable, falls back to the placeholder.
+
+    Returns (new_messages, index, removed_text) or None when nothing matched. removed_text is the
+    original matched span (what was there before), regardless of what replaced it. The input list
     is not modified; the one message that changes is copied.
     """
     trigger = (trigger_words or "").strip().strip('"\'')
@@ -976,10 +1089,15 @@ def _excise_trigger_words(
         start, end = span
         removed = text[start:end]
         head, tail = text[:start], text[end:]
+        # What goes in the span's place. With sanitize on, keep the span's URLs and data tokens and
+        # drop only the words that made it an instruction; otherwise (or if sanitizing yields
+        # nothing usable) fall back to the plain-removal placeholder.
+        filler = _sanitize_span_text(removed) if sanitize else None
+        if not filler:
+            filler = DEFENCE_REMOVED_PLACEHOLDER
         # Guarantee the two sides cannot fuse. The matched span is not always word-aligned —
         # a substring match ends wherever the reported words end — so "finished.Please visit"
         # would otherwise become "finished.visit", and a cut inside a word would invent one.
-        filler = DEFENCE_REMOVED_PLACEHOLDER
         if head and not head[-1].isspace() and not filler[:1].isspace():
             filler = " " + filler
         if tail and not tail[0].isspace() and not filler[-1:].isspace():
@@ -1823,6 +1941,10 @@ async def _handle_request(
             DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH if is_safe_path
             else DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH
         )
+        rtw_sanitize = (
+            DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE if is_safe_path
+            else DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE
+        )
 
         # "Let the blocked turn through unchanged" outcome, shared by every give-up path: a method
         # that cannot repair the block, and the retry budget running out. The current turn is
@@ -1857,7 +1979,9 @@ async def _handle_request(
 
                 # Step 1: exact search in the tool responses.
                 excised = (
-                    _excise_trigger_words(work_messages, trigger_words, allow_fuzzy=False)
+                    _excise_trigger_words(
+                        work_messages, trigger_words, allow_fuzzy=False, sanitize=rtw_sanitize,
+                    )
                     if trigger_words else None
                 )
 
@@ -1892,7 +2016,9 @@ async def _handle_request(
                 # Step 3: fuzzy search in the tool responses (only when the active fuzzy flag is on).
                 if excised is None and rtw_fuzzy:
                     excised = (
-                        _excise_trigger_words(work_messages, trigger_words, allow_fuzzy=True)
+                        _excise_trigger_words(
+                            work_messages, trigger_words, allow_fuzzy=True, sanitize=rtw_sanitize,
+                        )
                         if trigger_words else None
                     )
 
@@ -1912,8 +2038,9 @@ async def _handle_request(
 
                 work_messages, msg_index, removed_text = excised
                 log.info(
-                    "[defence] remove_trigger_words: removed injected words from tool response "
+                    "[defence] remove_trigger_words: %s injected words in tool response "
                     "at message index %d: %s",
+                    "sanitized" if rtw_sanitize else "removed",
                     msg_index, removed_text.replace("\n", "\\n")[:400],
                 )
                 if attempt >= SECURITY_DEFENCE_MAX_RETRIES:
@@ -2111,6 +2238,7 @@ def main():
     global DEFENCE_METHOD_LIST, DEFENCE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL
     global DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH, DEFENCE_SAFE_TOOLCALL, DEFENCE_SAFE_METHOD_LIST
     global DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL, DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH
+    global DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE, DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE
     global tokenizer
 
     parser = argparse.ArgumentParser(description="vllm two-phase inference proxy")
@@ -2196,6 +2324,17 @@ def main():
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=(f"remove_trigger_words (DEFENCE_SAFE_METHOD_LIST path): allow fuzzy matching "
                               f"(default: {str(DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH).lower()})"))
+    parser.add_argument("--defence_remove_trigger_words_sanitize",
+                        choices=["true", "false"], default=None, metavar="true|false",
+                        help=(f"remove_trigger_words (DEFENCE_METHOD_LIST path): replace a matched trigger "
+                              f"span with a spaCy-sanitized version (keep URLs/nouns/numbers/adjectives, "
+                              f"drop the command words) instead of deleting it "
+                              f"(default: {str(DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE).lower()})"))
+    parser.add_argument("--defence_safe_remove_trigger_words_sanitize",
+                        choices=["true", "false"], default=None, metavar="true|false",
+                        help=(f"remove_trigger_words (DEFENCE_SAFE_METHOD_LIST path): sanitize the matched "
+                              f"trigger span instead of deleting it "
+                              f"(default: {str(DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE).lower()})"))
     parser.add_argument("--defence_safe_toolcall",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=(f"validate a 'safe' verdict's trigger words against the user messages; "
@@ -2258,6 +2397,10 @@ def main():
         DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL = args.defence_safe_remove_trigger_words_match_tool_call == "true"
     if args.defence_safe_remove_trigger_words_fuzzy_search is not None:
         DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH = args.defence_safe_remove_trigger_words_fuzzy_search == "true"
+    if args.defence_remove_trigger_words_sanitize is not None:
+        DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE = args.defence_remove_trigger_words_sanitize == "true"
+    if args.defence_safe_remove_trigger_words_sanitize is not None:
+        DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE = args.defence_safe_remove_trigger_words_sanitize == "true"
 
     # Set log level and attach a dated file handler so all output goes to both console and file.
     log_level = args.log_level.upper()
@@ -2293,13 +2436,18 @@ def main():
     log.info("  defence          : enable=%s  level=%s  debug=%s  max_retries=%d",
              TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL,
              SECURITY_DEFENCE_DEBUG, SECURITY_DEFENCE_MAX_RETRIES)
-    log.info("  defence methods  : %s  fuzzy_trigger_search=%s  match_tool_call=%s",
+    log.info("  defence methods  : %s  fuzzy_trigger_search=%s  match_tool_call=%s  sanitize=%s",
              DEFENCE_METHOD_LIST, DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH,
-             DEFENCE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL)
-    log.info("  defence_safe     : %s  safe_methods=%s  fuzzy_trigger_search=%s  match_tool_call=%s",
+             DEFENCE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL,
+             DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE)
+    log.info("  defence_safe     : %s  safe_methods=%s  fuzzy_trigger_search=%s  match_tool_call=%s  sanitize=%s",
              DEFENCE_SAFE_TOOLCALL, DEFENCE_SAFE_METHOD_LIST,
              DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH,
-             DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL)
+             DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL,
+             DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE)
+    if DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE or DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE:
+        log.info("  sanitize spaCy   : model=%s  keep_pos=%s",
+                 DEFENCE_SANITIZE_SPACY_MODEL, sorted(DEFENCE_SANITIZE_KEEP_POS))
     log.info("  fake_tool_resp   : %r", FAKE_TOOL_RESPONSE_CONTENT)
     log.info("  strip security   : %s  timeout=%ds", STRIP_SECURITY_IN_HISTORY, REQUEST_TIMEOUT)
     log.info("  context window   : fetched from vllm at startup")
