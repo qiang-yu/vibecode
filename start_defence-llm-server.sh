@@ -6,8 +6,8 @@
 
 # Phase 1: LLM server (OpenAI-compatible chat backend, e.g. vllm, Nvidia, OpenRouter).
 # The server calls {LLM_SERVER_URL}/chat/completions, so give the base URL ending in /v1.
-LLM_SERVER_URL="https://integrate.api.nvidia.com/v1"
-LLM_MODEL_ID="openai/gpt-oss-20b"
+LLM_SERVER_URL="https://api.groq.com/openai/v1"
+LLM_MODEL_ID="openai/gpt-oss-120b"
 # Proxy used to reach the remote LLM; leave empty ("") to connect directly.
 LLM_SERVER_PROXY="http://127.0.0.1:1085"
 # Bearer token for the remote LLM: keep it OUT of this file. Export it in your environment instead:
@@ -16,7 +16,7 @@ LLM_SERVER_PROXY="http://127.0.0.1:1085"
 # Phase-1 context length in tokens; remote chat APIs cannot report max_model_len via /models.
 LLM_CONTEXT_WINDOW=32768
 # Minimum seconds between consecutive phase-1 LLM API calls (Nvidia free API rate limit).
-LLM_API_CALL_INTERVAL=1.5
+LLM_API_CALL_INTERVAL=2.0
 
 # Phase 2: secure server running the lora security model
 SECURE_SERVER_URL="http://localhost:19000/v1"

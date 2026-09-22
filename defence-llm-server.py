@@ -1534,7 +1534,7 @@ async def _handle_request(
         if VLLM_INFERENCE_DEBUG:
             log.info(
                 "[inference][LLM Model] assistant=%s",
-                raw_assistant.replace("\n", "\\n"),
+                json.dumps(msg1, ensure_ascii=False),
             )
 
         tool_calls, content = _parse_output(
