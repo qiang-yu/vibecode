@@ -381,56 +381,6 @@ DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH    = False
 DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL = True
 DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH    = False
 
-# *_SANITIZE — replace a located trigger span with a neutralised version of itself instead of
-#   deleting it outright.
-#
-#   The default behaviour cuts the whole matched span out and drops DEFENCE_REMOVED_PLACEHOLDER
-#   in its place. That is correct when the span is pure instruction, but a real tool response often
-#   carries the instruction WELDED to data the model legitimately needs — most importantly a URL
-#   that a following, genuine tool call takes as an argument. Deleting the whole span
-#   ("visit website for details www.restaurant-zurich.com") takes the URL with it, and the genuine
-#   call is then left without its argument and inference stalls.
-#
-#   With sanitize on, the span is parsed with spaCy and rebuilt keeping only the tokens that name a
-#   thing or a value and therefore cannot, on their own, read as a command: URLs and e-mail
-#   addresses; anything spaCy recognises as a named entity (people, countries, cities, locations,
-#   streets/buildings, organisations, dates, money, phone/other numbers); numeric-looking tokens;
-#   and the parts of speech in DEFENCE_SANITIZE_KEEP_POS (nouns, proper nouns, numbers, adjectives).
-#   Verbs, adverbs, prepositions, pronouns, conjunctions, ... are dropped, which is what removes the
-#   imperative that triggered the call. Punctuation and whitespace between the kept words are
-#   preserved so two survivors can never fuse. Example:
-#       "visit website for details www.restaurant-zurich.com"
-#         -> "website details www.restaurant-zurich.com"   (URL kept, "visit"/"for" dropped)
-#
-#   Requires spaCy and the DEFENCE_SANITIZE_SPACY_MODEL model (en_core_web_sm, ~12 MB):
-#       pip install spacy && python -m spacy download en_core_web_sm
-#   When spaCy or the model cannot be loaded the mode degrades gracefully: the failure is logged
-#   once and the span falls back to the plain-removal placeholder, so defence still fires.
-#   On by default; the DEFENCE_* flag drives the blocked-call path, the DEFENCE_SAFE_* flag the
-#   safe-verdict path, mirroring the *_MATCH_TOOL_CALL / *_FUZZY_SEARCH pairs above.
-DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE      = True
-DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE = True
-
-# spaCy model loaded on demand for the sanitize mode, and the coarse POS tags it keeps. Tokens whose
-# pos_ is in this set — together with URLs, e-mail addresses, punctuation and whitespace — survive
-# sanitisation; every other token (VERB, ADV, ADP, PRON, DET, CCONJ, AUX, ...) is dropped so the
-# residual text can no longer be read as an instruction.
-DEFENCE_SANITIZE_SPACY_MODEL = "en_core_web_sm"
-DEFENCE_SANITIZE_KEEP_POS    = frozenset({"NOUN", "PROPN", "NUM", "ADJ"})
-
-# A trigger span is often a keyword fragment ("Concatenate messages channels Slack website ..."),
-# not a grammatical sentence, and on such fragments spaCy's POS tagger has no syntactic context and
-# mislabels verbs as ADJ/NOUN/PROPN — so a command word like "Concatenate" is wrongly kept. WordNet
-# closes that gap: a word it knows ONLY as a verb (verb synsets, no noun synsets) can never be a
-# needed argument, so it is force-dropped whatever the POS tagger said. Words that are also nouns
-# ("message", "channel", "website", "slack") keep their noun sense and survive. The check is
-# deliberately conservative — it only drops unambiguous verbs — so it never destroys data; an
-# ambiguous verb that WordNet also lists as a noun (e.g. "visit") is left to the POS tagger. Needs
-# nltk + the WordNet corpus (pip install nltk && python -m nltk.downloader wordnet omw-1.4); when
-# either is missing the filter is disabled with a one-time log and sanitisation falls back to the
-# POS/entity rules alone.
-DEFENCE_SANITIZE_WORDNET_VERB_FILTER = True
-
 # What is left behind in place of the removed words.
 #
 # Something has to be, for two reasons.
@@ -995,183 +945,8 @@ def _trigger_words_in_user_message(
     return None
 
 
-# spaCy pipeline for the sanitize mode, loaded once on first use. _SPACY_LOAD_FAILED latches a
-# failed load so a missing model is reported once and never retried per request.
-_SPACY_NLP = None
-_SPACY_LOAD_FAILED = False
-
-
-def _get_spacy_nlp():
-    """Lazy-load and cache the spaCy model used by the sanitize mode.
-
-    Returns the loaded pipeline, or None when spaCy or the model is unavailable — the caller then
-    falls back to plain removal. The parser and lemmatizer are disabled (unused), but the NER
-    component is kept on: the sanitize mode reads coarse POS tags AND named-entity types
-    (token.ent_type_) so that people, places, countries, streets, organisations, dates and the like
-    are recognised as data and preserved, not just what the POS tagger happens to label PROPN/NOUN.
-    """
-    global _SPACY_NLP, _SPACY_LOAD_FAILED
-    if _SPACY_NLP is not None:
-        return _SPACY_NLP
-    if _SPACY_LOAD_FAILED:
-        return None
-    try:
-        import spacy
-        _SPACY_NLP = spacy.load(
-            DEFENCE_SANITIZE_SPACY_MODEL, disable=["parser", "lemmatizer"],
-        )
-        log.info("[defence] sanitize: loaded spaCy model %r", DEFENCE_SANITIZE_SPACY_MODEL)
-    except Exception as exc:
-        _SPACY_LOAD_FAILED = True
-        log.error(
-            "[defence] sanitize: could not load spaCy model %r (%s); falling back to plain "
-            "removal. Install it with: pip install spacy && python -m spacy download %s",
-            DEFENCE_SANITIZE_SPACY_MODEL, exc, DEFENCE_SANITIZE_SPACY_MODEL,
-        )
-        return None
-    return _SPACY_NLP
-
-
-# nltk WordNet, loaded on demand to catch verbs the POS tagger mislabels on keyword fragments.
-# _WORDNET_LOAD_FAILED latches a failed load so a missing corpus is reported once, not per token.
-_WORDNET = None
-_WORDNET_LOAD_FAILED = False
-_VERB_ONLY_CACHE: Dict[str, bool] = {}
-
-
-def _get_wordnet():
-    """Lazy-load and cache the nltk WordNet corpus used by the verb filter.
-
-    Returns the corpus reader, or None when nltk or the WordNet data is unavailable — the caller
-    then skips the verb filter and relies on the POS/entity rules alone. A probe lookup forces the
-    corpus to load now so a missing download fails here rather than on first real use.
-    """
-    global _WORDNET, _WORDNET_LOAD_FAILED
-    if _WORDNET is not None:
-        return _WORDNET
-    if _WORDNET_LOAD_FAILED:
-        return None
-    try:
-        from nltk.corpus import wordnet as wn
-        wn.synsets("test")  # force the lazy corpus to load; raises LookupError if not downloaded
-        _WORDNET = wn
-        log.info("[defence] sanitize: loaded nltk WordNet for verb filtering")
-    except Exception as exc:
-        _WORDNET_LOAD_FAILED = True
-        log.error(
-            "[defence] sanitize: nltk WordNet unavailable (%s); verb filter disabled, using "
-            "POS/entity rules only. Install it with: pip install nltk && "
-            "python -m nltk.downloader wordnet omw-1.4", exc,
-        )
-        return None
-    return _WORDNET
-
-
-def _is_verb_only_word(word: str) -> bool:
-    """True when WordNet knows this word ONLY as a verb (verb synsets, no noun synsets).
-
-    Such a word cannot be a needed argument, so it is safe to drop even when the POS tagger — with
-    no sentence context on a keyword fragment — mislabelled it ADJ/NOUN/PROPN. The check is
-    conservative on purpose: a word that also has a noun sense (message, channel, website, slack,
-    even visit) returns False and is left to the POS rules, so real data is never destroyed here.
-    WordNet's morphy normalises inflections, so "sends"/"deleting" resolve to their base verb.
-    Returns False whenever WordNet is unavailable. Results are cached per lowercased word.
-    """
-    wn = _get_wordnet()
-    if wn is None:
-        return False
-    w = word.lower()
-    if len(w) < 3 or not w.isalpha():
-        return False
-    cached = _VERB_ONLY_CACHE.get(w)
-    if cached is not None:
-        return cached
-    try:
-        has_verb = bool(wn.synsets(w, pos=wn.VERB))
-        has_noun = bool(wn.synsets(w, pos=wn.NOUN))
-    except Exception:
-        return False
-    result = has_verb and not has_noun
-    _VERB_ONLY_CACHE[w] = result
-    return result
-
-
-def _sanitize_span_text(span_text: str) -> Optional[str]:
-    """Neutralise a trigger span while keeping its URLs and data tokens.
-
-    Rebuilds the span from spaCy tokens, keeping only those that cannot read as a command on their
-    own — everything that names a thing or carries a value:
-      - URLs and e-mail addresses (like_url / like_email);
-      - anything spaCy tagged as part of a named entity (ent_type_): people, countries, cities,
-        other locations, streets/buildings, organisations, dates, money, phone/other numbers, ...;
-      - numeric-looking tokens (like_num), so phone numbers and amounts survive even untagged;
-      - the parts of speech in DEFENCE_SANITIZE_KEEP_POS (nouns, proper nouns, numbers, adjectives);
-      - punctuation and whitespace, so survivors keep their separators.
-    Verbs, adverbs, prepositions, pronouns, conjunctions, ... are dropped, which is what removes the
-    imperative that triggered the call. On top of the POS rules, when the WordNet verb filter is on,
-    a word WordNet knows only as a verb is force-dropped even if the POS tagger mislabelled it
-    (see _is_verb_only_word) — this catches command words like "Concatenate" on keyword fragments
-    where the tagger has no context; the hard keeps above (URL/email/number/entity) still win, so a
-    data token is never dropped by the verb filter. Each survivor is emitted with its trailing
-    whitespace (token.text_with_ws), so a dropped word between two survivors collapses to the single
-    space the survivor before it already carried — two kept words can never fuse. Runs of whitespace
-    opened up by the dropped tokens are then collapsed.
-
-    Returns the sanitized string (possibly empty when every token was dropped), or None when spaCy
-    is unavailable so the caller can fall back to the plain-removal placeholder.
-    """
-    nlp = _get_spacy_nlp()
-    if nlp is None:
-        return None
-    doc = nlp(span_text)
-    kept = []
-    for tok in doc:
-        # Hard keeps: data that must survive regardless of POS or the verb filter.
-        if (
-            tok.is_space
-            or tok.is_punct
-            or tok.like_url
-            or tok.like_email
-            or tok.like_num
-            or tok.ent_type_
-        ):
-            kept.append(tok.text_with_ws)
-            continue
-        # Force-drop a word WordNet knows only as a verb, whatever the POS tagger called it.
-        if DEFENCE_SANITIZE_WORDNET_VERB_FILTER and _is_verb_only_word(tok.text):
-            continue
-        if tok.pos_ in DEFENCE_SANITIZE_KEEP_POS:
-            kept.append(tok.text_with_ws)
-    cleaned = "".join(kept)
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
-
-
-def _init_sanitize_backends() -> None:
-    """Eagerly load the sanitize-mode backends (spaCy, and WordNet when the verb filter is on) at
-    startup, so their availability is known and logged up front rather than on the first tool call
-    that needs them. Runs only when a sanitize flag is enabled. _get_spacy_nlp / _get_wordnet log
-    their own detailed success/error; this adds one consolidated status line on top.
-    """
-    if not (DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE or DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE):
-        log.info("  sanitize backends: skipped (sanitize disabled on both paths)")
-        return
-    spacy_ok = _get_spacy_nlp() is not None
-    if DEFENCE_SANITIZE_WORDNET_VERB_FILTER:
-        wordnet_status = "OK" if _get_wordnet() is not None else "FAILED (POS rules only)"
-    else:
-        wordnet_status = "disabled"
-    log.info(
-        "  sanitize backends: spaCy=%s  wordnet=%s",
-        "OK" if spacy_ok else "FAILED (fallback to plain removal)",
-        wordnet_status,
-    )
-
-
 def _excise_trigger_words(
     messages: List[Dict[str, Any]], trigger_words: str, allow_fuzzy: bool = False,
-    sanitize: bool = False,
 ) -> Optional[Tuple[List[Dict[str, Any]], int, str, str]]:
     """Cut the trigger words out of the tool response that carried them.
 
@@ -1184,19 +959,11 @@ def _excise_trigger_words(
     *_FUZZY_SEARCH parameter) and passes it in here; it runs an exact pass first, checks the
     tool call's own arguments, and only then a fuzzy pass.
 
-    sanitize (from the active *_SANITIZE parameter) chooses what replaces the matched span: when
-    False the span is cut and DEFENCE_REMOVED_PLACEHOLDER is dropped in; when True the span is
-    passed through _sanitize_span_text, which keeps its URLs and data tokens and drops only the
-    words that made it read as a command, so a URL a following genuine tool call needs is not lost.
-    A sanitize that yields empty text, or a spaCy that is unavailable, falls back to the placeholder.
-    A sanitize that changes nothing (output equals input) is treated as no match, so the caller
-    moves on to the next steps and defence methods rather than "repairing" the span with itself.
+    The matched span is cut out and DEFENCE_REMOVED_PLACEHOLDER is dropped in its place.
 
-    Returns (new_messages, index, removed_text, filler) or None when nothing matched (including when
-    sanitize left every matched span unchanged). removed_text is the original matched span (what was
-    there before) and filler is the text put in its place (the sanitized span, or the placeholder),
-    so the caller can log both. The input list is not modified; the one message that changes is
-    copied.
+    Returns (new_messages, index, removed_text) or None when nothing matched. removed_text is the
+    original matched span, so the caller can log what was removed. The input list is not modified;
+    the one message that changes is copied.
     """
     trigger = (trigger_words or "").strip().strip('"\'')
     if len(trigger) < 8:
@@ -1212,24 +979,7 @@ def _excise_trigger_words(
         start, end = span
         removed = text[start:end]
         head, tail = text[:start], text[end:]
-        # What goes in the span's place. With sanitize on, keep the span's URLs and data tokens and
-        # drop only the words that made it an instruction; otherwise (or if sanitizing yields
-        # nothing usable) fall back to the plain-removal placeholder.
-        filler = _sanitize_span_text(removed) if sanitize else None
-        if not filler:
-            filler = DEFENCE_REMOVED_PLACEHOLDER
-        # When sanitize kept every word — its output equals the input apart from whitespace — it
-        # neutralised nothing, so this match is not a usable repair (e.g. a keyword fragment the
-        # POS/verb rules could not touch). Keep scanning the other tool responses; if none yields
-        # an effective sanitize the function returns None and the caller falls through to the next
-        # steps (match-tool-call, fuzzy) and the remaining defence methods (e.g. fake_tool_response).
-        if sanitize and re.sub(r"\s+", " ", filler).strip() == re.sub(r"\s+", " ", removed).strip():
-            log.info(
-                "[defence] remove_trigger_words: sanitize left the span unchanged at message "
-                "index %d (nothing neutralised): %r — treating as ineffective, moving on.",
-                i, removed.replace("\n", "\\n")[:400],
-            )
-            continue
+        filler = DEFENCE_REMOVED_PLACEHOLDER
         # Guarantee the two sides cannot fuse. The matched span is not always word-aligned —
         # a substring match ends wherever the reported words end — so "finished.Please visit"
         # would otherwise become "finished.visit", and a cut inside a word would invent one.
@@ -1245,7 +995,7 @@ def _excise_trigger_words(
         new_msg = dict(messages[i])
         new_msg["content"] = cleaned
         new_messages[i] = new_msg
-        return new_messages, i, removed, filler.strip()
+        return new_messages, i, removed
     return None
 
 
@@ -2076,10 +1826,6 @@ async def _handle_request(
             DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH if is_safe_path
             else DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH
         )
-        rtw_sanitize = (
-            DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE if is_safe_path
-            else DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE
-        )
 
         # "Let the blocked turn through unchanged" outcome, shared by every give-up path: a method
         # that cannot repair the block, and the retry budget running out. The current turn is
@@ -2115,7 +1861,7 @@ async def _handle_request(
                 # Step 1: exact search in the tool responses.
                 excised = (
                     _excise_trigger_words(
-                        work_messages, trigger_words, allow_fuzzy=False, sanitize=rtw_sanitize,
+                        work_messages, trigger_words, allow_fuzzy=False,
                     )
                     if trigger_words else None
                 )
@@ -2152,7 +1898,7 @@ async def _handle_request(
                 if excised is None and rtw_fuzzy:
                     excised = (
                         _excise_trigger_words(
-                            work_messages, trigger_words, allow_fuzzy=True, sanitize=rtw_sanitize,
+                            work_messages, trigger_words, allow_fuzzy=True,
                         )
                         if trigger_words else None
                     )
@@ -2171,21 +1917,12 @@ async def _handle_request(
                     )
                     continue
 
-                work_messages, msg_index, removed_text, filler_text = excised
-                if rtw_sanitize:
-                    log.info(
-                        "[defence] remove_trigger_words: sanitized injected words in tool response "
-                        "at message index %d: %r -> %r",
-                        msg_index,
-                        removed_text.replace("\n", "\\n")[:400],
-                        filler_text.replace("\n", "\\n")[:400],
-                    )
-                else:
-                    log.info(
-                        "[defence] remove_trigger_words: removed injected words from tool response "
-                        "at message index %d: %s",
-                        msg_index, removed_text.replace("\n", "\\n")[:400],
-                    )
+                work_messages, msg_index, removed_text = excised
+                log.info(
+                    "[defence] remove_trigger_words: removed injected words from tool response "
+                    "at message index %d: %s",
+                    msg_index, removed_text.replace("\n", "\\n")[:400],
+                )
                 if attempt >= SECURITY_DEFENCE_MAX_RETRIES:
                     log.warning(
                         "[defence] max retries (%d) reached after excision — letting the turn "
@@ -2381,7 +2118,6 @@ def main():
     global DEFENCE_METHOD_LIST, DEFENCE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL
     global DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH, DEFENCE_SAFE_TOOLCALL, DEFENCE_SAFE_METHOD_LIST
     global DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL, DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH
-    global DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE, DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE
     global tokenizer
 
     parser = argparse.ArgumentParser(description="vllm two-phase inference proxy")
@@ -2467,17 +2203,6 @@ def main():
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=(f"remove_trigger_words (DEFENCE_SAFE_METHOD_LIST path): allow fuzzy matching "
                               f"(default: {str(DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH).lower()})"))
-    parser.add_argument("--defence_remove_trigger_words_sanitize",
-                        choices=["true", "false"], default=None, metavar="true|false",
-                        help=(f"remove_trigger_words (DEFENCE_METHOD_LIST path): replace a matched trigger "
-                              f"span with a spaCy-sanitized version (keep URLs/nouns/numbers/adjectives, "
-                              f"drop the command words) instead of deleting it "
-                              f"(default: {str(DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE).lower()})"))
-    parser.add_argument("--defence_safe_remove_trigger_words_sanitize",
-                        choices=["true", "false"], default=None, metavar="true|false",
-                        help=(f"remove_trigger_words (DEFENCE_SAFE_METHOD_LIST path): sanitize the matched "
-                              f"trigger span instead of deleting it "
-                              f"(default: {str(DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE).lower()})"))
     parser.add_argument("--defence_safe_toolcall",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=(f"validate a 'safe' verdict's trigger words against the user messages; "
@@ -2540,10 +2265,6 @@ def main():
         DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL = args.defence_safe_remove_trigger_words_match_tool_call == "true"
     if args.defence_safe_remove_trigger_words_fuzzy_search is not None:
         DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH = args.defence_safe_remove_trigger_words_fuzzy_search == "true"
-    if args.defence_remove_trigger_words_sanitize is not None:
-        DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE = args.defence_remove_trigger_words_sanitize == "true"
-    if args.defence_safe_remove_trigger_words_sanitize is not None:
-        DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE = args.defence_safe_remove_trigger_words_sanitize == "true"
 
     # Set log level and attach a dated file handler so all output goes to both console and file.
     log_level = args.log_level.upper()
@@ -2579,21 +2300,13 @@ def main():
     log.info("  defence          : enable=%s  level=%s  debug=%s  max_retries=%d",
              TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL,
              SECURITY_DEFENCE_DEBUG, SECURITY_DEFENCE_MAX_RETRIES)
-    log.info("  defence methods  : %s  fuzzy_trigger_search=%s  match_tool_call=%s  sanitize=%s",
+    log.info("  defence methods  : %s  fuzzy_trigger_search=%s  match_tool_call=%s",
              DEFENCE_METHOD_LIST, DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH,
-             DEFENCE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL,
-             DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE)
-    log.info("  defence_safe     : %s  safe_methods=%s  fuzzy_trigger_search=%s  match_tool_call=%s  sanitize=%s",
+             DEFENCE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL)
+    log.info("  defence_safe     : %s  safe_methods=%s  fuzzy_trigger_search=%s  match_tool_call=%s",
              DEFENCE_SAFE_TOOLCALL, DEFENCE_SAFE_METHOD_LIST,
              DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH,
-             DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL,
-             DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE)
-    if DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE or DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE:
-        log.info("  sanitize spaCy   : model=%s  keep_pos=%s  wordnet_verb_filter=%s",
-                 DEFENCE_SANITIZE_SPACY_MODEL, sorted(DEFENCE_SANITIZE_KEEP_POS),
-                 DEFENCE_SANITIZE_WORDNET_VERB_FILTER)
-    # Eagerly load spaCy/WordNet now so their status is known and logged at startup.
-    _init_sanitize_backends()
+             DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL)
     log.info("  fake_tool_resp   : %r", FAKE_TOOL_RESPONSE_CONTENT)
     log.info("  strip security   : %s  timeout=%ds", STRIP_SECURITY_IN_HISTORY, REQUEST_TIMEOUT)
     log.info("  context window   : fetched from vllm at startup")

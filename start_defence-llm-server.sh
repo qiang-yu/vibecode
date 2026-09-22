@@ -37,10 +37,6 @@ DEFENCE_METHOD_LIST="remove_trigger_words,fake_tool_response"
 # remove_trigger_words parameters for the DEFENCE_METHOD_LIST (blocked-call) path.
 DEFENCE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL=true  # true: treat trigger words that belong to a tool call (name/args) as a false positive
 DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH=true     # true: allow fuzzy matching when locating trigger words
-# true: replace a matched trigger span with a spaCy-sanitized version (keep URLs/nouns/numbers/adjectives,
-# drop the command words) instead of deleting it, so a URL a genuine tool call needs is not lost.
-# Needs: pip install spacy && python -m spacy download en_core_web_sm
-DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE=true
 # true: for a "safe" verdict, validate its trigger words against the user messages (exact match, no fuzzy);
 # if they are not from the user, run the defence methods instead of trusting the "safe" rating.
 DEFENCE_SAFE_TOOLCALL=true
@@ -50,7 +46,6 @@ DEFENCE_SAFE_METHOD_LIST="remove_trigger_words"
 # remove_trigger_words parameters for the DEFENCE_SAFE_METHOD_LIST (safe-verdict) path.
 DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL=true   # true: match-tool-call false-positive guard
 DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH=false     # false: exact matching only on the safe path
-DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE=true          # true: sanitize the matched span instead of deleting it
 
 # -----------------------------------------------------------------------
 # Launch
@@ -85,6 +80,4 @@ python "${SCRIPT_DIR}/defence-llm-server.py" \
     --defence_safe_toolcall "${DEFENCE_SAFE_TOOLCALL}" \
     --defence_safe_method_list "${DEFENCE_SAFE_METHOD_LIST}" \
     --defence_safe_remove_trigger_words_match_tool_call "${DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL}" \
-    --defence_safe_remove_trigger_words_fuzzy_search "${DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH}" \
-    --defence_remove_trigger_words_sanitize "${DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE}" \
-    --defence_safe_remove_trigger_words_sanitize "${DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE}"
+    --defence_safe_remove_trigger_words_fuzzy_search "${DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH}"

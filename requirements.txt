@@ -1,50 +1,9 @@
-# vllm-server dependencies
+# defence-llm-server dependencies
 # Verified with Python 3.12 (conda env "RQwen"). Versions below are what this
 # server was tested against; loosen the pins if you need to.
 
-# --- Core runtime (imported directly by vllm-server.py) ---
+# --- Core runtime (imported directly by defence-llm-server.py) ---
 fastapi==0.136.3
 uvicorn==0.48.0
 httpx==0.28.1
 transformers==4.57.6
-
-# --- Backend inference stack (the vllm server this proxy forwards to) ---
-# Not imported by vllm-server.py itself; needed to run the vllm OpenAI server it talks to.
-# torch/vllm builds are CUDA/GPU-specific — match them to your driver and install per vLLM's
-# instructions (https://docs.vllm.ai). Installing vllm normally pulls torch, xformers, ray,
-# tokenizers, safetensors, etc. as its own dependencies; the pins below are what was tested here.
-torch==2.6.0
-vllm==0.8.5.post1
-xformers==0.0.29.post2
-tokenizers==0.22.2
-accelerate==1.13.0
-safetensors==0.7.0
-sentencepiece==0.2.1
-numpy==2.2.6
-ray==2.55.1
-triton==3.2.0
-
-# --- Defence "remove_trigger_words" sanitize mode ---
-# Used only when DEFENCE_REMOVE_TRIGGER_WORDS_SANITIZE / DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE
-# is true (both default to true). The sanitize step keeps a matched trigger span's data (URLs,
-# emails, names, places, phone numbers, ...) and drops only the command words, so a following
-# genuine tool call does not lose its arguments. If these are missing the server still runs: it
-# logs once and falls back to deleting the span (the " (nothing) " placeholder).
-spacy==3.8.16
-nltk==3.10.3
-
-# --- Extra data the two libs above need (NOT installed by pip, download separately) ---
-#
-# 1) spaCy English model en_core_web_sm (~12 MB), for POS tagging + named-entity recognition:
-#        python -m spacy download en_core_web_sm
-#
-# 2) nltk WordNet corpora, for the verb filter that catches command words the POS tagger
-#    mislabels on keyword fragments (e.g. "Concatenate"):
-#        python -c "import nltk; nltk.download('wordnet'); nltk.download('omw-1.4')"
-#    Behind a proxy, nltk >= 3.9 blocks proxied fetches (SSRF guard). If the proxy is trusted:
-#        export NLTK_ALLOW_PROXIED_URLOPEN=1
-#    then rerun the download. Data lands in ~/nltk_data/corpora/ (a path nltk searches by
-#    default); the vllm-server process must be able to read it at runtime.
-#
-# Quick check that both extras are in place:
-#   python -c "import spacy; spacy.load('en_core_web_sm'); from nltk.corpus import wordnet as wn; print(wn.synsets('concatenate', pos=wn.VERB)); print('ok')"
