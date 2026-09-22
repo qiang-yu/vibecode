@@ -15,6 +15,8 @@ LLM_SERVER_PROXY="http://127.0.0.1:1085"
 # The server reads the LLM_SERVER_TOKEN environment variable when no token is configured.
 # Phase-1 context length in tokens; remote chat APIs cannot report max_model_len via /models.
 LLM_CONTEXT_WINDOW=32768
+# Minimum seconds between consecutive phase-1 LLM API calls (Nvidia free API rate limit).
+LLM_API_CALL_INTERVAL=1.5
 
 # Phase 2: secure server running the lora security model
 SECURE_SERVER_URL="http://localhost:19000/v1"
@@ -69,6 +71,7 @@ python "${SCRIPT_DIR}/defence-llm-server.py" \
     --llm-model-id         "${LLM_MODEL_ID}" \
     --llm-server-proxy     "${LLM_SERVER_PROXY}" \
     --llm-context-window   "${LLM_CONTEXT_WINDOW}" \
+    --llm_api_call_interval "${LLM_API_CALL_INTERVAL}" \
     --secure-server-url    "${SECURE_SERVER_URL}" \
     --secure-model-id      "${SECURE_MODEL_ID}" \
     --host                 "${LISTEN_HOST}" \

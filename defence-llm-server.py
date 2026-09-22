@@ -19,6 +19,7 @@
 ###
 
 import argparse
+import asyncio
 import difflib
 from datetime import datetime
 import json
@@ -52,6 +53,7 @@ SECURE_MODEL_ID           = "lora-model"
 BASE_MODEL_PATH           = "/home/qiangyu/Models/Qwen/Qwen3-8B"           # required: local path to load tokenizer
 MAX_TOKENS_SECURITY       = 1024        # hard limit for phase 2 / security block
 REQUEST_TIMEOUT           = 600         # seconds
+LLM_API_CALL_INTERVAL     = 1.5         # phase 1: minimum seconds between consecutive LLM API calls (Nvidia free API rate limit)
 
 LISTEN_HOST               = "localhost"
 LISTEN_PORT               = 29000
@@ -87,7 +89,7 @@ SECURITY_QUESTION_MATCH_RATIO = 0.85
 
 # When True, log the full assistant output of every base/lora inference on a single
 # line (newlines shown as "\n"), including the prefix WE injected and let the model
-# continue from. The log clearly labels each line as Base Model or Lora Model.
+# continue from. The log clearly labels each line as LLM Model or SEC Model.
 VLLM_INFERENCE_DEBUG      = True
 
 # When True, log the raw client input rendered into Qwen3 chat-template format BEFORE
@@ -441,6 +443,9 @@ tokenizer: Any = None
 _http: Optional[httpx.AsyncClient] = None          # local calls: phase 2, secure /models, passthrough
 _http_llm: Optional[httpx.AsyncClient] = None      # phase 1 (remote chat): may carry proxy + auth header
 _context_window: int = 0          # context length, set at startup from LLM_CONTEXT_WINDOW
+_last_llm_call_time: float = 0.0  # monotonic timestamp of the last phase-1 LLM API call
+_llm_call_error: bool = False     # True after a phase-1 API error; causes 20x interval on next call
+_llm_call_lock: Optional[asyncio.Lock] = None      # serialises rate-limit enforcement across concurrent requests
 
 # ---------------------------------------------------------------------------
 # FastAPI lifespan: one shared connection pool for the whole process
@@ -448,7 +453,9 @@ _context_window: int = 0          # context length, set at startup from LLM_CONT
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _http, _http_llm, _context_window
+    global _http, _http_llm, _context_window, _llm_call_lock
+
+    _llm_call_lock = asyncio.Lock()
 
     # Local client (no proxy): phase 2 completions, secure /models, passthrough.
     _http = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
@@ -731,7 +738,19 @@ async def _call_chat_completions(
 
     Sends the native OpenAI request (messages + tools) and returns the raw JSON response.
     Goes through _http_llm so the configured proxy and bearer token (if any) are applied.
+    Enforces LLM_API_CALL_INTERVAL between consecutive calls to respect Nvidia free-API rate limits.
+    After any API error the next call waits 20x LLM_API_CALL_INTERVAL; reverts to normal on success.
     """
+    global _last_llm_call_time, _llm_call_error
+    async with _llm_call_lock:
+        interval = LLM_API_CALL_INTERVAL * 20 if _llm_call_error else LLM_API_CALL_INTERVAL
+        elapsed = time.monotonic() - _last_llm_call_time
+        if elapsed < interval:
+            wait = interval - elapsed
+            log.debug("[phase1] rate limit: sleeping %.2fs before LLM API call (error_mode=%s)", wait, _llm_call_error)
+            await asyncio.sleep(wait)
+        _last_llm_call_time = time.monotonic()
+
     payload: Dict[str, Any] = {
         **fwd,
         "model": LLM_MODEL_ID,
@@ -743,10 +762,18 @@ async def _call_chat_completions(
         payload["tools"] = tools
     if stop:
         payload["stop"] = stop
-    r = await _http_llm.post(
-        f"{LLM_SERVER_URL.rstrip('/')}/chat/completions", json=payload,
-    )
-    r.raise_for_status()
+    try:
+        r = await _http_llm.post(
+            f"{LLM_SERVER_URL.rstrip('/')}/chat/completions", json=payload,
+        )
+        r.raise_for_status()
+    except Exception as exc:
+        async with _llm_call_lock:
+            _llm_call_error = True
+        log.error("[phase1] LLM API call failed: %s", exc)
+        raise
+    async with _llm_call_lock:
+        _llm_call_error = False
     return r.json()
 
 # ---------------------------------------------------------------------------
@@ -1343,7 +1370,7 @@ async def _validate_and_fix_tool_reason(
         p2_prompt = regen_head + fixed_prefix
         if VLLM_INFERENCE_DEBUG:
             log.info(
-                "[inference][Lora Model][validate] input=%s",
+                "[inference][SEC Model][validate] input=%s",
                 p2_prompt.replace("\n", "\\n"),
             )
         p2 = await _call_completions(
@@ -1479,7 +1506,7 @@ async def _handle_request(
         )
         if VLLM_INFERENCE_DEBUG:
             log.info(
-                "[inference][Base Model] messages=%s",
+                "[inference][LLM Model] messages=%s",
                 json.dumps(work_messages, ensure_ascii=False),
             )
 
@@ -1506,7 +1533,7 @@ async def _handle_request(
 
         if VLLM_INFERENCE_DEBUG:
             log.info(
-                "[inference][Base Model] assistant=%s",
+                "[inference][LLM Model] assistant=%s",
                 raw_assistant.replace("\n", "\\n"),
             )
 
@@ -1624,7 +1651,7 @@ async def _handle_request(
                 )
                 if VLLM_INFERENCE_DEBUG:
                     log.info(
-                        "[inference][Lora Model] input=%s",
+                        "[inference][SEC Model] input=%s",
                         p2_prompt.replace("\n", "\\n"),
                     )
                 p2 = await _call_completions(
@@ -1691,7 +1718,7 @@ async def _handle_request(
 
             if VLLM_INFERENCE_DEBUG:
                 log.info(
-                    "[inference][Lora Model] assistant=%s",
+                    "[inference][SEC Model] assistant=%s",
                     full_security_block.replace("\n", "\\n"),
                 )
 
@@ -2040,7 +2067,7 @@ async def health():
 def main():
     global LLM_SERVER_URL, LLM_MODEL_ID, SECURE_SERVER_URL, SECURE_MODEL_ID, BASE_MODEL_PATH
     global LLM_SERVER_PROXY, LLM_SERVER_TOKEN, LLM_CONTEXT_WINDOW
-    global MAX_TOKENS_SECURITY, REQUEST_TIMEOUT
+    global MAX_TOKENS_SECURITY, REQUEST_TIMEOUT, LLM_API_CALL_INTERVAL
     global LISTEN_HOST, LISTEN_PORT, LOG_FILE_NAME, ENABLE_THINKING
     global PHASE2_ENABLE, PHASE2_TOOL_REASON_RETRY_COUNT
     global SECURITY_VALIDATE_TOOL_REASON, SECURITY_TOOL_REASON_MAX_FIX
@@ -2063,6 +2090,8 @@ def main():
                         help=f"bearer token for the phase-1 remote LLM; empty = read the LLM_SERVER_TOKEN env var (default: {LLM_SERVER_TOKEN!r})")
     parser.add_argument("--llm-context-window",    type=int, default=None, metavar="N",
                         help=f"phase-1 context length in tokens (default: {LLM_CONTEXT_WINDOW})")
+    parser.add_argument("--llm_api_call_interval", type=float, default=None, metavar="SEC",
+                        help=f"minimum seconds between consecutive phase-1 LLM API calls (default: {LLM_API_CALL_INTERVAL})")
     parser.add_argument("--secure-server-url",     default=None, metavar="URL",
                         help=f"secure server base URL for phase 2 / lora (default: {SECURE_SERVER_URL})")
     parser.add_argument("--secure-model-id",       default=None, metavar="ID",
@@ -2159,6 +2188,7 @@ def main():
     if not LLM_SERVER_TOKEN:
         LLM_SERVER_TOKEN = os.environ.get("LLM_SERVER_TOKEN", "")
     if args.llm_context_window:  LLM_CONTEXT_WINDOW   = args.llm_context_window
+    if args.llm_api_call_interval is not None: LLM_API_CALL_INTERVAL = args.llm_api_call_interval
     if args.secure_server_url:   SECURE_SERVER_URL    = args.secure_server_url
     if args.secure_model_id:     SECURE_MODEL_ID      = args.secure_model_id
     if args.base_model_path:     BASE_MODEL_PATH      = args.base_model_path
@@ -2228,6 +2258,7 @@ def main():
     log.info("  llm proxy        : %s", LLM_SERVER_PROXY or "none")
     log.info("  llm auth token   : %s", "set" if LLM_SERVER_TOKEN and LLM_SERVER_TOKEN != "NOKEY" else "none")
     log.info("  llm context win  : %d tokens (manual config)", LLM_CONTEXT_WINDOW)
+    log.info("  llm call interval: %.2fs", LLM_API_CALL_INTERVAL)
     log.info("  secure server    : %s  model=%s  security_max_tokens=%d",
              SECURE_SERVER_URL, SECURE_MODEL_ID, MAX_TOKENS_SECURITY)
     log.info("  enable_thinking  : %s", ENABLE_THINKING)
