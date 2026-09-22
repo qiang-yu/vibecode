@@ -455,15 +455,25 @@ _llm_error_counts: Dict[str, int] = {}            # error_type -> error count
 _llm_error_input_tokens: Dict[str, int] = {}      # error_type -> prompt tokens
 _llm_error_output_tokens: Dict[str, int] = {}     # error_type -> completion tokens
 
+# SEC model usage statistics (phase 2 only)
+_sec_call_count: int = 0
+_sec_input_tokens: int = 0
+_sec_output_tokens: int = 0
+_sec_error_counts: Dict[str, int] = {}
+_sec_error_input_tokens: Dict[str, int] = {}
+_sec_error_output_tokens: Dict[str, int] = {}
+_sec_stats_lock: Optional[asyncio.Lock] = None
+
 # ---------------------------------------------------------------------------
 # FastAPI lifespan: one shared connection pool for the whole process
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _http, _http_llm, _context_window, _llm_call_lock
+    global _http, _http_llm, _context_window, _llm_call_lock, _sec_stats_lock
 
     _llm_call_lock = asyncio.Lock()
+    _sec_stats_lock = asyncio.Lock()
 
     # Local client (no proxy): phase 2 completions, secure /models, passthrough.
     _http = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
@@ -506,8 +516,10 @@ async def lifespan(app: FastAPI):
         raise
 
     yield
-    log.info("Server shutting down — final LLM API statistics:")
+    log.info("Server shutting down — final LLM Model statistics:")
     _log_llm_stats()
+    log.info("Server shutting down — final SEC Model statistics:")
+    _log_sec_stats()
     await _http.aclose()
     await _http_llm.aclose()
     log.info("HTTP clients closed")
@@ -721,6 +733,9 @@ async def _call_completions(
     fwd: Dict,
     base_url: Optional[str] = None,
 ) -> Dict:
+    global _sec_call_count, _sec_input_tokens, _sec_output_tokens
+    global _sec_error_counts, _sec_error_input_tokens, _sec_error_output_tokens
+
     payload = {
         **fwd,
         "model": model,
@@ -732,9 +747,41 @@ async def _call_completions(
         "stream": False,
     }
     target = (base_url or LLM_SERVER_URL).rstrip('/')
-    r = await _http.post(f"{target}/completions", json=payload)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = await _http.post(f"{target}/completions", json=payload)
+        r.raise_for_status()
+    except Exception as exc:
+        err_type = _llm_error_type(exc)
+        err_in = err_out = 0
+        if isinstance(exc, httpx.HTTPStatusError):
+            try:
+                err_usage = exc.response.json().get("usage") or {}
+                err_in = err_usage.get("prompt_tokens", 0)
+                err_out = err_usage.get("completion_tokens", 0)
+            except Exception:
+                pass
+        async with _sec_stats_lock:
+            _sec_error_counts[err_type] = _sec_error_counts.get(err_type, 0) + 1
+            _sec_error_input_tokens[err_type] = _sec_error_input_tokens.get(err_type, 0) + err_in
+            _sec_error_output_tokens[err_type] = _sec_error_output_tokens.get(err_type, 0) + err_out
+            total_calls = _sec_call_count + sum(_sec_error_counts.values())
+        log.error("[phase2] SEC model API call failed: %s", exc)
+        if total_calls % 10 == 0:
+            _log_sec_stats()
+        raise
+
+    result = r.json()
+    usage = result.get("usage") or {}
+    in_tok = usage.get("prompt_tokens", 0)
+    out_tok = usage.get("completion_tokens", 0)
+    async with _sec_stats_lock:
+        _sec_call_count += 1
+        _sec_input_tokens += in_tok
+        _sec_output_tokens += out_tok
+        total_calls = _sec_call_count + sum(_sec_error_counts.values())
+    if total_calls % 10 == 0:
+        _log_sec_stats()
+    return result
 
 
 def _llm_error_type(exc: Exception) -> str:
@@ -754,6 +801,20 @@ def _log_llm_stats() -> None:
             err_type, _llm_error_counts[err_type],
             _llm_error_input_tokens.get(err_type, 0),
             _llm_error_output_tokens.get(err_type, 0),
+        )
+
+
+def _log_sec_stats() -> None:
+    log.info(
+        "[sec_stats] calls=%d  input_tokens=%d  output_tokens=%d",
+        _sec_call_count, _sec_input_tokens, _sec_output_tokens,
+    )
+    for err_type in sorted(_sec_error_counts):
+        log.info(
+            "[sec_stats] error=%s  count=%d  input_tokens=%d  output_tokens=%d",
+            err_type, _sec_error_counts[err_type],
+            _sec_error_input_tokens.get(err_type, 0),
+            _sec_error_output_tokens.get(err_type, 0),
         )
 
 
