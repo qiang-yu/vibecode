@@ -447,6 +447,14 @@ _last_llm_call_time: float = 0.0  # monotonic timestamp of the last phase-1 LLM 
 _llm_call_error: bool = False     # True after a phase-1 API error; causes 20x interval on next call
 _llm_call_lock: Optional[asyncio.Lock] = None      # serialises rate-limit enforcement across concurrent requests
 
+# LLM API usage statistics (phase 1 only)
+_llm_call_count: int = 0                          # successful call count
+_llm_input_tokens: int = 0                        # cumulative prompt tokens (successful calls)
+_llm_output_tokens: int = 0                       # cumulative completion tokens (successful calls)
+_llm_error_counts: Dict[str, int] = {}            # error_type -> error count
+_llm_error_input_tokens: Dict[str, int] = {}      # error_type -> prompt tokens
+_llm_error_output_tokens: Dict[str, int] = {}     # error_type -> completion tokens
+
 # ---------------------------------------------------------------------------
 # FastAPI lifespan: one shared connection pool for the whole process
 # ---------------------------------------------------------------------------
@@ -498,6 +506,8 @@ async def lifespan(app: FastAPI):
         raise
 
     yield
+    log.info("Server shutting down — final LLM API statistics:")
+    _log_llm_stats()
     await _http.aclose()
     await _http_llm.aclose()
     log.info("HTTP clients closed")
@@ -727,6 +737,26 @@ async def _call_completions(
     return r.json()
 
 
+def _llm_error_type(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP_{exc.response.status_code}"
+    return type(exc).__name__
+
+
+def _log_llm_stats() -> None:
+    log.info(
+        "[llm_stats] calls=%d  input_tokens=%d  output_tokens=%d",
+        _llm_call_count, _llm_input_tokens, _llm_output_tokens,
+    )
+    for err_type in sorted(_llm_error_counts):
+        log.info(
+            "[llm_stats] error=%s  count=%d  input_tokens=%d  output_tokens=%d",
+            err_type, _llm_error_counts[err_type],
+            _llm_error_input_tokens.get(err_type, 0),
+            _llm_error_output_tokens.get(err_type, 0),
+        )
+
+
 async def _call_chat_completions(
     messages: List[Dict],
     tools: Optional[List[Dict]],
@@ -742,6 +772,9 @@ async def _call_chat_completions(
     After any API error the next call waits 20x LLM_API_CALL_INTERVAL; reverts to normal on success.
     """
     global _last_llm_call_time, _llm_call_error
+    global _llm_call_count, _llm_input_tokens, _llm_output_tokens
+    global _llm_error_counts, _llm_error_input_tokens, _llm_error_output_tokens
+
     async with _llm_call_lock:
         interval = LLM_API_CALL_INTERVAL * 20 if _llm_call_error else LLM_API_CALL_INTERVAL
         elapsed = time.monotonic() - _last_llm_call_time
@@ -768,13 +801,39 @@ async def _call_chat_completions(
         )
         r.raise_for_status()
     except Exception as exc:
+        err_type = _llm_error_type(exc)
+        err_in = err_out = 0
+        if isinstance(exc, httpx.HTTPStatusError):
+            try:
+                err_usage = exc.response.json().get("usage") or {}
+                err_in = err_usage.get("prompt_tokens", 0)
+                err_out = err_usage.get("completion_tokens", 0)
+            except Exception:
+                pass
         async with _llm_call_lock:
             _llm_call_error = True
+            _llm_error_counts[err_type] = _llm_error_counts.get(err_type, 0) + 1
+            _llm_error_input_tokens[err_type] = _llm_error_input_tokens.get(err_type, 0) + err_in
+            _llm_error_output_tokens[err_type] = _llm_error_output_tokens.get(err_type, 0) + err_out
+            total_calls = _llm_call_count + sum(_llm_error_counts.values())
         log.error("[phase1] LLM API call failed: %s", exc)
+        if total_calls % 10 == 0:
+            _log_llm_stats()
         raise
+
+    result = r.json()
+    usage = result.get("usage") or {}
+    in_tok = usage.get("prompt_tokens", 0)
+    out_tok = usage.get("completion_tokens", 0)
     async with _llm_call_lock:
         _llm_call_error = False
-    return r.json()
+        _llm_call_count += 1
+        _llm_input_tokens += in_tok
+        _llm_output_tokens += out_tok
+        total_calls = _llm_call_count + sum(_llm_error_counts.values())
+    if total_calls % 10 == 0:
+        _log_llm_stats()
+    return result
 
 # ---------------------------------------------------------------------------
 # Security defence helpers
