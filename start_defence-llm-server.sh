@@ -4,9 +4,9 @@
 # Configurable parameters — edit these before starting the server
 # -----------------------------------------------------------------------
 
-VLLM_BASE_URL="http://localhost:19001/v1"
+VLLM_BASE_URL="http://localhost:19000/v1"
 LISTEN_HOST="localhost"
-LISTEN_PORT=29001
+LISTEN_PORT=29000
 
 BASE_MODEL_PATH="/home/qiangyu/Models/Qwen/Qwen3-8B"
 BASE_MODEL_ID="Qwen3Base"
@@ -15,7 +15,7 @@ LORA_MODEL_ID="lora-model"
 MAX_TOKENS_SECURITY=4096          # max tokens for phase-2 lora security block
 REQUEST_TIMEOUT=600              # HTTP request timeout in seconds
 LOG_LEVEL="info"                 # debug | info | warning | error
-LOG_FILE_NAME="154_attack_slack_defence_safe_nofuzzy.log"         # log file base name; runtime prepends YYYYMMDD_
+LOG_FILE_NAME="defence-llm-server.log"         # log file base name; runtime prepends YYYYMMDD_
 
 OUTPUT_RAW_CLIENT_INPUT=false    # true: log raw client input (Qwen3 format) before stripping
 
