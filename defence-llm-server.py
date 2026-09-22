@@ -19,11 +19,11 @@
 ###
 
 import argparse
-import copy
 import difflib
 from datetime import datetime
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -42,8 +42,11 @@ from transformers import AutoTokenizer
 # Configuration defaults — edit here or override with CLI arguments
 # ---------------------------------------------------------------------------
 
-LLM_SERVER_URL            = "http://localhost:19000/v1"   # phase 1: any OpenAI-compatible LLM backend
+LLM_SERVER_URL            = "http://localhost:19000/v1"   # phase 1: OpenAI-compatible chat backend base URL (vllm / Nvidia / OpenRouter); code appends /chat/completions
 LLM_MODEL_ID              = "Qwen3Base"
+LLM_SERVER_PROXY          = ""           # phase 1: HTTP(S) proxy for the remote LLM; "" = direct (no proxy)
+LLM_SERVER_TOKEN          = ""           # phase 1: bearer token for the remote LLM; empty = read the LLM_SERVER_TOKEN env var (else no Authorization header)
+LLM_CONTEXT_WINDOW        = 32768        # phase 1: context length; remote chat APIs cannot report max_model_len via /models
 SECURE_SERVER_URL         = "http://localhost:19000/v1"   # phase 2: lora security model server
 SECURE_MODEL_ID           = "lora-model"
 BASE_MODEL_PATH           = "/home/qiangyu/Models/Qwen/Qwen3-8B"           # required: local path to load tokenizer
@@ -54,20 +57,12 @@ LISTEN_HOST               = "localhost"
 LISTEN_PORT               = 29000
 LOG_FILE_NAME             = "defence-llm-server.log"   # dated prefix is prepended at runtime: YYYYMMDD_<name>
 
-STRIP_SECURITY_IN_HISTORY = True
 ENABLE_THINKING           = True        # Qwen3: pass enable_thinking to apply_chat_template
 
 # When True, a phase-1 tool call is handed to the lora model for the phase-2 security
 # check (and possible defence). When False, phase 2 is skipped entirely: the phase-1
 # output is parsed and returned directly, so no security block is ever produced.
 PHASE2_ENABLE             = True
-
-# Retries for phase 1 when its think block overruns max_tokens (finish_reason=="length").
-# 0 disables retries (original behavior). When > 0, the truncated output is discarded and
-# phase 1 is re-run up to this many times; if the limit is still hit, the last (truncated)
-# result is returned as before. Only meaningful under sampling, where a fresh draw
-# may yield a shorter think.
-PHASE1_THINK_RETRY_COUNT  = 0
 
 # Retries for phase 2 when its security block overruns max_tokens (finish_reason=="length").
 # 0 disables retries (original behavior). When > 0, the truncated output is discarded and
@@ -443,8 +438,9 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 tokenizer: Any = None
-_http: Optional[httpx.AsyncClient] = None
-_context_window: int = 0          # max_model_len from vllm, set at startup
+_http: Optional[httpx.AsyncClient] = None          # local calls: phase 2, secure /models, passthrough
+_http_llm: Optional[httpx.AsyncClient] = None      # phase 1 (remote chat): may carry proxy + auth header
+_context_window: int = 0          # context length, set at startup from LLM_CONTEXT_WINDOW
 
 # ---------------------------------------------------------------------------
 # FastAPI lifespan: one shared connection pool for the whole process
@@ -452,35 +448,37 @@ _context_window: int = 0          # max_model_len from vllm, set at startup
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _http, _context_window
+    global _http, _http_llm, _context_window
+
+    # Local client (no proxy): phase 2 completions, secure /models, passthrough.
     _http = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
-    log.info("HTTP client created (timeout=%ds)", REQUEST_TIMEOUT)
 
-    # Validate model IDs and read max_model_len from the LLM server.
+    # Phase-1 client for the remote chat backend. Carries the proxy and/or bearer token only
+    # when configured; with the defaults ("" proxy, "NOKEY" token) it behaves like a plain client.
+    llm_kwargs: Dict[str, Any] = {"timeout": REQUEST_TIMEOUT}
+    if LLM_SERVER_PROXY:
+        llm_kwargs["proxy"] = LLM_SERVER_PROXY
+    if LLM_SERVER_TOKEN and LLM_SERVER_TOKEN != "NOKEY":
+        llm_kwargs["headers"] = {"Authorization": f"Bearer {LLM_SERVER_TOKEN}"}
+    _http_llm = httpx.AsyncClient(**llm_kwargs)
+    log.info(
+        "HTTP clients created (timeout=%ds, phase1_proxy=%s, phase1_auth=%s)",
+        REQUEST_TIMEOUT,
+        LLM_SERVER_PROXY or "none",
+        "yes" if "headers" in llm_kwargs else "no",
+    )
+
+    # Phase 1 targets a chat backend that cannot report max_model_len via /models, so the
+    # context window is taken from configuration rather than probed.
+    _context_window = LLM_CONTEXT_WINDOW
+    log.info("Context window: %d tokens (from LLM_CONTEXT_WINDOW config)", _context_window)
+
+    # Validate the secure (phase 2) model against its own server, which stays a local vllm.
     try:
-        r = await _http.get(f"{LLM_SERVER_URL.rstrip('/')}/models")
-        r.raise_for_status()
-        llm_models = r.json().get("data", [])
-        llm_model_ids = {m.get("id") for m in llm_models}
-        if LLM_MODEL_ID not in llm_model_ids:
-            raise ValueError(
-                f"LLM model ID {LLM_MODEL_ID!r} not found at {LLM_SERVER_URL}. "
-                f"Available: {sorted(llm_model_ids)}"
-            )
-        llm_info = next(m for m in llm_models if m.get("id") == LLM_MODEL_ID)
-        if not llm_info.get("max_model_len"):
-            raise ValueError(f"max_model_len missing for {LLM_MODEL_ID}")
-        _context_window = int(llm_info["max_model_len"])
-        log.info("Context window: %d tokens (from %s)", _context_window, LLM_MODEL_ID)
-
-        # Validate secure server model (may be a different endpoint).
-        if SECURE_SERVER_URL.rstrip('/') == LLM_SERVER_URL.rstrip('/'):
-            secure_model_ids = llm_model_ids
-        else:
-            r2 = await _http.get(f"{SECURE_SERVER_URL.rstrip('/')}/models")
-            r2.raise_for_status()
-            secure_models = r2.json().get("data", [])
-            secure_model_ids = {m.get("id") for m in secure_models}
+        r2 = await _http.get(f"{SECURE_SERVER_URL.rstrip('/')}/models")
+        r2.raise_for_status()
+        secure_models = r2.json().get("data", [])
+        secure_model_ids = {m.get("id") for m in secure_models}
         if SECURE_MODEL_ID not in secure_model_ids:
             raise ValueError(
                 f"Secure model ID {SECURE_MODEL_ID!r} not found at {SECURE_SERVER_URL}. "
@@ -488,12 +486,14 @@ async def lifespan(app: FastAPI):
             )
     except Exception as exc:
         await _http.aclose()
+        await _http_llm.aclose()
         log.error("Startup validation failed: %s", exc)
         raise
 
     yield
     await _http.aclose()
-    log.info("HTTP client closed")
+    await _http_llm.aclose()
+    log.info("HTTP clients closed")
 
 
 app = FastAPI(title="defence-llm-server", docs_url=None, redoc_url=None, lifespan=lifespan)
@@ -531,11 +531,15 @@ _SECURITY_FULL_RE = re.compile(
 _VERDICT_MALFORMED = object()
 
 # ---------------------------------------------------------------------------
-# Message preprocessing (only for STRIP_SECURITY_IN_HISTORY = False)
+# Tool-call text rendering
 # ---------------------------------------------------------------------------
 
 def _render_tool_calls_as_text(tool_calls: List[Dict]) -> str:
-    """Serialize the OpenAI tool_calls array back to Qwen3's native <tool_call> text."""
+    """Serialize an OpenAI tool_calls array into Qwen3's native <tool_call> text.
+
+    Used to turn phase-1 chat tool_calls into the assistant text the lora reviews, and to
+    reassemble the final response with each call followed by its security block.
+    """
     parts = []
     for tc in tool_calls:
         fn = tc.get("function", {})
@@ -547,42 +551,6 @@ def _render_tool_calls_as_text(tool_calls: List[Dict]) -> str:
         obj = {"name": name, "arguments": args}
         parts.append(f"<tool_call>\n{json.dumps(obj, ensure_ascii=False)}\n</tool_call>")
     return "\n".join(parts)
-
-
-def _reorder_security_after_tool_calls(messages: List[Dict]) -> List[Dict]:
-    """
-    Reorder history so each <tool_call_security> block follows its <tool_call>.
-
-    Used only when STRIP_SECURITY_IN_HISTORY is False (the block is kept, not stripped).
-    For any assistant message carrying both a <tool_call_security> block in its content
-    and a tool_calls field, the tool_calls are serialized into text placed before the
-    security block, and the tool_calls field is dropped so the chat template does not
-    re-render the call in the wrong slot (i.e. before the security block). This must run
-    before rendering, because it rewrites the structured messages the template consumes.
-    """
-    result = []
-    for msg in copy.deepcopy(messages):
-        if msg.get("role") == "assistant":
-            content = msg.get("content") or ""
-            tool_calls = msg.get("tool_calls")
-
-            # Flatten list content to a plain string for security detection.
-            if isinstance(content, list):
-                content_str = "\n".join(
-                    p.get("text", "") for p in content
-                    if isinstance(p, dict) and p.get("type") == "text"
-                )
-            else:
-                content_str = content if isinstance(content, str) else ""
-
-            if "<tool_call_security>" in content_str and tool_calls:
-                sec_match = _SECURITY_RE.search(content_str)
-                security_block = sec_match.group(0) if sec_match else ""
-                msg["content"] = _render_tool_calls_as_text(tool_calls) + security_block
-                msg.pop("tool_calls", None)
-
-        result.append(msg)
-    return result
 
 # ---------------------------------------------------------------------------
 # Chat template rendering
@@ -751,12 +719,35 @@ async def _call_completions(
     r.raise_for_status()
     return r.json()
 
-# ---------------------------------------------------------------------------
-# Tool-call stop detection — only trust vllm's stop_reason field
-# ---------------------------------------------------------------------------
 
-def _is_tool_call_stop(choice: Dict) -> bool:
-    return choice.get("stop_reason") == TOOL_CALL_END
+async def _call_chat_completions(
+    messages: List[Dict],
+    tools: Optional[List[Dict]],
+    max_tokens: int,
+    stop: List[str],
+    fwd: Dict,
+) -> Dict:
+    """Phase-1 call against a remote OpenAI-compatible chat backend (vllm / Nvidia / OpenRouter).
+
+    Sends the native OpenAI request (messages + tools) and returns the raw JSON response.
+    Goes through _http_llm so the configured proxy and bearer token (if any) are applied.
+    """
+    payload: Dict[str, Any] = {
+        **fwd,
+        "model": LLM_MODEL_ID,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    if tools:
+        payload["tools"] = tools
+    if stop:
+        payload["stop"] = stop
+    r = await _http_llm.post(
+        f"{LLM_SERVER_URL.rstrip('/')}/chat/completions", json=payload,
+    )
+    r.raise_for_status()
+    return r.json()
 
 # ---------------------------------------------------------------------------
 # Security defence helpers
@@ -1403,14 +1394,11 @@ async def _handle_request(
     client_stop: List[str],
     fwd: Dict,
 ) -> Tuple[Dict, List[Dict]]:
-    # Phase 1 should look like native vllm's input. Native vllm history never contains
-    # <tool_call_security> — that tag is injected by THIS server — so strip it before
-    # phase 1 (STRIP_SECURITY_IN_HISTORY True), leaving content native vllm would have.
-    # <think> is NOT stripped here: native Qwen3 keeps the current multi-step turn's
-    # think, so phase 1 keeps it too; historical <think> is removed later, only on the
-    # phase-2 path, so it never runs when phase 2 is skipped. When STRIP_SECURITY_IN_HISTORY
-    # is False the block is kept, so reorder messages first (a message-level edit) to
-    # place each <tool_call_security> after its <tool_call>.
+    # prompt_head_no_think (rendered here) feeds phase 2 (the lora); the phase-1 head is also used
+    # to estimate token budgets. Native history never contains <tool_call_security> — that tag is
+    # injected by THIS server — so it is always stripped from the rendered prompt. Historical
+    # <think> is removed for the phase-2 head; the phase-1 head keeps it (harmless: chat output
+    # has none anyway).
     def _build_heads(msgs: List[Dict[str, Any]], log_raw: bool = False):
         """Render the conversation and split it into the pieces the two phases need.
 
@@ -1418,24 +1406,22 @@ async def _handle_request(
         when the defence cuts injected words out of a tool response, the history has changed
         and everything derived from it has to be rebuilt before phase 1 runs again.
         """
-        msgs_for_render = msgs
-        if not STRIP_SECURITY_IN_HISTORY:
-            msgs_for_render = _reorder_security_after_tool_calls(msgs)
-        rendered = _render_prompt(msgs_for_render, tools)
+        rendered = _render_prompt(msgs, tools)
 
         # Optionally log the rendered input — after formatting, before the security strip.
         if log_raw and OUTPUT_RAW_CLIENT_INPUT:
             log.info("[raw_client_input] %s", rendered.replace("\n", "\\n"))
 
-        if STRIP_SECURITY_IN_HISTORY:
-            rendered = _SECURITY_BLOCK_RE.sub("", rendered)
+        # Native history never contains <tool_call_security> (this server injects it), so it is
+        # always stripped from the rendered prompt.
+        rendered = _SECURITY_BLOCK_RE.sub("", rendered)
 
         # head is what phase 1 sees: native-like (security stripped, think kept).
         # opener (possibly "") is the assistant-turn opener the template emitted.
         head, opener = _split_open_think(rendered)
 
         # head with all historical <think> removed. Security was already handled before
-        # phase 1 (stripped or reordered). Two consumers:
+        # phase 1 (always stripped). Two consumers:
         #   - phase 2 (lora), which never needs the base model's historical thinking;
         #   - defence retries, which rebuild the base turn with our injected <think>; starting
         #     from this head guarantees the base model continues from ONLY that single
@@ -1447,8 +1433,8 @@ async def _handle_request(
     work_messages = messages
     prompt_head, think_opener, prompt_head_no_think = _build_heads(work_messages, log_raw=True)
 
-    # Text of the current assistant turn that WE injected (defence think). Never
-    # contains base-model output — the base model's own text is always appended after it.
+    # The Qwen3 assistant-turn opener the template emitted; kept only to estimate how many
+    # tokens the rendered history occupies (it is no longer sent — phase 1 posts native messages).
     assistant_prefix = think_opener
 
     # Usage is summed over every phase-1/phase-2 call the request triggered.
@@ -1456,14 +1442,14 @@ async def _handle_request(
     acc_completion_tokens = 0
 
     for attempt in range(SECURITY_DEFENCE_MAX_RETRIES + 1):
-        # Every phase-1 run is a native turn: the assistant text is generated with nothing of
-        # ours in front of it. After a defence method repairs the conversation the poisoned turn
-        # is thrown away, not continued, so the retry is likewise a fresh native turn.
+        # Phase 1 sends the native conversation to the remote chat backend; current_prompt is the
+        # locally rendered head used ONLY to estimate the prompt token count for the max_tokens
+        # budget and the context-window guard below (the remote enforces its own limits too).
         current_prompt = prompt_head + assistant_prefix
 
         # ── Phase 1: base model ──────────────────────────────────────────────
-        # _context_window is the total context length (vllm --max-model-len); the
-        # generation budget is window minus prompt length.
+        # _context_window is the configured context length (LLM_CONTEXT_WINDOW); the
+        # generation budget is window minus the estimated prompt length.
         prompt_token_count = len(tokenizer.encode(current_prompt, add_special_tokens=False))
         p1_available = _context_window - prompt_token_count - 64   # 64-token safety buffer
         if p1_available <= 0:
@@ -1481,47 +1467,42 @@ async def _handle_request(
             p1_available,
         )
 
-        # TOOL_CALL_END first for deterministic logging; client stops deduped and appended.
-        p1_stop = [TOOL_CALL_END] + [s for s in dict.fromkeys(client_stop) if s != TOOL_CALL_END]
+        # Phase 1 runs against a remote OpenAI-compatible chat backend: send the native
+        # conversation (messages + tools) and read native tool_calls back. client_stop is
+        # forwarded; the </tool_call> stop the old raw-completion path relied on is meaningless
+        # for a chat endpoint that returns structured tool_calls.
+        p1_stop = list(dict.fromkeys(client_stop))
 
-        # Phase-1 call, retried when the think block overruns max_tokens (finish_reason
-        # == "length"). Each retry reuses the SAME prompt and DISCARDS the previous
-        # truncated output — that output overran the limit, so it is incomplete and wrong
-        # and must not be used. Retrying only helps under sampling, where a fresh draw
-        # may produce a shorter think. After PHASE1_THINK_RETRY_COUNT
-        # retries still hitting length, fall through with the last result so the original
-        # length-handling below runs unchanged.
-        text1 = ""
-        p1_finish_reason = "stop"
-        for think_try in range(PHASE1_THINK_RETRY_COUNT + 1):
-            log.info("[phase1] base model  attempt=%d  think_try=%d  stop=%s  max_tokens=%d  prompt_tokens~=%d",
-                     attempt, think_try, p1_stop, p1_max, prompt_token_count)
-            if VLLM_INFERENCE_DEBUG:
-                log.info(
-                    "[inference][Base Model] input=%s",
-                    current_prompt.replace("\n", "\\n"),
-                )
-            p1 = await _call_completions(current_prompt, LLM_MODEL_ID, p1_stop, p1_max, fwd)
-            c1 = p1["choices"][0]
-            text1 = c1.get("text") or ""
-            usage1 = p1.get("usage", {})
-            acc_prompt_tokens += usage1.get("prompt_tokens") or prompt_token_count
-            acc_completion_tokens += usage1.get("completion_tokens", 0)
-            p1_finish_reason = c1.get("finish_reason") or "stop"
-
-            if p1_finish_reason != "length" or think_try >= PHASE1_THINK_RETRY_COUNT:
-                break
-            log.warning(
-                "[phase1] hit max_tokens (finish_reason=length); discarding truncated "
-                "output and retrying think (%d/%d)",
-                think_try + 1, PHASE1_THINK_RETRY_COUNT,
+        log.info(
+            "[phase1] chat model  attempt=%d  model=%s  stop=%s  max_tokens=%d  prompt_tokens~=%d",
+            attempt, LLM_MODEL_ID, p1_stop, p1_max, prompt_token_count,
+        )
+        if VLLM_INFERENCE_DEBUG:
+            log.info(
+                "[inference][Base Model] messages=%s",
+                json.dumps(work_messages, ensure_ascii=False),
             )
 
-        # The complete assistant turn as text: our injected prefix (defence think and/or
-        # the template's think opener) followed by whatever the base model produced.
-        # Building it this way means every return path below already carries a complete
-        # <think>...</think> pair, with no per-branch patching.
-        raw_assistant = assistant_prefix + text1
+        p1 = await _call_chat_completions(work_messages, tools, p1_max, p1_stop, fwd)
+        c1 = p1["choices"][0]
+        msg1 = c1.get("message") or {}
+        native_tool_calls = msg1.get("tool_calls") or []
+        content_text = msg1.get("content") or ""
+        usage1 = p1.get("usage", {})
+        acc_prompt_tokens += usage1.get("prompt_tokens") or prompt_token_count
+        acc_completion_tokens += usage1.get("completion_tokens", 0)
+        p1_finish_reason = c1.get("finish_reason") or "stop"
+
+        # Rebuild the assistant turn as native-Qwen3 text so the phase-2 / defence pipeline below
+        # (written for the raw-completion path) is reused unchanged. That pipeline appends
+        # TOOL_CALL_END itself, so the synthesized text stops right before the final </tool_call>,
+        # mirroring what vllm's stop string used to leave in place.
+        if native_tool_calls:
+            rendered_calls = _render_tool_calls_as_text(native_tool_calls)
+            content_prefix = (content_text.rstrip() + "\n") if content_text.strip() else ""
+            raw_assistant = content_prefix + rendered_calls[: -len(TOOL_CALL_END)]
+        else:
+            raw_assistant = content_text
 
         if VLLM_INFERENCE_DEBUG:
             log.info(
@@ -1529,66 +1510,17 @@ async def _handle_request(
                 raw_assistant.replace("\n", "\\n"),
             )
 
-        # ── Case 1: max_tokens truncation — return truncated output as-is ────
-        if p1_finish_reason == "length":
-            log.error(
-                "[phase1] ERROR: base model hit max_tokens (finish_reason=length); "
-                "prompt_tokens~=%d max_tokens=%d — returning truncated output, not calling lora",
-                prompt_token_count, p1_max,
-            )
-            _open_idx  = raw_assistant.rfind("<think>")
-            _close_idx = raw_assistant.rfind("</think>")
-            if _open_idx != -1 and _open_idx > _close_idx:
-                log.error("[phase1] unclosed <think> detected in truncated output, appending </think>")
-                raw_assistant = raw_assistant.rstrip() + "\n</think>"
-            tool_calls, content = _parse_output(raw_assistant)
-            return _build_response(
-                cid, tool_calls, content,
-                acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
-            ), work_messages
-
-        # ── Cases 2 & 3: repair unclosed <think> then check for tool calls ───
-        # Case 2: unclosed </think> — close it so _parse_qwen3 can filter
-        # spurious <tool_call> blocks the model wrote while planning.
-        _open_idx  = raw_assistant.rfind("<think>")
-        _close_idx = raw_assistant.rfind("</think>")
-        if _open_idx != -1 and _open_idx > _close_idx:
-            log.error(
-                "[phase1] ERROR: base model output has an unclosed <think> block "
-                "(finish_reason=%s); appending </think> to restore valid structure",
-                p1_finish_reason,
-            )
-            raw_assistant = raw_assistant.rstrip() + "\n</think>"
-
-        # When stop_reason==</tool_call> that tag was consumed by vllm and is absent
-        # from text1; append it to reconstruct the complete <tool_call>…</tool_call>.
-        _full_for_parse = raw_assistant + (TOOL_CALL_END if _is_tool_call_stop(c1) else "")
-        tool_calls, content = _parse_output(_full_for_parse)
+        tool_calls, content = _parse_output(
+            raw_assistant + (TOOL_CALL_END if native_tool_calls else "")
+        )
 
         if not tool_calls:
             log.info(
-                "[phase1] no real tool calls (finish_reason=%s, stop_reason=%r) — "
-                "skipping lora",
-                p1_finish_reason, c1.get("stop_reason"),
+                "[phase1] no tool calls (finish_reason=%s) — skipping lora",
+                p1_finish_reason,
             )
             return _build_response(
                 cid, [], content,
-                acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
-            ), work_messages
-
-        if not _is_tool_call_stop(c1):
-            # Tool calls present but stop_reason is not </tool_call>.
-            # This should not happen in normal operation: tool calls outside <think>
-            # always trigger the </tool_call> stop string, and tool calls inside <think>
-            # are filtered by _parse_qwen3 so tool_calls would be empty above.
-            # Most likely cause: </tool_call> is missing from the stop-strings config.
-            log.warning(
-                "[phase1] UNEXPECTED: tool calls found but stop_reason=%r (not </tool_call>); "
-                "finish_reason=%s — returning without lora (check stop-strings config)",
-                c1.get("stop_reason"), p1_finish_reason,
-            )
-            return _build_response(
-                cid, tool_calls, content,
                 acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
             ), work_messages
 
@@ -1600,465 +1532,442 @@ async def _handle_request(
                 acc_prompt_tokens, acc_completion_tokens, p1_finish_reason,
             ), work_messages
 
-        log.info("[phase1] hit </tool_call> — switching to lora model")
+        log.info("[phase1] %d tool call(s) produced — running per-call lora review",
+                 len(native_tool_calls))
 
-        # ── Phase 2 prompt construction ──────────────────────────────────────
-        # Strip the base model's <think>...</think> entirely before the lora sees it, so its
-        # verdict is never poisoned by the base model's (possibly injected) reasoning. The final
-        # response still carries the base model's original think — this only affects the lora
-        # prompt. The strip is applied to the WHOLE assistant turn, so on retry rounds the
-        # injected defence think is removed too; applying it to text1 alone would leave that
-        # defence think visible to the lora and leave a dangling </think>, since the opening tag
-        # lives in the prompt head.
-        assistant_for_lora = _THINK_RE.sub("", raw_assistant).lstrip()
-        if assistant_for_lora != raw_assistant.lstrip():
-            log.info("[phase2] stripped base model <think>...</think> before lora")
-        else:
-            log.warning("[phase2] no complete <think> block found to strip, left as-is")
+        # ── Per-call phase 2 + defence ───────────────────────────────────────
+        # An external chat model may emit several tool calls in one turn, but phase 2 (the lora)
+        # reasons about ONE call at a time. Each call is isolated into its own single-call assistant
+        # text (raw_call) — the OTHER calls never appear in the lora prompt — sent to phase 2 on its
+        # own, then run through defence. Calls that clear defence are collected in `cleared` (call +
+        # its security block) so the final answer carries every call with its own verdict. The first
+        # BLOCKED call short-circuits the loop: later calls are not sent to phase 2, and the block is
+        # handed to the defence methods, which either repair the conversation and re-run phase 1
+        # (retry) or produce a final response (return).
+        def _finalize(segments: List[Tuple[Dict, str]], finish_reason: str) -> Dict:
+            """Assemble the response from (native_tool_call, security_block) pairs.
 
-        # Prefill the fixed opening of the security block so the lora only writes the
-        # reasoning. Anything prefilled cannot be malformed, truncated or abbreviated.
-        security_prefill = ""
-        if PREFILL_SECURITY_HEADER:
-            security_prefill = _build_security_prefill(raw_assistant)
-            if not security_prefill:
-                log.warning("[phase2] could not parse the tool call, "
-                            "falling back to letting the lora write the whole block")
-
-        # prompt_head_no_think already has historical <think> removed and security handled;
-        # phase 1 kept them so the base model saw a native-vllm prompt. The current turn's
-        # think was stripped above on assistant_for_lora.
-        p2_prompt = (
-            prompt_head_no_think + assistant_for_lora + TOOL_CALL_END
-            + TOOL_CALL_SECURITY_START + security_prefill
-        )
-
-        p2_prompt_tokens_est = len(tokenizer.encode(p2_prompt, add_special_tokens=False))
-        p2_available = _context_window - p2_prompt_tokens_est - 64
-
-        if p2_available < 64:
-            # Not enough room for a meaningful security block — skip phase 2.
-            log.warning(
-                "[phase2] context exhausted (available=%d tokens), skipping security phase",
-                p2_available,
+            content_text appears once, then each call is rendered as native <tool_call> text
+            followed by its security block (possibly "" for a call that was never assessed).
+            _parse_output pulls the calls back out; the blocks land in content and are stripped
+            unless SECURITY_DEFENCE_DEBUG is on.
+            """
+            body = "\n".join(
+                _render_tool_calls_as_text([tc]) + (block or "")
+                for tc, block in segments
             )
-            tool_calls, content = _parse_output(raw_assistant + TOOL_CALL_END)
+            lead = content_text.rstrip() if content_text.strip() else ""
+            full_text = (lead + "\n" + body) if lead else body
+            resp_calls, resp_content = _parse_output(full_text)
+            if not SECURITY_DEFENCE_DEBUG and resp_content:
+                resp_content = _SECURITY_RE.sub("", resp_content).strip() or None
             return _build_response(
-                cid, tool_calls, content,
-                acc_prompt_tokens, acc_completion_tokens, "length",
-            ), work_messages
-
-        p2_max = min(MAX_TOKENS_SECURITY, p2_available)
-        if p2_max < MAX_TOKENS_SECURITY:
-            log.warning("[phase2] context nearly full, security max_tokens clamped to %d", p2_max)
-
-        # ── Phase 2: lora model ──────────────────────────────────────────────
-        text2 = ""
-        p2_finish_reason = "stop"
-        c2: Dict = {}
-        for reason_try in range(PHASE2_TOOL_REASON_RETRY_COUNT + 1):
-            log.info(
-                "[phase2] lora model  reason_try=%d  stop=[%s]  max_tokens=%d  prefilled=%d chars",
-                reason_try, TOOL_CALL_SECURITY_END, p2_max, len(security_prefill),
+                cid, resp_calls, resp_content,
+                acc_prompt_tokens, acc_completion_tokens, finish_reason,
             )
+
+        cleared: List[Tuple[Dict, str]] = []   # (native_tool_call, security_block) that passed
+        outer_action: Optional[str] = None     # None | "retry" | "return"
+        defence_response: Optional[Dict] = None
+        last_p2_finish_reason = "stop"
+
+        for call_idx, native_tc in enumerate(native_tool_calls):
+            # Isolate a single-call assistant turn: content is kept as context, but the OTHER tool
+            # calls are excluded so the lora sees only this one. _render_tool_calls_as_text closes
+            # the <tool_call>; strip that trailing tag so the phase-2 assembly re-adds it uniformly.
+            content_prefix = (content_text.rstrip() + "\n") if content_text.strip() else ""
+            single_render = _render_tool_calls_as_text([native_tc])
+            raw_call = content_prefix + single_render[: -len(TOOL_CALL_END)]
+
+            # Chat-mode output carries no <think>, but keep the strip for parity with the old path.
+            assistant_for_lora = _THINK_RE.sub("", raw_call).lstrip()
+
+            # Prefill the fixed opening of the security block so the lora only writes the reasoning.
+            security_prefill = ""
+            if PREFILL_SECURITY_HEADER:
+                security_prefill = _build_security_prefill(raw_call)
+                if not security_prefill:
+                    log.warning("[phase2] call %d: could not parse the tool call, falling back to "
+                                "letting the lora write the whole block", call_idx + 1)
+
+            p2_prompt = (
+                prompt_head_no_think + assistant_for_lora + TOOL_CALL_END
+                + TOOL_CALL_SECURITY_START + security_prefill
+            )
+
+            p2_prompt_tokens_est = len(tokenizer.encode(p2_prompt, add_special_tokens=False))
+            p2_available = _context_window - p2_prompt_tokens_est - 64
+
+            if p2_available < 64:
+                # Not enough room for a meaningful security block — let this call through unassessed
+                # (no block) and move on, mirroring the old "skip phase 2 on exhaustion" behaviour.
+                log.warning(
+                    "[phase2] call %d: context exhausted (available=%d tokens), skipping security "
+                    "phase for this call", call_idx + 1, p2_available,
+                )
+                cleared.append((native_tc, ""))
+                continue
+
+            p2_max = min(MAX_TOKENS_SECURITY, p2_available)
+            if p2_max < MAX_TOKENS_SECURITY:
+                log.warning("[phase2] context nearly full, security max_tokens clamped to %d", p2_max)
+
+            # ── Phase 2: lora model ──────────────────────────────────────────
+            text2 = ""
+            p2_finish_reason = "stop"
+            c2: Dict = {}
+            for reason_try in range(PHASE2_TOOL_REASON_RETRY_COUNT + 1):
+                log.info(
+                    "[phase2] call %d/%d  reason_try=%d  stop=[%s]  max_tokens=%d  prefilled=%d chars",
+                    call_idx + 1, len(native_tool_calls), reason_try,
+                    TOOL_CALL_SECURITY_END, p2_max, len(security_prefill),
+                )
+                if VLLM_INFERENCE_DEBUG:
+                    log.info(
+                        "[inference][Lora Model] input=%s",
+                        p2_prompt.replace("\n", "\\n"),
+                    )
+                p2 = await _call_completions(
+                    p2_prompt, SECURE_MODEL_ID, [TOOL_CALL_SECURITY_END], p2_max, fwd,
+                    base_url=SECURE_SERVER_URL,
+                )
+                c2 = p2["choices"][0]
+                text2 = c2.get("text") or ""
+                usage2 = p2.get("usage", {})
+                p2_finish_reason = c2.get("finish_reason") or "stop"
+                acc_prompt_tokens += usage2.get("prompt_tokens", 0)
+                acc_completion_tokens += usage2.get("completion_tokens", 0)
+
+                if p2_finish_reason != "length" or reason_try >= PHASE2_TOOL_REASON_RETRY_COUNT:
+                    break
+                log.warning(
+                    "[phase2] hit max_tokens (finish_reason=length); discarding truncated "
+                    "output and retrying reason (%d/%d)",
+                    reason_try + 1, PHASE2_TOOL_REASON_RETRY_COUNT,
+                )
+            last_p2_finish_reason = p2_finish_reason
+
+            if c2.get("stop_reason") != TOOL_CALL_SECURITY_END:
+                log.warning(
+                    "[phase2] security block was truncated (finish_reason=%s, stop_reason=%r) — "
+                    "the verdict will most likely fail the format check",
+                    p2_finish_reason, c2.get("stop_reason"),
+                )
+
+            # block_body is everything the lora "wrote" between the tags: fixed prefill plus its
+            # generation. It stops before </tool_call_security>, re-added when the block is assembled.
+            block_body = security_prefill + text2
+
+            # Validate-and-fix the tool_reason questions (invent/short/missing-Summary corrections).
+            if SECURITY_VALIDATE_TOOL_REASON:
+                regen_head = (
+                    prompt_head_no_think + assistant_for_lora + TOOL_CALL_END
+                    + TOOL_CALL_SECURITY_START
+                )
+                block_body, fix_pt, fix_ct = await _validate_and_fix_tool_reason(
+                    block_body, regen_head, p2_max, fwd,
+                )
+                acc_prompt_tokens += fix_pt
+                acc_completion_tokens += fix_ct
+
+            full_security_block = (
+                TOOL_CALL_SECURITY_START + block_body + TOOL_CALL_SECURITY_END
+            )
+
+            # Strip any <tool_call> the lora cited inside its reasoning, else _parse_output would
+            # return them as spurious extra calls.
+            _spurious_tc = _TOOL_CALL_RE.findall(full_security_block)
+            if _spurious_tc:
+                log.error(
+                    "[phase2] ERROR: lora generated %d spurious <tool_call> block(s) inside "
+                    "<tool_call_security>; stripping them. names=%s",
+                    len(_spurious_tc),
+                    [json.loads(s.strip()).get("name", "?") if s.strip().startswith("{") else s[:60]
+                     for s in _spurious_tc],
+                )
+                full_security_block = _TOOL_CALL_RE.sub("", full_security_block)
+
+            log.info("[phase2] call %d done  finish_reason=%s", call_idx + 1, p2_finish_reason)
+
             if VLLM_INFERENCE_DEBUG:
                 log.info(
-                    "[inference][Lora Model] input=%s",
-                    p2_prompt.replace("\n", "\\n"),
+                    "[inference][Lora Model] assistant=%s",
+                    full_security_block.replace("\n", "\\n"),
                 )
-            p2 = await _call_completions(
-                p2_prompt, SECURE_MODEL_ID, [TOOL_CALL_SECURITY_END], p2_max, fwd,
-                base_url=SECURE_SERVER_URL,
-            )
-            c2 = p2["choices"][0]
-            text2 = c2.get("text") or ""
-            usage2 = p2.get("usage", {})
-            p2_finish_reason = c2.get("finish_reason") or "stop"
-            acc_prompt_tokens += usage2.get("prompt_tokens", 0)
-            acc_completion_tokens += usage2.get("completion_tokens", 0)
 
-            if p2_finish_reason != "length" or reason_try >= PHASE2_TOOL_REASON_RETRY_COUNT:
-                break
+            # ── Per-call defence decision ────────────────────────────────────
+            # The four "let it through" outcomes below (defence disabled, malformed block, a verdict
+            # that needs no block, and a safe verdict validated as user-driven) record this call's
+            # block and continue to the next call. Only a genuine block runs the defence methods.
+            if not TOOL_CALL_SECURITY_DEFENCE_ENABLE:
+                cleared.append((native_tc, full_security_block))
+                continue
+
+            verdict = _check_defence_verdict(full_security_block)
+
+            if verdict is _VERDICT_MALFORMED:
+                log.error("[defence] call %d security_block=%s",
+                          call_idx + 1, full_security_block.replace("\n", "\\n"))
+                cleared.append((native_tc, full_security_block))
+                continue
+
+            if verdict is None:
+                log.info("[defence] call %d security_block=%s",
+                         call_idx + 1, full_security_block.replace("\n", "\\n"))
+                cleared.append((native_tc, full_security_block))
+                continue
+
+            safe_value, tool_name, tool_args, tool_trace, trigger_words = verdict
+
+            # Safe-verdict trigger-word validation: trust a "safe" verdict only if its trigger words
+            # actually came from a user message; otherwise treat this call as a block.
+            if DEFENCE_SAFE_TOOLCALL and safe_value == "safe":
+                trigger = (trigger_words or "").strip().strip('"\'')
+                user_hit = _trigger_words_in_user_message(work_messages, trigger_words) if trigger else None
+                if not trigger:
+                    log.info("[defence] call %d: safe tool call has no trigger words to validate — "
+                             "letting it through (tool_name=%s)", call_idx + 1, tool_name)
+                elif user_hit is not None:
+                    log.info("[defence] call %d: safe tool call trigger words found in user message "
+                             "at index %d — genuinely user-driven (tool_name=%s)",
+                             call_idx + 1, user_hit[0], tool_name)
+                if not trigger or user_hit is not None:
+                    cleared.append((native_tc, full_security_block))
+                    continue
+                log.warning(
+                    "[defence] call %d: safe tool call trigger words NOT from any user message; "
+                    "running defence methods. tool_name=%s trigger_words=%s",
+                    call_idx + 1, tool_name, trigger_words.replace("\n", "\\n"),
+                )
+
+            log.warning("[defence] call %d security_block=%s",
+                        call_idx + 1, full_security_block.replace("\n", "\\n"))
             log.warning(
-                "[phase2] hit max_tokens (finish_reason=length); discarding truncated "
-                "output and retrying reason (%d/%d)",
-                reason_try + 1, PHASE2_TOOL_REASON_RETRY_COUNT,
+                "[defence] call %d tool_call BLOCKED safe_value=%s defence_level=%s tool_name=%s "
+                "trigger_words=%s",
+                call_idx + 1, safe_value, TOOL_CALL_SECURITY_DEFENCE_LEVEL, tool_name,
+                (trigger_words or "").replace("\n", "\\n"),
             )
 
-        if c2.get("stop_reason") != TOOL_CALL_SECURITY_END:
-            log.warning(
-                "[phase2] security block was truncated (finish_reason=%s, stop_reason=%r) — "
-                "the verdict will most likely fail the format check",
-                p2_finish_reason, c2.get("stop_reason"),
+            # ── Defence dispatch for THIS call: apply the configured methods in order ──
+            # match_tool_call false positive => this call is actually safe => allow it and continue
+            # to the next call. remove_trigger_words excision / fake_tool_response => repair the
+            # conversation and re-run phase 1 (retry). Nothing handled => undefended pass-through of
+            # the whole turn. The give-up / max-retries responses are assembled by _finalize.
+            #
+            # The safe-verdict path (safe_value == "safe" under DEFENCE_SAFE_TOOLCALL) uses its own
+            # method list AND its own remove_trigger_words parameters; every other block uses the
+            # DEFENCE_METHOD_LIST / DEFENCE_* values. Resolved once so the methods read no globals.
+            is_safe_path = DEFENCE_SAFE_TOOLCALL and safe_value == "safe"
+            active_defence_methods = DEFENCE_SAFE_METHOD_LIST if is_safe_path else DEFENCE_METHOD_LIST
+            rtw_match_tool_call = (
+                DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL if is_safe_path
+                else DEFENCE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL
+            )
+            rtw_fuzzy = (
+                DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH if is_safe_path
+                else DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH
             )
 
-        # block_body is everything the lora "wrote" between the tags: our fixed prefill plus its
-        # generation. It stops before </tool_call_security> (the stop string), which is re-added
-        # when full_security_block is assembled below.
-        block_body = security_prefill + text2
-
-        # ── Validate-and-fix the tool_reason questions ────────────────────────
-        # The lora sometimes invents a question, stops short of the required count, or drops the
-        # Summary. Check the questions against SECURITY_QUESTIONS and, at the first deviation,
-        # truncate the block there and let phase 2 continue from the corrected spot.
-        if SECURITY_VALIDATE_TOOL_REASON:
-            regen_head = (
-                prompt_head_no_think + assistant_for_lora + TOOL_CALL_END
-                + TOOL_CALL_SECURITY_START
-            )
-            block_body, fix_pt, fix_ct = await _validate_and_fix_tool_reason(
-                block_body, regen_head, p2_max, fwd,
-            )
-            acc_prompt_tokens += fix_pt
-            acc_completion_tokens += fix_ct
-
-        full_security_block = (
-            TOOL_CALL_SECURITY_START + block_body + TOOL_CALL_SECURITY_END
-        )
-
-        # Lora may write <tool_call>...</tool_call> blocks inside its security reasoning
-        # (e.g. when citing historical calls). These must be removed before full_text is
-        # assembled, because _parse_output(full_text) uses _TOOL_CALL_RE which matches
-        # ANY <tool_call> in the string — including ones inside the security block —
-        # and would return them as spurious extra tool calls in the response.
-        _spurious_tc = _TOOL_CALL_RE.findall(full_security_block)
-        if _spurious_tc:
-            log.error(
-                "[phase2] ERROR: lora generated %d spurious <tool_call> block(s) inside "
-                "<tool_call_security>; stripping them. names=%s",
-                len(_spurious_tc),
-                [json.loads(s.strip()).get("name", "?") if s.strip().startswith("{") else s[:60]
-                 for s in _spurious_tc],
-            )
-            full_security_block = _TOOL_CALL_RE.sub("", full_security_block)
-
-        full_text = raw_assistant + TOOL_CALL_END + full_security_block
-        log.info("[phase2] done  finish_reason=%s", p2_finish_reason)
-
-        if VLLM_INFERENCE_DEBUG:
-            log.info(
-                "[inference][Lora Model] assistant=%s",
-                full_security_block.replace("\n", "\\n"),
+            # Undefended pass-through of the whole turn: cleared calls keep their blocks, the blocked
+            # call keeps its own block, and any not-yet-assessed calls follow with no block.
+            undefended_segments = (
+                cleared + [(native_tc, full_security_block)]
+                + [(tc, "") for tc in native_tool_calls[call_idx + 1:]]
             )
 
-        # ── Defence ──────────────────────────────────────────────────────────
-        if not TOOL_CALL_SECURITY_DEFENCE_ENABLE:
-            tool_calls, content = _parse_output(full_text)
-            if not SECURITY_DEFENCE_DEBUG and content:
-                content = _SECURITY_RE.sub("", content).strip() or None
-            return _build_response(
-                cid, tool_calls, content,
-                acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
-            ), work_messages
+            call_action: Optional[str] = None   # None | "allow" | "retry" | "return"
+            for method in active_defence_methods:
+                if method == "remove_trigger_words":
+                    # Cut the injected words out of the tool response that carried them. The search
+                    # runs backwards over the whole conversation, because a page fetched early can be
+                    # acted on several calls later.
+                    #
+                    # Three ordered steps — if ANY hits, remove_trigger_words has handled the block
+                    # and control does NOT fall to the next method:
+                    #   1. exact search across the tool responses => remove the words, re-run phase 1;
+                    #   2. if that misses AND the active *_MATCH_TOOL_CALL is on, test whether the
+                    #      words are a slice of THIS call's name/args — if so it is a false positive,
+                    #      annotate the verdict and let THIS call through (continue to the next call);
+                    #   3. only then a fuzzy search across the tool responses (when *_FUZZY_SEARCH is
+                    #      on) => remove the words, re-run phase 1.
+                    # Only when all three miss does control fall to the next configured method.
 
-        verdict = _check_defence_verdict(full_security_block)
-
-        if verdict is _VERDICT_MALFORMED:
-            log.error(
-                "[defence] security_block=%s",
-                full_security_block.replace("\n", "\\n"),
-            )
-            tool_calls, content = _parse_output(full_text)
-            if not SECURITY_DEFENCE_DEBUG and content:
-                content = _SECURITY_RE.sub("", content).strip() or None
-            return _build_response(
-                cid, tool_calls, content,
-                acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
-            ), work_messages
-
-        if verdict is None:
-            log.info(
-                "[defence] security_block=%s",
-                full_security_block.replace("\n", "\\n"),
-            )
-            tool_calls, content = _parse_output(full_text)
-            if not SECURITY_DEFENCE_DEBUG and content:
-                content = _SECURITY_RE.sub("", content).strip() or None
-            return _build_response(
-                cid, tool_calls, content,
-                acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
-            ), work_messages
-
-        safe_value, tool_name, tool_args, tool_trace, trigger_words = verdict
-
-        # ── Safe-verdict trigger-word validation ─────────────────────────────
-        # A verdict of exactly "safe" only reaches here when
-        # DEFENCE_SAFE_TOOLCALL is on. Trust it only if its trigger
-        # words actually came from a user message; otherwise the lora rated an injected
-        # instruction as safe, so the call is handed to the defence methods like any block.
-        if DEFENCE_SAFE_TOOLCALL and safe_value == "safe":
-            trigger = (trigger_words or "").strip().strip('"\'')
-            user_hit = _trigger_words_in_user_message(work_messages, trigger_words) if trigger else None
-            if not trigger:
-                log.info(
-                    "[defence] safe tool call has no trigger words to validate — letting it "
-                    "through (tool_name=%s)", tool_name,
-                )
-            elif user_hit is not None:
-                log.info(
-                    "[defence] safe tool call: trigger words found in user message at index %d "
-                    "— genuinely user-driven, letting it through (tool_name=%s)",
-                    user_hit[0], tool_name,
-                )
-            if not trigger or user_hit is not None:
-                tool_calls, content = _parse_output(full_text)
-                if not SECURITY_DEFENCE_DEBUG and content:
-                    content = _SECURITY_RE.sub("", content).strip() or None
-                return _build_response(
-                    cid, tool_calls, content,
-                    acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
-                ), work_messages
-            log.warning(
-                "[defence] safe tool call: trigger words NOT found in any user message — they "
-                "are not from the user; running defence methods. tool_name=%s trigger_words=%s",
-                tool_name, trigger_words.replace("\n", "\\n"),
-            )
-
-        log.warning(
-            "[defence] security_block=%s",
-            full_security_block.replace("\n", "\\n"),
-        )
-        log.warning(
-            "[defence] tool_call BLOCKED safe_value=%s defence_level=%s tool_name=%s "
-            "trigger_words=%s",
-            safe_value, TOOL_CALL_SECURITY_DEFENCE_LEVEL, tool_name,
-            (trigger_words or "").replace("\n", "\\n"),
-        )
-
-        # ── Defence dispatch: apply the configured methods in order ───────────
-        # Each method either neutralises the blocked call (stop) or fails (try the next one).
-        # A method reports its outcome through defence_action, read once the loop ends:
-        #   "retry"  — the method repaired the loop state; re-run phase 1 (continue outer loop)
-        #   "return" — the method produced a final response, held in defence_response
-        #   None     — no method handled the block; fall through to an undefended pass-through
-        defence_action: Optional[str] = None
-        defence_response: Optional[Dict] = None
-
-        # The safe-verdict path (reached only for safe_value == "safe" under DEFENCE_SAFE_TOOLCALL)
-        # uses its own method list AND its own remove_trigger_words parameters; every other blocked
-        # call uses the DEFENCE_METHOD_LIST list and the DEFENCE_* parameters. The active values are
-        # resolved once here and passed into the methods, so the methods read no globals.
-        is_safe_path = DEFENCE_SAFE_TOOLCALL and safe_value == "safe"
-        active_defence_methods = DEFENCE_SAFE_METHOD_LIST if is_safe_path else DEFENCE_METHOD_LIST
-        rtw_match_tool_call = (
-            DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL if is_safe_path
-            else DEFENCE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL
-        )
-        rtw_fuzzy = (
-            DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH if is_safe_path
-            else DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH
-        )
-
-        # "Let the blocked turn through unchanged" outcome, shared by every give-up path: a method
-        # that cannot repair the block, and the retry budget running out. The current turn is
-        # returned exactly as produced (security block stripped unless debug is on), so a failure
-        # to defend surfaces as an ordinary undefended answer rather than a canned message.
-        def _pass_through() -> Dict:
-            tool_calls, content = _parse_output(full_text)
-            if not SECURITY_DEFENCE_DEBUG and content:
-                content = _SECURITY_RE.sub("", content).strip() or None
-            return _build_response(
-                cid, tool_calls, content,
-                acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
-            )
-
-        for method in active_defence_methods:
-            if method == "remove_trigger_words":
-                # Cut the injected words out of the tool response that carried them. Telling the
-                # model to ignore an instruction leaves it in the conversation, where it is read
-                # again on every later turn and may be obeyed the second time; removing the words
-                # removes the thing to obey. The search runs backwards over the whole conversation
-                # rather than only the last tool response, because a page fetched early can be
-                # acted on several calls later.
-                #
-                # Three ordered steps:
-                #   1. exact search across the tool responses (verbatim + punctuation-insensitive);
-                #   2. if that misses AND the active *_MATCH_TOOL_CALL is on, test whether
-                #      the words are a slice of any tool call's name or arguments (current turn
-                #      first, then history backwards) — if so the verdict is a false positive, so
-                #      annotate it and let the call through (a success, no further methods);
-                #   3. only then fall back to a fuzzy search across the tool responses (when the
-                #      active *_FUZZY_SEARCH is on).
-
-                # Step 1: exact search in the tool responses.
-                excised = (
-                    _excise_trigger_words(
-                        work_messages, trigger_words, allow_fuzzy=False,
-                    )
-                    if trigger_words else None
-                )
-
-                # Step 2: exact match against a tool call's name or arguments — a false positive.
-                matched_call = None
-                if excised is None and rtw_match_tool_call and trigger_words:
-                    cur_calls, _ = _parse_output(raw_assistant + TOOL_CALL_END)
-                    cur_pairs = [(c["name"], c["arguments"]) for c in cur_calls]
-                    matched_call = _find_trigger_in_tool_calls(work_messages, cur_pairs, trigger_words)
-                if matched_call is not None:
-                    m_name, m_args = matched_call
-                    marked_block = _mark_tool_security_verdict(
-                        full_security_block, safe_value, "match_tool_call",
-                    )
-                    log.warning(
-                        "[defence] remove_trigger_words: trigger words are a slice of a tool call "
-                        "(name=%s args=%s), not a tool response — treating the verdict as a false "
-                        "positive (%s,match_tool_call) and letting the call through.",
-                        m_name, (m_args or "").replace("\n", "\\n")[:400], safe_value,
-                    )
-                    marked_full_text = raw_assistant + TOOL_CALL_END + marked_block
-                    tool_calls, content = _parse_output(marked_full_text)
-                    if not SECURITY_DEFENCE_DEBUG and content:
-                        content = _SECURITY_RE.sub("", content).strip() or None
-                    defence_response = _build_response(
-                        cid, tool_calls, content,
-                        acc_prompt_tokens, acc_completion_tokens, p2_finish_reason,
-                    )
-                    defence_action = "return"
-                    break
-
-                # Step 3: fuzzy search in the tool responses (only when the active fuzzy flag is on).
-                if excised is None and rtw_fuzzy:
+                    # Step 1: exact search in the tool responses.
                     excised = (
-                        _excise_trigger_words(
-                            work_messages, trigger_words, allow_fuzzy=True,
-                        )
+                        _excise_trigger_words(work_messages, trigger_words, allow_fuzzy=False)
                         if trigger_words else None
                     )
 
-                if excised is None:
-                    # The words could not be located — the lora may have reworded them past
-                    # recognition, or named text that is not in the conversation at all. Fall
-                    # through to the next configured defence method.
-                    log.error(
-                        "[defence] remove_trigger_words: trigger words not found in any tool "
-                        "response (exact%s) and not in the tool call arguments; trying the next "
-                        "defence method. trigger_words=%s",
-                        " and fuzzy" if rtw_fuzzy
-                        else ", fuzzy matching is off",
-                        (trigger_words or "<empty>").replace("\n", "\\n"),
+                    # Step 2: exact match against THIS call's name or arguments — a false positive.
+                    matched_call = None
+                    if excised is None and rtw_match_tool_call and trigger_words:
+                        cur_calls, _ = _parse_output(raw_call + TOOL_CALL_END)
+                        cur_pairs = [(c["name"], c["arguments"]) for c in cur_calls]
+                        matched_call = _find_trigger_in_tool_calls(work_messages, cur_pairs, trigger_words)
+                    if matched_call is not None:
+                        m_name, m_args = matched_call
+                        marked_block = _mark_tool_security_verdict(
+                            full_security_block, safe_value, "match_tool_call",
+                        )
+                        log.warning(
+                            "[defence] call %d remove_trigger_words: trigger words are a slice of a "
+                            "tool call (name=%s args=%s), not a tool response — false positive "
+                            "(%s,match_tool_call), letting this call through.",
+                            call_idx + 1, m_name, (m_args or "").replace("\n", "\\n")[:400], safe_value,
+                        )
+                        cleared.append((native_tc, marked_block))
+                        call_action = "allow"
+                        break
+
+                    # Step 3: fuzzy search in the tool responses (only when the active flag is on).
+                    if excised is None and rtw_fuzzy:
+                        excised = (
+                            _excise_trigger_words(work_messages, trigger_words, allow_fuzzy=True)
+                            if trigger_words else None
+                        )
+
+                    if excised is None:
+                        # Not located anywhere — fall through to the next configured defence method.
+                        log.error(
+                            "[defence] call %d remove_trigger_words: trigger words not found in any "
+                            "tool response (exact%s) and not in the tool call arguments; trying the "
+                            "next defence method. trigger_words=%s",
+                            call_idx + 1,
+                            " and fuzzy" if rtw_fuzzy else ", fuzzy matching is off",
+                            (trigger_words or "<empty>").replace("\n", "\\n"),
+                        )
+                        continue
+
+                    work_messages, msg_index, removed_text = excised
+                    log.info(
+                        "[defence] call %d remove_trigger_words: removed injected words from tool "
+                        "response at message index %d: %s",
+                        call_idx + 1, msg_index, removed_text.replace("\n", "\\n")[:400],
+                    )
+                    if attempt >= SECURITY_DEFENCE_MAX_RETRIES:
+                        log.warning(
+                            "[defence] max retries (%d) reached after excision — letting the turn "
+                            "through undefended", SECURITY_DEFENCE_MAX_RETRIES,
+                        )
+                        defence_response = _finalize(undefended_segments, last_p2_finish_reason)
+                        call_action = "return"
+                        break
+                    # The poisoned turn is discarded; re-render from the cleaned conversation and
+                    # re-run phase 1 from scratch (every call is then re-assessed).
+                    prompt_head, think_opener, prompt_head_no_think = _build_heads(work_messages)
+                    assistant_prefix = think_opener
+                    log.info(
+                        "[defence] re-running base model on the cleaned conversation (attempt %d/%d)",
+                        attempt + 1, SECURITY_DEFENCE_MAX_RETRIES,
+                    )
+                    call_action = "retry"
+                    break
+
+                elif method == "fake_tool_response":
+                    # Keep ONLY the blocked call in the conversation and fabricate its result. The
+                    # other calls from this turn (including ones already cleared) are dropped: after
+                    # re-running phase 1 from the fabricated response the model may plan different
+                    # calls, so the dropped ones would be stale anyway. raw_call holds exactly this
+                    # one blocked call, so parsing it yields a single call to fake.
+                    parsed_calls, parsed_content = _parse_output(raw_call + TOOL_CALL_END)
+                    if not parsed_calls:
+                        log.error(
+                            "[defence] call %d fake_tool_response: could not parse the tool call; "
+                            "trying the next defence method.", call_idx + 1,
+                        )
+                        continue
+
+                    # The blocked call's name/args are substituted into the fake response below.
+                    # They go inside a JSON string value, so they are JSON-escaped first
+                    # (json.dumps(x)[1:-1] = the escaped body without the surrounding quotes).
+                    def _json_inner(s: str) -> str:
+                        return json.dumps(s or "", ensure_ascii=False)[1:-1]
+
+                    assistant_tool_calls = []
+                    fake_tool_messages = []
+                    for tc in parsed_calls:
+                        call_id = f"call_{uuid.uuid4().hex[:8]}"
+                        assistant_tool_calls.append({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                        })
+                        # str.replace, not str.format: the template is JSON and its braces would
+                        # break str.format.
+                        fake_content = (
+                            FAKE_TOOL_RESPONSE_CONTENT
+                            .replace("{tool_name}", _json_inner(tc["name"]))
+                            .replace("{tool_args}", _json_inner(tc["arguments"]))
+                        )
+                        # tool_call_id ties the fake response back to the call it answers, exactly
+                        # as a real client would when returning the tool result.
+                        fake_tool_messages.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": fake_content,
+                        })
+
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": parsed_content or "",
+                        "tool_calls": assistant_tool_calls,
+                    }
+                    work_messages = list(work_messages) + [assistant_msg] + fake_tool_messages
+                    log.info(
+                        "[defence] call %d fake_tool_response: kept only the blocked call %s and a "
+                        "fake tool response (%r); re-running base model.",
+                        call_idx + 1, tool_name, fake_content,
+                    )
+                    if attempt >= SECURITY_DEFENCE_MAX_RETRIES:
+                        log.warning(
+                            "[defence] max retries (%d) reached after faking the tool response — "
+                            "letting the turn through undefended", SECURITY_DEFENCE_MAX_RETRIES,
+                        )
+                        defence_response = _finalize(undefended_segments, last_p2_finish_reason)
+                        call_action = "return"
+                        break
+                    # The poisoned turn is discarded; phase 1 re-runs from the augmented history.
+                    prompt_head, think_opener, prompt_head_no_think = _build_heads(work_messages)
+                    assistant_prefix = think_opener
+                    log.info(
+                        "[defence] re-running base model on the faked conversation (attempt %d/%d)",
+                        attempt + 1, SECURITY_DEFENCE_MAX_RETRIES,
+                    )
+                    call_action = "retry"
+                    break
+
+                else:
+                    log.warning(
+                        "[defence] unknown defence method %r in the defence method list; skipping",
+                        method,
                     )
                     continue
 
-                work_messages, msg_index, removed_text = excised
-                log.info(
-                    "[defence] remove_trigger_words: removed injected words from tool response "
-                    "at message index %d: %s",
-                    msg_index, removed_text.replace("\n", "\\n")[:400],
-                )
-                if attempt >= SECURITY_DEFENCE_MAX_RETRIES:
-                    log.warning(
-                        "[defence] max retries (%d) reached after excision — letting the turn "
-                        "through undefended", SECURITY_DEFENCE_MAX_RETRIES,
-                    )
-                    defence_response = _pass_through()
-                    defence_action = "return"
-                    break
-                # The assistant turn just produced was reasoned against the poisoned history, so
-                # it is discarded rather than continued: nothing of it is carried into the retry.
-                # Re-render from the repaired conversation and run phase 1 again from scratch.
-                prompt_head, think_opener, prompt_head_no_think = _build_heads(work_messages)
-                assistant_prefix = think_opener
-                log.info(
-                    "[defence] re-running base model on the cleaned conversation (attempt %d/%d)",
-                    attempt + 1, SECURITY_DEFENCE_MAX_RETRIES,
-                )
-                defence_action = "retry"
-                break
+            # ── After the defence methods for this call ──────────────────────
+            if call_action == "allow":
+                continue   # this call is safe; assess the next one
+            if call_action in ("retry", "return"):
+                outer_action = call_action
+                break      # stop assessing the remaining calls
 
-            elif method == "fake_tool_response":
-                # Keep the blocked call in the conversation but fabricate its result, so the
-                # dangerous call is never handed to the client while the model still gets to
-                # continue. Phase 1 stops at the first </tool_call>, so this turn carries exactly
-                # one tool call; parse it back out to build a proper assistant turn plus a
-                # matching fake tool response, both in OpenAI format so _render_prompt renders
-                # them natively on the re-run.
-                parsed_calls, parsed_content = _parse_output(raw_assistant + TOOL_CALL_END)
-                if not parsed_calls:
-                    log.error(
-                        "[defence] fake_tool_response: could not parse the tool call out of the "
-                        "assistant turn; trying the next defence method.",
-                    )
-                    continue
+            # No configured method handled the block — let the whole turn through undefended.
+            log.error(
+                "[defence] call %d: no defence method handled the blocked call — letting the turn "
+                "through undefended", call_idx + 1,
+            )
+            defence_response = _finalize(undefended_segments, last_p2_finish_reason)
+            outer_action = "return"
+            break
 
-                # The blocked call's name/args are substituted into the fake response below. They
-                # go inside a JSON string value, so they are JSON-escaped first (json.dumps(x)[1:-1]
-                # = the escaped body without the surrounding quotes) to keep the fabricated tool
-                # response strictly valid JSON.
-                def _json_inner(s: str) -> str:
-                    return json.dumps(s or "", ensure_ascii=False)[1:-1]
-
-                assistant_tool_calls = []
-                fake_tool_messages = []
-                for tc in parsed_calls:
-                    call_id = f"call_{uuid.uuid4().hex[:8]}"
-                    assistant_tool_calls.append({
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                    })
-                    # str.replace, not str.format: the template is JSON and its braces would
-                    # break str.format.
-                    fake_content = (
-                        FAKE_TOOL_RESPONSE_CONTENT
-                        .replace("{tool_name}", _json_inner(tc["name"]))
-                        .replace("{tool_args}", _json_inner(tc["arguments"]))
-                    )
-                    # tool_call_id ties the fake response back to the call it answers, exactly as
-                    # a real client would when returning the tool result.
-                    fake_tool_messages.append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": fake_content,
-                    })
-
-                assistant_msg = {
-                    "role": "assistant",
-                    "content": parsed_content or "",
-                    "tool_calls": assistant_tool_calls,
-                }
-                work_messages = list(work_messages) + [assistant_msg] + fake_tool_messages
-                log.info(
-                    "[defence] fake_tool_response: appended blocked call %s and a fake tool "
-                    "response (%r); re-running base model.",
-                    tool_name, fake_content,
-                )
-                if attempt >= SECURITY_DEFENCE_MAX_RETRIES:
-                    log.warning(
-                        "[defence] max retries (%d) reached after faking the tool response — "
-                        "letting the turn through undefended", SECURITY_DEFENCE_MAX_RETRIES,
-                    )
-                    defence_response = _pass_through()
-                    defence_action = "return"
-                    break
-                # A genuinely fresh turn continues from the fabricated tool response, so the
-                # poisoned turn is discarded and phase 1 re-runs from the augmented history.
-                prompt_head, think_opener, prompt_head_no_think = _build_heads(work_messages)
-                assistant_prefix = think_opener
-                log.info(
-                    "[defence] re-running base model on the faked conversation (attempt %d/%d)",
-                    attempt + 1, SECURITY_DEFENCE_MAX_RETRIES,
-                )
-                defence_action = "retry"
-                break
-
-            else:
-                log.warning(
-                    "[defence] unknown defence method %r in the defence method list; skipping", method,
-                )
-                continue
-
-        if defence_action == "return":
+        # ── After the per-call loop ──────────────────────────────────────────
+        if outer_action == "retry":
+            continue   # a defence method repaired the conversation; re-run phase 1
+        if outer_action == "return":
             return defence_response, work_messages
-        if defence_action == "retry":
-            continue
 
-        # No configured method could handle the block — let the turn through unchanged, exactly
-        # as if defence were disabled, so a failure to defend is visible as such.
-        log.error(
-            "[defence] no defence method handled the blocked call — letting the turn through "
-            "undefended"
-        )
-        return _pass_through(), work_messages
+        # Every tool call cleared defence — return them all, each with its own security block.
+        return _finalize(cleared, last_p2_finish_reason), work_messages
 
     # Unreachable — every code path inside the loop returns or continues.
     log.error("[defence] unexpected exit from defence retry loop — this should never happen")
@@ -2109,7 +2018,7 @@ async def passthrough(request: Request, path: str):
     body = await request.body()
     req_headers = {k: v for k, v in request.headers.items()
                    if k.lower() not in _HOP_BY_HOP | {"host"}}
-    r = await _http.request(
+    r = await _http_llm.request(
         method=request.method,
         url=f"{LLM_SERVER_URL.rstrip('/')}/{path}",
         content=body,
@@ -2130,9 +2039,10 @@ async def health():
 
 def main():
     global LLM_SERVER_URL, LLM_MODEL_ID, SECURE_SERVER_URL, SECURE_MODEL_ID, BASE_MODEL_PATH
+    global LLM_SERVER_PROXY, LLM_SERVER_TOKEN, LLM_CONTEXT_WINDOW
     global MAX_TOKENS_SECURITY, REQUEST_TIMEOUT
-    global LISTEN_HOST, LISTEN_PORT, LOG_FILE_NAME, STRIP_SECURITY_IN_HISTORY, ENABLE_THINKING
-    global PHASE2_ENABLE, PHASE1_THINK_RETRY_COUNT, PHASE2_TOOL_REASON_RETRY_COUNT
+    global LISTEN_HOST, LISTEN_PORT, LOG_FILE_NAME, ENABLE_THINKING
+    global PHASE2_ENABLE, PHASE2_TOOL_REASON_RETRY_COUNT
     global SECURITY_VALIDATE_TOOL_REASON, SECURITY_TOOL_REASON_MAX_FIX
     global VLLM_INFERENCE_DEBUG, OUTPUT_RAW_CLIENT_INPUT
     global TOOL_CALL_SECURITY_DEFENCE_ENABLE, TOOL_CALL_SECURITY_DEFENCE_LEVEL
@@ -2147,6 +2057,12 @@ def main():
                         help=f"LLM server base URL for phase 1 (default: {LLM_SERVER_URL})")
     parser.add_argument("--llm-model-id",          default=None, metavar="ID",
                         help=f"model ID for phase 1 LLM (default: {LLM_MODEL_ID})")
+    parser.add_argument("--llm-server-proxy",      default=None, metavar="URL",
+                        help=f"HTTP(S) proxy for the phase-1 remote LLM; empty = direct (default: {LLM_SERVER_PROXY!r})")
+    parser.add_argument("--llm-server-token",      default=None, metavar="TOKEN",
+                        help=f"bearer token for the phase-1 remote LLM; empty = read the LLM_SERVER_TOKEN env var (default: {LLM_SERVER_TOKEN!r})")
+    parser.add_argument("--llm-context-window",    type=int, default=None, metavar="N",
+                        help=f"phase-1 context length in tokens (default: {LLM_CONTEXT_WINDOW})")
     parser.add_argument("--secure-server-url",     default=None, metavar="URL",
                         help=f"secure server base URL for phase 2 / lora (default: {SECURE_SERVER_URL})")
     parser.add_argument("--secure-model-id",       default=None, metavar="ID",
@@ -2163,18 +2079,12 @@ def main():
                         help=f"listen port (default: {LISTEN_PORT})")
     parser.add_argument("--log-file-name",         default=None, metavar="NAME",
                         help=f"log file base name; runtime prepends YYYYMMDD_ (default: {LOG_FILE_NAME})")
-    parser.add_argument("--strip_security_in_history",
-                        choices=["true", "false"], default=None, metavar="true|false",
-                        help=f"strip <tool_call_security> from the rendered Qwen3 prompt (default: {str(STRIP_SECURITY_IN_HISTORY).lower()})")
     parser.add_argument("--enable_thinking",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=f"Qwen3 thinking mode (default: {str(ENABLE_THINKING).lower()})")
     parser.add_argument("--phase2_enable",
                         choices=["true", "false"], default=None, metavar="true|false",
                         help=f"run phase-2 lora security check; false = phase-1 only (default: {str(PHASE2_ENABLE).lower()})")
-    parser.add_argument("--phase1_think_retry_count",
-                        type=int, default=None, metavar="N",
-                        help=f"retry phase 1 up to N times when its think overruns max_tokens (default: {PHASE1_THINK_RETRY_COUNT})")
     parser.add_argument("--phase2_tool_reason_retry_count",
                         type=int, default=None, metavar="N",
                         help=f"retry phase 2 up to N times when its security block overruns max_tokens (default: {PHASE2_TOOL_REASON_RETRY_COUNT})")
@@ -2242,6 +2152,13 @@ def main():
 
     if args.llm_server_url:      LLM_SERVER_URL       = args.llm_server_url
     if args.llm_model_id:        LLM_MODEL_ID         = args.llm_model_id
+    if args.llm_server_proxy is not None:    LLM_SERVER_PROXY   = args.llm_server_proxy
+    if args.llm_server_token is not None:    LLM_SERVER_TOKEN   = args.llm_server_token
+    # When no token is configured, fall back to the LLM_SERVER_TOKEN environment variable so the
+    # secret can be kept out of the start script.
+    if not LLM_SERVER_TOKEN:
+        LLM_SERVER_TOKEN = os.environ.get("LLM_SERVER_TOKEN", "")
+    if args.llm_context_window:  LLM_CONTEXT_WINDOW   = args.llm_context_window
     if args.secure_server_url:   SECURE_SERVER_URL    = args.secure_server_url
     if args.secure_model_id:     SECURE_MODEL_ID      = args.secure_model_id
     if args.base_model_path:     BASE_MODEL_PATH      = args.base_model_path
@@ -2250,14 +2167,10 @@ def main():
     if args.host:                LISTEN_HOST          = args.host
     if args.port:                LISTEN_PORT          = args.port
     if args.log_file_name:       LOG_FILE_NAME        = args.log_file_name
-    if args.strip_security_in_history is not None:
-        STRIP_SECURITY_IN_HISTORY = args.strip_security_in_history == "true"
     if args.enable_thinking is not None:
         ENABLE_THINKING = args.enable_thinking == "true"
     if args.phase2_enable is not None:
         PHASE2_ENABLE = args.phase2_enable == "true"
-    if args.phase1_think_retry_count is not None:
-        PHASE1_THINK_RETRY_COUNT = args.phase1_think_retry_count
     if args.phase2_tool_reason_retry_count is not None:
         PHASE2_TOOL_REASON_RETRY_COUNT = args.phase2_tool_reason_retry_count
     if args.security_validate_tool_reason is not None:
@@ -2311,12 +2224,14 @@ def main():
 
     log.info("defence-llm-server starting up")
     log.info("  listen           : http://%s:%d/v1", LISTEN_HOST, LISTEN_PORT)
-    log.info("  llm server       : %s  model=%s", LLM_SERVER_URL, LLM_MODEL_ID)
+    log.info("  llm server       : %s  model=%s  (phase 1: /chat/completions)", LLM_SERVER_URL, LLM_MODEL_ID)
+    log.info("  llm proxy        : %s", LLM_SERVER_PROXY or "none")
+    log.info("  llm auth token   : %s", "set" if LLM_SERVER_TOKEN and LLM_SERVER_TOKEN != "NOKEY" else "none")
+    log.info("  llm context win  : %d tokens (manual config)", LLM_CONTEXT_WINDOW)
     log.info("  secure server    : %s  model=%s  security_max_tokens=%d",
              SECURE_SERVER_URL, SECURE_MODEL_ID, MAX_TOKENS_SECURITY)
     log.info("  enable_thinking  : %s", ENABLE_THINKING)
     log.info("  phase2_enable    : %s", PHASE2_ENABLE)
-    log.info("  p1_think_retry   : %d", PHASE1_THINK_RETRY_COUNT)
     log.info("  p2_reason_retry  : %d", PHASE2_TOOL_REASON_RETRY_COUNT)
     log.info("  p2_validate      : %s  max_fix=%d",
              SECURITY_VALIDATE_TOOL_REASON, SECURITY_TOOL_REASON_MAX_FIX)
@@ -2333,7 +2248,7 @@ def main():
              DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH,
              DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL)
     log.info("  fake_tool_resp   : %r", FAKE_TOOL_RESPONSE_CONTENT)
-    log.info("  strip security   : %s  timeout=%ds", STRIP_SECURITY_IN_HISTORY, REQUEST_TIMEOUT)
+    log.info("  request timeout  : %ds", REQUEST_TIMEOUT)
     log.info("  context window   : fetched from vllm at startup")
 
     uvicorn.run(app, host=LISTEN_HOST, port=LISTEN_PORT, log_level=args.log_level.lower())

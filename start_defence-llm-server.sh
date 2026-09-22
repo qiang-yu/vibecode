@@ -4,9 +4,17 @@
 # Configurable parameters — edit these before starting the server
 # -----------------------------------------------------------------------
 
-# Phase 1: LLM server (any OpenAI-compatible backend, e.g. vllm, llama.cpp, OpenAI)
-LLM_SERVER_URL="http://localhost:19000/v1"
-LLM_MODEL_ID="Qwen3Base"
+# Phase 1: LLM server (OpenAI-compatible chat backend, e.g. vllm, Nvidia, OpenRouter).
+# The server calls {LLM_SERVER_URL}/chat/completions, so give the base URL ending in /v1.
+LLM_SERVER_URL="https://integrate.api.nvidia.com/v1"
+LLM_MODEL_ID="openai/gpt-oss-20b"
+# Proxy used to reach the remote LLM; leave empty ("") to connect directly.
+LLM_SERVER_PROXY="http://127.0.0.1:1085"
+# Bearer token for the remote LLM: keep it OUT of this file. Export it in your environment instead:
+#   export LLM_SERVER_TOKEN="nvapi-xxxxxxxx"
+# The server reads the LLM_SERVER_TOKEN environment variable when no token is configured.
+# Phase-1 context length in tokens; remote chat APIs cannot report max_model_len via /models.
+LLM_CONTEXT_WINDOW=32768
 
 # Phase 2: secure server running the lora security model
 SECURE_SERVER_URL="http://localhost:19000/v1"
@@ -25,9 +33,7 @@ LOG_FILE_NAME="defence-llm-server.log"  # log file base name; runtime prepends Y
 OUTPUT_RAW_CLIENT_INPUT=false    # true: log raw client input (Qwen3 format) before stripping
 
 ENABLE_THINKING=true              # true | false
-STRIP_SECURITY_IN_HISTORY=true    # true | false
 PHASE2_ENABLE=true                # true: run phase-2 security check; false: phase-1 only
-PHASE1_THINK_RETRY_COUNT=0        # retry phase 1 N times when its think overruns max_tokens
 PHASE2_TOOL_REASON_RETRY_COUNT=1  # retry phase 2 N times when its security block overruns max_tokens
 
 # Security defence: block tool calls whose lora verdict is below SECURITY_DEFENCE_LEVEL.
@@ -61,6 +67,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 python "${SCRIPT_DIR}/defence-llm-server.py" \
     --llm-server-url       "${LLM_SERVER_URL}" \
     --llm-model-id         "${LLM_MODEL_ID}" \
+    --llm-server-proxy     "${LLM_SERVER_PROXY}" \
+    --llm-context-window   "${LLM_CONTEXT_WINDOW}" \
     --secure-server-url    "${SECURE_SERVER_URL}" \
     --secure-model-id      "${SECURE_MODEL_ID}" \
     --host                 "${LISTEN_HOST}" \
@@ -72,10 +80,8 @@ python "${SCRIPT_DIR}/defence-llm-server.py" \
     --log-file-name        "${LOG_FILE_NAME}" \
     --enable_thinking          "${ENABLE_THINKING}" \
     --phase2_enable            "${PHASE2_ENABLE}" \
-    --phase1_think_retry_count      "${PHASE1_THINK_RETRY_COUNT}" \
     --phase2_tool_reason_retry_count "${PHASE2_TOOL_REASON_RETRY_COUNT}" \
     --output_raw_client_input  "${OUTPUT_RAW_CLIENT_INPUT}" \
-    --strip_security_in_history "${STRIP_SECURITY_IN_HISTORY}" \
     --security_defence_enable       "${SECURITY_DEFENCE_ENABLE}" \
     --security_defence_debug        "${SECURITY_DEFENCE_DEBUG}" \
     --security-defence-level        "${SECURITY_DEFENCE_LEVEL}" \
