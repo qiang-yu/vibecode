@@ -58,7 +58,7 @@ DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_SANITIZE=true          # true: sanitize the ma
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-python "${SCRIPT_DIR}/vllm-server.py" \
+python "${SCRIPT_DIR}/defence-llm-server.py" \
     --vllm-url             "${VLLM_BASE_URL}" \
     --host                 "${LISTEN_HOST}" \
     --port                 "${LISTEN_PORT}" \

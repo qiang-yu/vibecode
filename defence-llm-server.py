@@ -7,7 +7,7 @@
 # This server targets Qwen3 only.
 #
 # Usage:
-#   python vllm-server.py \
+#   python defence-llm-server.py \
 #     --base-model-path /path/to/Qwen3-8B \
 #     [--vllm-url http://localhost:19001/v1] \
 #     [--base-model-id Qwen3Base] [--lora-model-id lora-model] \
@@ -530,7 +530,7 @@ async def lifespan(app: FastAPI):
     log.info("HTTP client closed")
 
 
-app = FastAPI(title="vllm-server", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="defence-llm-server", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -2563,7 +2563,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH, trust_remote_code=True)
     log.info("Tokenizer loaded")
 
-    log.info("vllm-server starting up")
+    log.info("defence-llm-server starting up")
     log.info("  listen           : http://%s:%d/v1", LISTEN_HOST, LISTEN_PORT)
     log.info("  vllm             : %s", VLLM_BASE_URL)
     log.info("  base model       : %s", BASE_MODEL_ID)
