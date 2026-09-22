@@ -4,18 +4,23 @@
 # Configurable parameters — edit these before starting the server
 # -----------------------------------------------------------------------
 
-VLLM_BASE_URL="http://localhost:19000/v1"
+# Phase 1: LLM server (any OpenAI-compatible backend, e.g. vllm, llama.cpp, OpenAI)
+LLM_SERVER_URL="http://localhost:19000/v1"
+LLM_MODEL_ID="Qwen3Base"
+
+# Phase 2: secure server running the lora security model
+SECURE_SERVER_URL="http://localhost:19000/v1"
+SECURE_MODEL_ID="lora-model"
+
 LISTEN_HOST="localhost"
 LISTEN_PORT=29000
 
 BASE_MODEL_PATH="/home/qiangyu/Models/Qwen/Qwen3-8B"
-BASE_MODEL_ID="Qwen3Base"
-LORA_MODEL_ID="lora-model"
 
-MAX_TOKENS_SECURITY=4096          # max tokens for phase-2 lora security block
+MAX_TOKENS_SECURITY=1024         # max tokens for phase-2 lora security block
 REQUEST_TIMEOUT=600              # HTTP request timeout in seconds
 LOG_LEVEL="info"                 # debug | info | warning | error
-LOG_FILE_NAME="defence-llm-server.log"         # log file base name; runtime prepends YYYYMMDD_
+LOG_FILE_NAME="defence-llm-server.log"  # log file base name; runtime prepends YYYYMMDD_
 
 OUTPUT_RAW_CLIENT_INPUT=false    # true: log raw client input (Qwen3 format) before stripping
 
@@ -36,7 +41,7 @@ SECURITY_DEFENCE_MAX_RETRIES=10        # max base-model retries after a defence 
 DEFENCE_METHOD_LIST="remove_trigger_words,fake_tool_response"
 # remove_trigger_words parameters for the DEFENCE_METHOD_LIST (blocked-call) path.
 DEFENCE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL=true  # true: treat trigger words that belong to a tool call (name/args) as a false positive
-DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH=true     # true: allow fuzzy matching when locating trigger words
+DEFENCE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH=false     # true: allow fuzzy matching when locating trigger words
 # true: for a "safe" verdict, validate its trigger words against the user messages (exact match, no fuzzy);
 # if they are not from the user, run the defence methods instead of trusting the "safe" rating.
 DEFENCE_SAFE_TOOLCALL=true
@@ -54,12 +59,13 @@ DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH=false     # false: exact matching
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 python "${SCRIPT_DIR}/defence-llm-server.py" \
-    --vllm-url             "${VLLM_BASE_URL}" \
+    --llm-server-url       "${LLM_SERVER_URL}" \
+    --llm-model-id         "${LLM_MODEL_ID}" \
+    --secure-server-url    "${SECURE_SERVER_URL}" \
+    --secure-model-id      "${SECURE_MODEL_ID}" \
     --host                 "${LISTEN_HOST}" \
     --port                 "${LISTEN_PORT}" \
     --base-model-path      "${BASE_MODEL_PATH}" \
-    --base-model-id        "${BASE_MODEL_ID}" \
-    --lora-model-id        "${LORA_MODEL_ID}" \
     --max-tokens-security  "${MAX_TOKENS_SECURITY}" \
     --timeout              "${REQUEST_TIMEOUT}" \
     --log-level            "${LOG_LEVEL}" \

@@ -1,16 +1,20 @@
 ###
-# OpenAI-compatible API proxy for vllm with two-phase inference.
-# Renders the chat template locally, sends both phases to vllm via
-# /v1/completions (raw-prompt), parses tool_calls from the combined
-# output, and returns a proper OpenAI chat.completion response.
+# OpenAI-compatible API proxy with two-phase inference and security defence.
+# Phase 1 sends to a configurable LLM server (any OpenAI-compatible backend).
+# Phase 2 sends to a separate secure server running the lora security model.
+# Renders the Qwen3 chat template locally, uses /v1/completions (raw-prompt),
+# parses tool_calls from the combined output, and returns a proper OpenAI
+# chat.completion response.
 #
-# This server targets Qwen3 only.
+# This server targets Qwen3 only (tokenizer / chat template).
 #
 # Usage:
 #   python defence-llm-server.py \
 #     --base-model-path /path/to/Qwen3-8B \
-#     [--vllm-url http://localhost:19001/v1] \
-#     [--base-model-id Qwen3Base] [--lora-model-id lora-model] \
+#     [--llm-server-url http://localhost:19000/v1] \
+#     [--llm-model-id Qwen3Base] \
+#     [--secure-server-url http://localhost:19001/v1] \
+#     [--secure-model-id lora-model] \
 #     [--host localhost] [--port 29001]
 ###
 
@@ -38,16 +42,17 @@ from transformers import AutoTokenizer
 # Configuration defaults — edit here or override with CLI arguments
 # ---------------------------------------------------------------------------
 
-VLLM_BASE_URL             = "http://localhost:19006/v1"
-BASE_MODEL_ID             = "Qwen3Base"
-LORA_MODEL_ID             = "lora-model"
+LLM_SERVER_URL            = "http://localhost:19000/v1"   # phase 1: any OpenAI-compatible LLM backend
+LLM_MODEL_ID              = "Qwen3Base"
+SECURE_SERVER_URL         = "http://localhost:19000/v1"   # phase 2: lora security model server
+SECURE_MODEL_ID           = "lora-model"
 BASE_MODEL_PATH           = "/home/qiangyu/Models/Qwen/Qwen3-8B"           # required: local path to load tokenizer
 MAX_TOKENS_SECURITY       = 1024        # hard limit for phase 2 / security block
-REQUEST_TIMEOUT           = 300         # seconds
+REQUEST_TIMEOUT           = 600         # seconds
 
 LISTEN_HOST               = "localhost"
-LISTEN_PORT               = 29006
-LOG_FILE_NAME             = "vllm.log"   # dated prefix is prepended at runtime: YYYYMMDD_<name>
+LISTEN_PORT               = 29000
+LOG_FILE_NAME             = "defence-llm-server.log"   # dated prefix is prepended at runtime: YYYYMMDD_<name>
 
 STRIP_SECURITY_IN_HISTORY = True
 ENABLE_THINKING           = True        # Qwen3: pass enable_thinking to apply_chat_template
@@ -68,7 +73,7 @@ PHASE1_THINK_RETRY_COUNT  = 0
 # 0 disables retries (original behavior). When > 0, the truncated output is discarded and
 # phase 2 is re-run up to this many times with the identical prompt; only meaningful under
 # sampling, where a fresh draw may yield a shorter block.
-PHASE2_TOOL_REASON_RETRY_COUNT = 0
+PHASE2_TOOL_REASON_RETRY_COUNT = 1
 
 # Validate-and-fix for the phase-2 <tool_reason> block. The lora sometimes derails: it asks a
 # question we never asked (inventing its own, after which the reasoning drifts), stops short of
@@ -282,7 +287,7 @@ def _build_security_prefill(assistant_text: str) -> str:
 TOOL_CALL_SECURITY_DEFENCE_ENABLE = True
 TOOL_CALL_SECURITY_DEFENCE_LEVEL  = "neutral"      # safe | neutral | suspicious | unsafe
 SECURITY_DEFENCE_DEBUG            = True            # True: keep <tool_call_security> in response; False: strip it
-SECURITY_DEFENCE_MAX_RETRIES      = 3               # max times to re-run base model after a defence block
+SECURITY_DEFENCE_MAX_RETRIES      = 10              # max times to re-run base model after a defence block
 
 # Validate the trigger words of a tool call the lora rated exactly "safe".
 #
@@ -451,25 +456,36 @@ async def lifespan(app: FastAPI):
     _http = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
     log.info("HTTP client created (timeout=%ds)", REQUEST_TIMEOUT)
 
-    # Validate model IDs and read max_model_len from vllm.
+    # Validate model IDs and read max_model_len from the LLM server.
     try:
-        r = await _http.get(f"{VLLM_BASE_URL.rstrip('/')}/models")
+        r = await _http.get(f"{LLM_SERVER_URL.rstrip('/')}/models")
         r.raise_for_status()
-        models = r.json().get("data", [])
-        model_ids = {m.get("id") for m in models}
-
-        missing = [mid for mid in (BASE_MODEL_ID, LORA_MODEL_ID) if mid not in model_ids]
-        if missing:
+        llm_models = r.json().get("data", [])
+        llm_model_ids = {m.get("id") for m in llm_models}
+        if LLM_MODEL_ID not in llm_model_ids:
             raise ValueError(
-                f"Model ID(s) not found in vllm: {missing}. "
-                f"Available: {sorted(model_ids)}"
+                f"LLM model ID {LLM_MODEL_ID!r} not found at {LLM_SERVER_URL}. "
+                f"Available: {sorted(llm_model_ids)}"
             )
+        llm_info = next(m for m in llm_models if m.get("id") == LLM_MODEL_ID)
+        if not llm_info.get("max_model_len"):
+            raise ValueError(f"max_model_len missing for {LLM_MODEL_ID}")
+        _context_window = int(llm_info["max_model_len"])
+        log.info("Context window: %d tokens (from %s)", _context_window, LLM_MODEL_ID)
 
-        base_info = next(m for m in models if m.get("id") == BASE_MODEL_ID)
-        if not base_info.get("max_model_len"):
-            raise ValueError(f"max_model_len missing for {BASE_MODEL_ID}")
-        _context_window = int(base_info["max_model_len"])
-        log.info("Context window: %d tokens (from %s)", _context_window, BASE_MODEL_ID)
+        # Validate secure server model (may be a different endpoint).
+        if SECURE_SERVER_URL.rstrip('/') == LLM_SERVER_URL.rstrip('/'):
+            secure_model_ids = llm_model_ids
+        else:
+            r2 = await _http.get(f"{SECURE_SERVER_URL.rstrip('/')}/models")
+            r2.raise_for_status()
+            secure_models = r2.json().get("data", [])
+            secure_model_ids = {m.get("id") for m in secure_models}
+        if SECURE_MODEL_ID not in secure_model_ids:
+            raise ValueError(
+                f"Secure model ID {SECURE_MODEL_ID!r} not found at {SECURE_SERVER_URL}. "
+                f"Available: {sorted(secure_model_ids)}"
+            )
     except Exception as exc:
         await _http.aclose()
         log.error("Startup validation failed: %s", exc)
@@ -689,7 +705,7 @@ def _build_response(
         "id": cid,
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": BASE_MODEL_ID,
+        "model": LLM_MODEL_ID,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         "usage": {
             "prompt_tokens": prompt_tokens,
@@ -718,6 +734,7 @@ async def _call_completions(
     stop: List[str],
     max_tokens: int,
     fwd: Dict,
+    base_url: Optional[str] = None,
 ) -> Dict:
     payload = {
         **fwd,
@@ -729,7 +746,8 @@ async def _call_completions(
         "add_special_tokens": False,   # prompt is fully rendered; avoid duplicate BOS
         "stream": False,
     }
-    r = await _http.post(f"{VLLM_BASE_URL.rstrip('/')}/completions", json=payload)
+    target = (base_url or LLM_SERVER_URL).rstrip('/')
+    r = await _http.post(f"{target}/completions", json=payload)
     r.raise_for_status()
     return r.json()
 
@@ -1338,7 +1356,8 @@ async def _validate_and_fix_tool_reason(
                 p2_prompt.replace("\n", "\\n"),
             )
         p2 = await _call_completions(
-            p2_prompt, LORA_MODEL_ID, [TOOL_CALL_SECURITY_END], p2_max, fwd,
+            p2_prompt, SECURE_MODEL_ID, [TOOL_CALL_SECURITY_END], p2_max, fwd,
+            base_url=SECURE_SERVER_URL,
         )
         c2 = p2["choices"][0]
         new_text = c2.get("text") or ""
@@ -1482,7 +1501,7 @@ async def _handle_request(
                     "[inference][Base Model] input=%s",
                     current_prompt.replace("\n", "\\n"),
                 )
-            p1 = await _call_completions(current_prompt, BASE_MODEL_ID, p1_stop, p1_max, fwd)
+            p1 = await _call_completions(current_prompt, LLM_MODEL_ID, p1_stop, p1_max, fwd)
             c1 = p1["choices"][0]
             text1 = c1.get("text") or ""
             usage1 = p1.get("usage", {})
@@ -1647,7 +1666,10 @@ async def _handle_request(
                     "[inference][Lora Model] input=%s",
                     p2_prompt.replace("\n", "\\n"),
                 )
-            p2 = await _call_completions(p2_prompt, LORA_MODEL_ID, [TOOL_CALL_SECURITY_END], p2_max, fwd)
+            p2 = await _call_completions(
+                p2_prompt, SECURE_MODEL_ID, [TOOL_CALL_SECURITY_END], p2_max, fwd,
+                base_url=SECURE_SERVER_URL,
+            )
             c2 = p2["choices"][0]
             text2 = c2.get("text") or ""
             usage2 = p2.get("usage", {})
@@ -2089,7 +2111,7 @@ async def passthrough(request: Request, path: str):
                    if k.lower() not in _HOP_BY_HOP | {"host"}}
     r = await _http.request(
         method=request.method,
-        url=f"{VLLM_BASE_URL.rstrip('/')}/{path}",
+        url=f"{LLM_SERVER_URL.rstrip('/')}/{path}",
         content=body,
         headers=req_headers,
         params=dict(request.query_params),
@@ -2107,7 +2129,7 @@ async def health():
 # ---------------------------------------------------------------------------
 
 def main():
-    global VLLM_BASE_URL, BASE_MODEL_ID, LORA_MODEL_ID, BASE_MODEL_PATH
+    global LLM_SERVER_URL, LLM_MODEL_ID, SECURE_SERVER_URL, SECURE_MODEL_ID, BASE_MODEL_PATH
     global MAX_TOKENS_SECURITY, REQUEST_TIMEOUT
     global LISTEN_HOST, LISTEN_PORT, LOG_FILE_NAME, STRIP_SECURITY_IN_HISTORY, ENABLE_THINKING
     global PHASE2_ENABLE, PHASE1_THINK_RETRY_COUNT, PHASE2_TOOL_REASON_RETRY_COUNT
@@ -2121,12 +2143,14 @@ def main():
     global tokenizer
 
     parser = argparse.ArgumentParser(description="vllm two-phase inference proxy")
-    parser.add_argument("--vllm-url",             default=None, metavar="URL",
-                        help=f"vllm base URL (default: {VLLM_BASE_URL})")
-    parser.add_argument("--base-model-id",         default=None, metavar="ID",
-                        help=f"vllm model ID for base model (default: {BASE_MODEL_ID})")
-    parser.add_argument("--lora-model-id",         default=None, metavar="ID",
-                        help=f"vllm model ID for lora model (default: {LORA_MODEL_ID})")
+    parser.add_argument("--llm-server-url",        default=None, metavar="URL",
+                        help=f"LLM server base URL for phase 1 (default: {LLM_SERVER_URL})")
+    parser.add_argument("--llm-model-id",          default=None, metavar="ID",
+                        help=f"model ID for phase 1 LLM (default: {LLM_MODEL_ID})")
+    parser.add_argument("--secure-server-url",     default=None, metavar="URL",
+                        help=f"secure server base URL for phase 2 / lora (default: {SECURE_SERVER_URL})")
+    parser.add_argument("--secure-model-id",       default=None, metavar="ID",
+                        help=f"model ID for phase 2 / lora security check (default: {SECURE_MODEL_ID})")
     parser.add_argument("--base-model-path",       default=None, metavar="PATH",
                         help=f"local path used to load the tokenizer (default: {BASE_MODEL_PATH})")
     parser.add_argument("--max-tokens-security",   type=int, default=None, metavar="N",
@@ -2216,10 +2240,11 @@ def main():
                         help="log level: debug/info/warning/error (default: info)")
     args = parser.parse_args()
 
-    if args.vllm_url:            VLLM_BASE_URL        = args.vllm_url
-    if args.base_model_id:       BASE_MODEL_ID        = args.base_model_id
-    if args.lora_model_id:       LORA_MODEL_ID        = args.lora_model_id
-    if args.base_model_path:   BASE_MODEL_PATH      = args.base_model_path
+    if args.llm_server_url:      LLM_SERVER_URL       = args.llm_server_url
+    if args.llm_model_id:        LLM_MODEL_ID         = args.llm_model_id
+    if args.secure_server_url:   SECURE_SERVER_URL    = args.secure_server_url
+    if args.secure_model_id:     SECURE_MODEL_ID      = args.secure_model_id
+    if args.base_model_path:     BASE_MODEL_PATH      = args.base_model_path
     if args.max_tokens_security: MAX_TOKENS_SECURITY  = args.max_tokens_security
     if args.timeout:             REQUEST_TIMEOUT      = args.timeout
     if args.host:                LISTEN_HOST          = args.host
@@ -2286,9 +2311,9 @@ def main():
 
     log.info("defence-llm-server starting up")
     log.info("  listen           : http://%s:%d/v1", LISTEN_HOST, LISTEN_PORT)
-    log.info("  vllm             : %s", VLLM_BASE_URL)
-    log.info("  base model       : %s", BASE_MODEL_ID)
-    log.info("  lora model       : %s  security_max_tokens=%d", LORA_MODEL_ID, MAX_TOKENS_SECURITY)
+    log.info("  llm server       : %s  model=%s", LLM_SERVER_URL, LLM_MODEL_ID)
+    log.info("  secure server    : %s  model=%s  security_max_tokens=%d",
+             SECURE_SERVER_URL, SECURE_MODEL_ID, MAX_TOKENS_SECURITY)
     log.info("  enable_thinking  : %s", ENABLE_THINKING)
     log.info("  phase2_enable    : %s", PHASE2_ENABLE)
     log.info("  p1_think_retry   : %d", PHASE1_THINK_RETRY_COUNT)
