@@ -521,22 +521,25 @@ async def lifespan(app: FastAPI):
     _context_window = LLM_CONTEXT_WINDOW
     log.info("Context window: %d tokens (from LLM_CONTEXT_WINDOW config)", _context_window)
 
-    # Validate the secure (phase 2) model against its own server, which stays a local vllm.
-    try:
-        r2 = await _http.get(f"{SECURE_SERVER_URL.rstrip('/')}/models")
-        r2.raise_for_status()
-        secure_models = r2.json().get("data", [])
-        secure_model_ids = {m.get("id") for m in secure_models}
-        if SECURE_MODEL_ID not in secure_model_ids:
-            raise ValueError(
-                f"Secure model ID {SECURE_MODEL_ID!r} not found at {SECURE_SERVER_URL}. "
-                f"Available: {sorted(secure_model_ids)}"
-            )
-    except Exception as exc:
-        await _http.aclose()
-        await _http_llm.aclose()
-        log.error("Startup validation failed: %s", exc)
-        raise
+    # Validate the secure (phase 2) model only when phase 2 is enabled.
+    if PHASE2_ENABLE:
+        try:
+            r2 = await _http.get(f"{SECURE_SERVER_URL.rstrip('/')}/models")
+            r2.raise_for_status()
+            secure_models = r2.json().get("data", [])
+            secure_model_ids = {m.get("id") for m in secure_models}
+            if SECURE_MODEL_ID not in secure_model_ids:
+                raise ValueError(
+                    f"Secure model ID {SECURE_MODEL_ID!r} not found at {SECURE_SERVER_URL}. "
+                    f"Available: {sorted(secure_model_ids)}"
+                )
+        except Exception as exc:
+            await _http.aclose()
+            await _http_llm.aclose()
+            log.error("Startup validation failed: %s", exc)
+            raise
+    else:
+        log.info("Phase 2 disabled — skipping secure server validation")
 
     yield
     log.info("Server shutting down — final LLM Model statistics:")
