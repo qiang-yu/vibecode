@@ -51,7 +51,8 @@ LLM_CONTEXT_WINDOW        = 32768        # phase 1: context length; remote chat 
 SECURE_SERVER_URL         = "http://localhost:19000/v1"   # phase 2: lora security model server
 SECURE_MODEL_ID           = "lora-model"
 BASE_MODEL_PATH           = "/home/qiangyu/Models/Qwen/Qwen3-8B"           # required: local path to load tokenizer
-MAX_TOKENS_SECURITY       = 1024        # hard limit for phase 2 / security block
+SEC_INFERENCE_MAX_TOKENS       = 1024        # hard limit for phase 2 / security block
+LLM_INFERENCE_MAX_TOKENS = 2048  # phase 1: hard cap on tokens generated per LLM API call
 REQUEST_TIMEOUT           = 600         # seconds
 LLM_API_CALL_INTERVAL     = 1.5         # phase 1: minimum seconds between consecutive LLM API calls (Nvidia free API rate limit)
 
@@ -448,17 +449,23 @@ _llm_call_error: bool = False     # True after a phase-1 API error; causes 20x i
 _llm_call_lock: Optional[asyncio.Lock] = None      # serialises rate-limit enforcement across concurrent requests
 
 # LLM API usage statistics (phase 1 only)
-_llm_call_count: int = 0                          # successful call count
-_llm_input_tokens: int = 0                        # cumulative prompt tokens (successful calls)
-_llm_output_tokens: int = 0                       # cumulative completion tokens (successful calls)
-_llm_error_counts: Dict[str, int] = {}            # error_type -> error count
-_llm_error_input_tokens: Dict[str, int] = {}      # error_type -> prompt tokens
-_llm_error_output_tokens: Dict[str, int] = {}     # error_type -> completion tokens
+_llm_call_count: int = 0
+_llm_input_tokens: int = 0
+_llm_output_tokens: int = 0
+_llm_length_count: int = 0                        # calls stopped by max_tokens (finish_reason="length")
+_llm_length_input_tokens: int = 0
+_llm_length_output_tokens: int = 0
+_llm_error_counts: Dict[str, int] = {}
+_llm_error_input_tokens: Dict[str, int] = {}
+_llm_error_output_tokens: Dict[str, int] = {}
 
 # SEC model usage statistics (phase 2 only)
 _sec_call_count: int = 0
 _sec_input_tokens: int = 0
 _sec_output_tokens: int = 0
+_sec_length_count: int = 0
+_sec_length_input_tokens: int = 0
+_sec_length_output_tokens: int = 0
 _sec_error_counts: Dict[str, int] = {}
 _sec_error_input_tokens: Dict[str, int] = {}
 _sec_error_output_tokens: Dict[str, int] = {}
@@ -734,6 +741,7 @@ async def _call_completions(
     base_url: Optional[str] = None,
 ) -> Dict:
     global _sec_call_count, _sec_input_tokens, _sec_output_tokens
+    global _sec_length_count, _sec_length_input_tokens, _sec_length_output_tokens
     global _sec_error_counts, _sec_error_input_tokens, _sec_error_output_tokens
 
     payload = {
@@ -753,19 +761,25 @@ async def _call_completions(
     except Exception as exc:
         err_type = _llm_error_type(exc)
         err_in = err_out = 0
+        resp_body: Optional[str] = None
         if isinstance(exc, httpx.HTTPStatusError):
             try:
-                err_usage = exc.response.json().get("usage") or {}
+                resp_json = exc.response.json()
+                err_usage = resp_json.get("usage") or {}
                 err_in = err_usage.get("prompt_tokens", 0)
                 err_out = err_usage.get("completion_tokens", 0)
+                resp_body = json.dumps(resp_json, ensure_ascii=False)
             except Exception:
-                pass
+                resp_body = exc.response.text
         async with _sec_stats_lock:
             _sec_error_counts[err_type] = _sec_error_counts.get(err_type, 0) + 1
             _sec_error_input_tokens[err_type] = _sec_error_input_tokens.get(err_type, 0) + err_in
             _sec_error_output_tokens[err_type] = _sec_error_output_tokens.get(err_type, 0) + err_out
             total_calls = _sec_call_count + sum(_sec_error_counts.values())
-        log.error("[phase2] SEC model API call failed: %s", exc)
+        if resp_body is not None:
+            log.error("[phase2] SEC model API call failed: %s  response_body=%s", exc, resp_body)
+        else:
+            log.error("[phase2] SEC model API call failed: %s", exc)
         if total_calls % 10 == 0:
             _log_sec_stats()
         raise
@@ -774,10 +788,15 @@ async def _call_completions(
     usage = result.get("usage") or {}
     in_tok = usage.get("prompt_tokens", 0)
     out_tok = usage.get("completion_tokens", 0)
+    finish_reason = (result.get("choices") or [{}])[0].get("finish_reason") or ""
     async with _sec_stats_lock:
         _sec_call_count += 1
         _sec_input_tokens += in_tok
         _sec_output_tokens += out_tok
+        if finish_reason == "length":
+            _sec_length_count += 1
+            _sec_length_input_tokens += in_tok
+            _sec_length_output_tokens += out_tok
         total_calls = _sec_call_count + sum(_sec_error_counts.values())
     if total_calls % 10 == 0:
         _log_sec_stats()
@@ -791,31 +810,29 @@ def _llm_error_type(exc: Exception) -> str:
 
 
 def _log_llm_stats() -> None:
+    err_str = " ".join(
+        f"err:{t}={_llm_error_counts[t]}(in={_llm_error_input_tokens.get(t, 0)},out={_llm_error_output_tokens.get(t, 0)})"
+        for t in sorted(_llm_error_counts)
+    ) or "errors=none"
     log.info(
-        "[llm_stats] calls=%d  input_tokens=%d  output_tokens=%d",
+        "[llm_stats] calls=%d in=%d out=%d  length=%d len_in=%d len_out=%d  %s",
         _llm_call_count, _llm_input_tokens, _llm_output_tokens,
+        _llm_length_count, _llm_length_input_tokens, _llm_length_output_tokens,
+        err_str,
     )
-    for err_type in sorted(_llm_error_counts):
-        log.info(
-            "[llm_stats] error=%s  count=%d  input_tokens=%d  output_tokens=%d",
-            err_type, _llm_error_counts[err_type],
-            _llm_error_input_tokens.get(err_type, 0),
-            _llm_error_output_tokens.get(err_type, 0),
-        )
 
 
 def _log_sec_stats() -> None:
+    err_str = " ".join(
+        f"err:{t}={_sec_error_counts[t]}(in={_sec_error_input_tokens.get(t, 0)},out={_sec_error_output_tokens.get(t, 0)})"
+        for t in sorted(_sec_error_counts)
+    ) or "errors=none"
     log.info(
-        "[sec_stats] calls=%d  input_tokens=%d  output_tokens=%d",
+        "[sec_stats] calls=%d in=%d out=%d  length=%d len_in=%d len_out=%d  %s",
         _sec_call_count, _sec_input_tokens, _sec_output_tokens,
+        _sec_length_count, _sec_length_input_tokens, _sec_length_output_tokens,
+        err_str,
     )
-    for err_type in sorted(_sec_error_counts):
-        log.info(
-            "[sec_stats] error=%s  count=%d  input_tokens=%d  output_tokens=%d",
-            err_type, _sec_error_counts[err_type],
-            _sec_error_input_tokens.get(err_type, 0),
-            _sec_error_output_tokens.get(err_type, 0),
-        )
 
 
 async def _call_chat_completions(
@@ -834,6 +851,7 @@ async def _call_chat_completions(
     """
     global _last_llm_call_time, _llm_call_error
     global _llm_call_count, _llm_input_tokens, _llm_output_tokens
+    global _llm_length_count, _llm_length_input_tokens, _llm_length_output_tokens
     global _llm_error_counts, _llm_error_input_tokens, _llm_error_output_tokens
 
     async with _llm_call_lock:
@@ -864,20 +882,26 @@ async def _call_chat_completions(
     except Exception as exc:
         err_type = _llm_error_type(exc)
         err_in = err_out = 0
+        resp_body: Optional[str] = None
         if isinstance(exc, httpx.HTTPStatusError):
             try:
-                err_usage = exc.response.json().get("usage") or {}
+                resp_json = exc.response.json()
+                err_usage = resp_json.get("usage") or {}
                 err_in = err_usage.get("prompt_tokens", 0)
                 err_out = err_usage.get("completion_tokens", 0)
+                resp_body = json.dumps(resp_json, ensure_ascii=False)
             except Exception:
-                pass
+                resp_body = exc.response.text
         async with _llm_call_lock:
             _llm_call_error = True
             _llm_error_counts[err_type] = _llm_error_counts.get(err_type, 0) + 1
             _llm_error_input_tokens[err_type] = _llm_error_input_tokens.get(err_type, 0) + err_in
             _llm_error_output_tokens[err_type] = _llm_error_output_tokens.get(err_type, 0) + err_out
             total_calls = _llm_call_count + sum(_llm_error_counts.values())
-        log.error("[phase1] LLM API call failed: %s", exc)
+        if resp_body is not None:
+            log.error("[phase1] LLM API call failed: %s  response_body=%s", exc, resp_body)
+        else:
+            log.error("[phase1] LLM API call failed: %s", exc)
         if total_calls % 10 == 0:
             _log_llm_stats()
         raise
@@ -886,11 +910,16 @@ async def _call_chat_completions(
     usage = result.get("usage") or {}
     in_tok = usage.get("prompt_tokens", 0)
     out_tok = usage.get("completion_tokens", 0)
+    finish_reason = (result.get("choices") or [{}])[0].get("finish_reason") or ""
     async with _llm_call_lock:
         _llm_call_error = False
         _llm_call_count += 1
         _llm_input_tokens += in_tok
         _llm_output_tokens += out_tok
+        if finish_reason == "length":
+            _llm_length_count += 1
+            _llm_length_input_tokens += in_tok
+            _llm_length_output_tokens += out_tok
         total_calls = _llm_call_count + sum(_llm_error_counts.values())
     if total_calls % 10 == 0:
         _log_llm_stats()
@@ -1612,6 +1641,7 @@ async def _handle_request(
         p1_max = min(
             client_max_tokens if client_max_tokens is not None else _context_window,
             p1_available,
+            LLM_INFERENCE_MAX_TOKENS,
         )
 
         # Phase 1 runs against a remote OpenAI-compatible chat backend: send the native
@@ -1755,8 +1785,8 @@ async def _handle_request(
                 cleared.append((native_tc, ""))
                 continue
 
-            p2_max = min(MAX_TOKENS_SECURITY, p2_available)
-            if p2_max < MAX_TOKENS_SECURITY:
+            p2_max = min(SEC_INFERENCE_MAX_TOKENS, p2_available)
+            if p2_max < SEC_INFERENCE_MAX_TOKENS:
                 log.warning("[phase2] context nearly full, security max_tokens clamped to %d", p2_max)
 
             # ── Phase 2: lora model ──────────────────────────────────────────
@@ -2187,7 +2217,7 @@ async def health():
 def main():
     global LLM_SERVER_URL, LLM_MODEL_ID, SECURE_SERVER_URL, SECURE_MODEL_ID, BASE_MODEL_PATH
     global LLM_SERVER_PROXY, LLM_SERVER_TOKEN, LLM_CONTEXT_WINDOW
-    global MAX_TOKENS_SECURITY, REQUEST_TIMEOUT, LLM_API_CALL_INTERVAL
+    global SEC_INFERENCE_MAX_TOKENS, REQUEST_TIMEOUT, LLM_API_CALL_INTERVAL, LLM_INFERENCE_MAX_TOKENS
     global LISTEN_HOST, LISTEN_PORT, LOG_FILE_NAME, ENABLE_THINKING
     global PHASE2_ENABLE, PHASE2_TOOL_REASON_RETRY_COUNT
     global SECURITY_VALIDATE_TOOL_REASON, SECURITY_TOOL_REASON_MAX_FIX
@@ -2218,8 +2248,10 @@ def main():
                         help=f"model ID for phase 2 / lora security check (default: {SECURE_MODEL_ID})")
     parser.add_argument("--base-model-path",       default=None, metavar="PATH",
                         help=f"local path used to load the tokenizer (default: {BASE_MODEL_PATH})")
-    parser.add_argument("--max-tokens-security",   type=int, default=None, metavar="N",
-                        help=f"max tokens for phase 2 / lora security block (default: {MAX_TOKENS_SECURITY})")
+    parser.add_argument("--sec_inference_max_tokens", type=int, default=None, metavar="N",
+                        help=f"hard cap on tokens generated per phase-2 SEC model call (default: {SEC_INFERENCE_MAX_TOKENS})")
+    parser.add_argument("--llm_inference_max_tokens", type=int, default=None, metavar="N",
+                        help=f"hard cap on tokens generated per phase-1 LLM API call (default: {LLM_INFERENCE_MAX_TOKENS})")
     parser.add_argument("--timeout",               type=int, default=None, metavar="SEC",
                         help=f"HTTP request timeout in seconds (default: {REQUEST_TIMEOUT})")
     parser.add_argument("--host",                  default=None,
@@ -2312,7 +2344,8 @@ def main():
     if args.secure_server_url:   SECURE_SERVER_URL    = args.secure_server_url
     if args.secure_model_id:     SECURE_MODEL_ID      = args.secure_model_id
     if args.base_model_path:     BASE_MODEL_PATH      = args.base_model_path
-    if args.max_tokens_security: MAX_TOKENS_SECURITY  = args.max_tokens_security
+    if args.sec_inference_max_tokens: SEC_INFERENCE_MAX_TOKENS = args.sec_inference_max_tokens
+    if args.llm_inference_max_tokens: LLM_INFERENCE_MAX_TOKENS = args.llm_inference_max_tokens
     if args.timeout:             REQUEST_TIMEOUT      = args.timeout
     if args.host:                LISTEN_HOST          = args.host
     if args.port:                LISTEN_PORT          = args.port
@@ -2379,8 +2412,9 @@ def main():
     log.info("  llm auth token   : %s", "set" if LLM_SERVER_TOKEN and LLM_SERVER_TOKEN != "NOKEY" else "none")
     log.info("  llm context win  : %d tokens (manual config)", LLM_CONTEXT_WINDOW)
     log.info("  llm call interval: %.2fs", LLM_API_CALL_INTERVAL)
+    log.info("  llm max tokens   : %d per call", LLM_INFERENCE_MAX_TOKENS)
     log.info("  secure server    : %s  model=%s  security_max_tokens=%d",
-             SECURE_SERVER_URL, SECURE_MODEL_ID, MAX_TOKENS_SECURITY)
+             SECURE_SERVER_URL, SECURE_MODEL_ID, SEC_INFERENCE_MAX_TOKENS)
     log.info("  enable_thinking  : %s", ENABLE_THINKING)
     log.info("  phase2_enable    : %s", PHASE2_ENABLE)
     log.info("  p2_reason_retry  : %d", PHASE2_TOOL_REASON_RETRY_COUNT)

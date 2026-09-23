@@ -27,7 +27,8 @@ LISTEN_PORT=29000
 
 BASE_MODEL_PATH="/home/qiangyu/Models/Qwen/Qwen3-8B"
 
-MAX_TOKENS_SECURITY=1024         # max tokens for phase-2 lora security block
+SEC_INFERENCE_MAX_TOKENS=2048  # hard cap on tokens generated per phase-2 SEC model call
+LLM_INFERENCE_MAX_TOKENS=4096  # hard cap on tokens generated per phase-1 LLM API call
 REQUEST_TIMEOUT=600              # HTTP request timeout in seconds
 LOG_LEVEL="info"                 # debug | info | warning | error
 LOG_FILE_NAME="defence-llm-server.log"  # log file base name; runtime prepends YYYYMMDD_
@@ -42,7 +43,7 @@ PHASE2_TOOL_REASON_RETRY_COUNT=1  # retry phase 2 N times when its security bloc
 # Calls at or above the level pass through. Example: "neutral" allows safe+neutral, blocks suspicious+unsafe.
 SECURITY_DEFENCE_ENABLE=true          # true | false
 SECURITY_DEFENCE_LEVEL="neutral"       # safe | neutral | suspicious | unsafe
-SECURITY_DEFENCE_DEBUG=true           # true: keep <tool_call_security> in response; false: strip it
+SECURITY_DEFENCE_DEBUG=false           # true: keep <tool_call_security> in response; false: strip it
 SECURITY_DEFENCE_MAX_RETRIES=10        # max base-model retries after a defence block
 # Defence methods applied in order until one succeeds; if none does, the turn passes through
 # undefended. Available: remove_trigger_words | fake_tool_response
@@ -57,7 +58,7 @@ DEFENCE_SAFE_TOOLCALL=true
 # order until one succeeds; if none does, the call passes through. Same names as DEFENCE_METHOD_LIST.
 DEFENCE_SAFE_METHOD_LIST="remove_trigger_words"
 # remove_trigger_words parameters for the DEFENCE_SAFE_METHOD_LIST (safe-verdict) path.
-DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL=true   # true: match-tool-call false-positive guard
+DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL=false   # true: match-tool-call false-positive guard
 DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH=false     # false: exact matching only on the safe path
 
 # -----------------------------------------------------------------------
@@ -77,7 +78,8 @@ python "${SCRIPT_DIR}/defence-llm-server.py" \
     --host                 "${LISTEN_HOST}" \
     --port                 "${LISTEN_PORT}" \
     --base-model-path      "${BASE_MODEL_PATH}" \
-    --max-tokens-security  "${MAX_TOKENS_SECURITY}" \
+    --sec_inference_max_tokens "${SEC_INFERENCE_MAX_TOKENS}" \
+    --llm_inference_max_tokens "${LLM_INFERENCE_MAX_TOKENS}" \
     --timeout              "${REQUEST_TIMEOUT}" \
     --log-level            "${LOG_LEVEL}" \
     --log-file-name        "${LOG_FILE_NAME}" \
