@@ -17,10 +17,10 @@ _ENV_LLM_API_CALL_INTERVAL="$LLM_API_CALL_INTERVAL"
 
 # Phase 1: LLM server (OpenAI-compatible chat backend, e.g. vllm, Nvidia, OpenRouter).
 # The server calls {LLM_SERVER_URL}/chat/completions, so give the base URL ending in /v1.
-LLM_SERVER_URL="https://api.groq.com/openai/v1"
-LLM_MODEL_ID="openai/gpt-oss-120b"
+LLM_SERVER_URL="http://localhost:19000/v1"
+LLM_MODEL_ID="Qwen3Base"
 # Proxy used to reach the remote LLM; leave empty ("") to connect directly.
-LLM_SERVER_PROXY="http://127.0.0.1:1085"
+LLM_SERVER_PROXY=""
 # Comma-separated bearer tokens for the remote LLM; rotated round-robin per call.
 # Keep tokens OUT of this file. Export them in your environment instead:
 #   export LLM_SERVER_TOKEN_LIST="token1,token2,token3"
