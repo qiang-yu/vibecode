@@ -455,6 +455,7 @@ _llm_output_tokens: int = 0
 _llm_length_count: int = 0                        # calls stopped by max_tokens (finish_reason="length")
 _llm_length_input_tokens: int = 0
 _llm_length_output_tokens: int = 0
+_llm_elapsed_ms: float = 0.0                      # cumulative client-side latency (successful calls)
 _llm_error_counts: Dict[str, int] = {}
 _llm_error_input_tokens: Dict[str, int] = {}
 _llm_error_output_tokens: Dict[str, int] = {}
@@ -466,6 +467,7 @@ _sec_output_tokens: int = 0
 _sec_length_count: int = 0
 _sec_length_input_tokens: int = 0
 _sec_length_output_tokens: int = 0
+_sec_elapsed_ms: float = 0.0                      # cumulative client-side latency (successful calls)
 _sec_error_counts: Dict[str, int] = {}
 _sec_error_input_tokens: Dict[str, int] = {}
 _sec_error_output_tokens: Dict[str, int] = {}
@@ -742,6 +744,7 @@ async def _call_completions(
 ) -> Dict:
     global _sec_call_count, _sec_input_tokens, _sec_output_tokens
     global _sec_length_count, _sec_length_input_tokens, _sec_length_output_tokens
+    global _sec_elapsed_ms
     global _sec_error_counts, _sec_error_input_tokens, _sec_error_output_tokens
 
     payload = {
@@ -755,6 +758,7 @@ async def _call_completions(
         "stream": False,
     }
     target = (base_url or LLM_SERVER_URL).rstrip('/')
+    t_start = time.monotonic()
     try:
         r = await _http.post(f"{target}/completions", json=payload)
         r.raise_for_status()
@@ -784,6 +788,7 @@ async def _call_completions(
             _log_sec_stats()
         raise
 
+    elapsed_ms = (time.monotonic() - t_start) * 1000
     result = r.json()
     usage = result.get("usage") or {}
     in_tok = usage.get("prompt_tokens", 0)
@@ -793,6 +798,7 @@ async def _call_completions(
         _sec_call_count += 1
         _sec_input_tokens += in_tok
         _sec_output_tokens += out_tok
+        _sec_elapsed_ms += elapsed_ms
         if finish_reason == "length":
             _sec_length_count += 1
             _sec_length_input_tokens += in_tok
@@ -810,29 +816,39 @@ def _llm_error_type(exc: Exception) -> str:
 
 
 def _log_llm_stats() -> None:
-    err_str = " ".join(
-        f"err:{t}={_llm_error_counts[t]}(in={_llm_error_input_tokens.get(t, 0)},out={_llm_error_output_tokens.get(t, 0)})"
-        for t in sorted(_llm_error_counts)
-    ) or "errors=none"
-    log.info(
-        "[llm_stats] calls=%d in=%d out=%d  length=%d len_in=%d len_out=%d  %s",
-        _llm_call_count, _llm_input_tokens, _llm_output_tokens,
-        _llm_length_count, _llm_length_input_tokens, _llm_length_output_tokens,
-        err_str,
-    )
+    data = {
+        "llm_api": {
+            "succ":   {"calls": _llm_call_count, "input_tokens": _llm_input_tokens, "output_tokens": _llm_output_tokens},
+            "length": {"count": _llm_length_count, "input_tokens": _llm_length_input_tokens, "output_tokens": _llm_length_output_tokens},
+            "timing": {
+                "elapsed_ms": round(_llm_elapsed_ms),
+                "avg_ms": round(_llm_elapsed_ms / _llm_call_count) if _llm_call_count else 0,
+            },
+            "errors": {
+                t: {"count": _llm_error_counts[t], "input_tokens": _llm_error_input_tokens.get(t, 0), "output_tokens": _llm_error_output_tokens.get(t, 0)}
+                for t in sorted(_llm_error_counts)
+            },
+        }
+    }
+    log.info("[llm_stats] %s", json.dumps(data, ensure_ascii=False, separators=(",", ":")))
 
 
 def _log_sec_stats() -> None:
-    err_str = " ".join(
-        f"err:{t}={_sec_error_counts[t]}(in={_sec_error_input_tokens.get(t, 0)},out={_sec_error_output_tokens.get(t, 0)})"
-        for t in sorted(_sec_error_counts)
-    ) or "errors=none"
-    log.info(
-        "[sec_stats] calls=%d in=%d out=%d  length=%d len_in=%d len_out=%d  %s",
-        _sec_call_count, _sec_input_tokens, _sec_output_tokens,
-        _sec_length_count, _sec_length_input_tokens, _sec_length_output_tokens,
-        err_str,
-    )
+    data = {
+        "sec_model": {
+            "succ":   {"calls": _sec_call_count, "input_tokens": _sec_input_tokens, "output_tokens": _sec_output_tokens},
+            "length": {"count": _sec_length_count, "input_tokens": _sec_length_input_tokens, "output_tokens": _sec_length_output_tokens},
+            "timing": {
+                "elapsed_ms": round(_sec_elapsed_ms),
+                "avg_ms": round(_sec_elapsed_ms / _sec_call_count) if _sec_call_count else 0,
+            },
+            "errors": {
+                t: {"count": _sec_error_counts[t], "input_tokens": _sec_error_input_tokens.get(t, 0), "output_tokens": _sec_error_output_tokens.get(t, 0)}
+                for t in sorted(_sec_error_counts)
+            },
+        }
+    }
+    log.info("[sec_stats] %s", json.dumps(data, ensure_ascii=False, separators=(",", ":")))
 
 
 async def _call_chat_completions(
@@ -852,6 +868,7 @@ async def _call_chat_completions(
     global _last_llm_call_time, _llm_call_error
     global _llm_call_count, _llm_input_tokens, _llm_output_tokens
     global _llm_length_count, _llm_length_input_tokens, _llm_length_output_tokens
+    global _llm_elapsed_ms
     global _llm_error_counts, _llm_error_input_tokens, _llm_error_output_tokens
 
     async with _llm_call_lock:
@@ -874,6 +891,7 @@ async def _call_chat_completions(
         payload["tools"] = tools
     if stop:
         payload["stop"] = stop
+    t_start = time.monotonic()
     try:
         r = await _http_llm.post(
             f"{LLM_SERVER_URL.rstrip('/')}/chat/completions", json=payload,
@@ -906,6 +924,7 @@ async def _call_chat_completions(
             _log_llm_stats()
         raise
 
+    elapsed_ms = (time.monotonic() - t_start) * 1000
     result = r.json()
     usage = result.get("usage") or {}
     in_tok = usage.get("prompt_tokens", 0)
@@ -916,6 +935,7 @@ async def _call_chat_completions(
         _llm_call_count += 1
         _llm_input_tokens += in_tok
         _llm_output_tokens += out_tok
+        _llm_elapsed_ms += elapsed_ms
         if finish_reason == "length":
             _llm_length_count += 1
             _llm_length_input_tokens += in_tok
