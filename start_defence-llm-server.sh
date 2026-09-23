@@ -7,7 +7,7 @@
 _ENV_LLM_SERVER_URL="$LLM_SERVER_URL"
 _ENV_LLM_MODEL_ID="$LLM_MODEL_ID"
 _ENV_LLM_SERVER_PROXY="$LLM_SERVER_PROXY"
-_ENV_LLM_SERVER_TOKEN="$LLM_SERVER_TOKEN"
+_ENV_LLM_SERVER_TOKEN_LIST="$LLM_SERVER_TOKEN_LIST"
 _ENV_LLM_CONTEXT_WINDOW="$LLM_CONTEXT_WINDOW"
 _ENV_LLM_API_CALL_INTERVAL="$LLM_API_CALL_INTERVAL"
 
@@ -21,10 +21,10 @@ LLM_SERVER_URL="https://api.groq.com/openai/v1"
 LLM_MODEL_ID="openai/gpt-oss-120b"
 # Proxy used to reach the remote LLM; leave empty ("") to connect directly.
 LLM_SERVER_PROXY="http://127.0.0.1:1085"
-# Bearer token for the remote LLM: keep it OUT of this file. Export it in your environment instead:
-#   export LLM_SERVER_TOKEN="nvapi-xxxxxxxx"
-# The server reads the LLM_SERVER_TOKEN environment variable when no token is configured.
-LLM_SERVER_TOKEN=""
+# Comma-separated bearer tokens for the remote LLM; rotated round-robin per call.
+# Keep tokens OUT of this file. Export them in your environment instead:
+#   export LLM_SERVER_TOKEN_LIST="token1,token2,token3"
+LLM_SERVER_TOKEN_LIST=""
 # Phase-1 context length in tokens; remote chat APIs cannot report max_model_len via /models.
 LLM_CONTEXT_WINDOW=32768
 # Minimum seconds between consecutive phase-1 LLM API calls (Nvidia free API rate limit).
@@ -78,12 +78,12 @@ DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH=false     # false: exact matching
 # If any of the Phase-1 LLM variables were set in the shell environment
 # before running this script, they take priority over the defaults above.
 # -----------------------------------------------------------------------
-[ -n "$_ENV_LLM_SERVER_URL" ]        && LLM_SERVER_URL="$_ENV_LLM_SERVER_URL"
-[ -n "$_ENV_LLM_MODEL_ID" ]          && LLM_MODEL_ID="$_ENV_LLM_MODEL_ID"
-[ -n "$_ENV_LLM_SERVER_PROXY" ]      && LLM_SERVER_PROXY="$_ENV_LLM_SERVER_PROXY"
-[ -n "$_ENV_LLM_SERVER_TOKEN" ]      && LLM_SERVER_TOKEN="$_ENV_LLM_SERVER_TOKEN"
-[ -n "$_ENV_LLM_CONTEXT_WINDOW" ]    && LLM_CONTEXT_WINDOW="$_ENV_LLM_CONTEXT_WINDOW"
-[ -n "$_ENV_LLM_API_CALL_INTERVAL" ] && LLM_API_CALL_INTERVAL="$_ENV_LLM_API_CALL_INTERVAL"
+[ -n "$_ENV_LLM_SERVER_URL" ]             && LLM_SERVER_URL="$_ENV_LLM_SERVER_URL"
+[ -n "$_ENV_LLM_MODEL_ID" ]               && LLM_MODEL_ID="$_ENV_LLM_MODEL_ID"
+[ -n "$_ENV_LLM_SERVER_PROXY" ]           && LLM_SERVER_PROXY="$_ENV_LLM_SERVER_PROXY"
+[ -n "$_ENV_LLM_SERVER_TOKEN_LIST" ]      && LLM_SERVER_TOKEN_LIST="$_ENV_LLM_SERVER_TOKEN_LIST"
+[ -n "$_ENV_LLM_CONTEXT_WINDOW" ]         && LLM_CONTEXT_WINDOW="$_ENV_LLM_CONTEXT_WINDOW"
+[ -n "$_ENV_LLM_API_CALL_INTERVAL" ]      && LLM_API_CALL_INTERVAL="$_ENV_LLM_API_CALL_INTERVAL"
 
 # -----------------------------------------------------------------------
 # Launch
@@ -94,8 +94,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 python "${SCRIPT_DIR}/defence-llm-server.py" \
     --llm-server-url       "${LLM_SERVER_URL}" \
     --llm-model-id         "${LLM_MODEL_ID}" \
-    --llm-server-proxy     "${LLM_SERVER_PROXY}" \
-    --llm-context-window   "${LLM_CONTEXT_WINDOW}" \
+    --llm-server-proxy      "${LLM_SERVER_PROXY}" \
+    --llm-server-token-list "${LLM_SERVER_TOKEN_LIST}" \
+    --llm-context-window    "${LLM_CONTEXT_WINDOW}" \
     --llm_api_call_interval "${LLM_API_CALL_INTERVAL}" \
     --secure-server-url    "${SECURE_SERVER_URL}" \
     --secure-model-id      "${SECURE_MODEL_ID}" \

@@ -25,6 +25,7 @@ from datetime import datetime
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -46,7 +47,7 @@ from transformers import AutoTokenizer
 LLM_SERVER_URL            = "http://localhost:19000/v1"   # phase 1: OpenAI-compatible chat backend base URL (vllm / Nvidia / OpenRouter); code appends /chat/completions
 LLM_MODEL_ID              = "Qwen3Base"
 LLM_SERVER_PROXY          = ""           # phase 1: HTTP(S) proxy for the remote LLM; "" = direct (no proxy)
-LLM_SERVER_TOKEN          = ""           # phase 1: bearer token for the remote LLM; empty = read the LLM_SERVER_TOKEN env var (else no Authorization header)
+LLM_SERVER_TOKEN_LIST     = ""           # phase 1: comma-separated bearer tokens; rotated round-robin per call (env: LLM_SERVER_TOKEN_LIST)
 LLM_CONTEXT_WINDOW        = 32768        # phase 1: context length; remote chat APIs cannot report max_model_len via /models
 SECURE_SERVER_URL         = "http://localhost:19000/v1"   # phase 2: lora security model server
 SECURE_MODEL_ID           = "lora-model"
@@ -442,11 +443,16 @@ log = logging.getLogger(__name__)
 
 tokenizer: Any = None
 _http: Optional[httpx.AsyncClient] = None          # local calls: phase 2, secure /models, passthrough
-_http_llm: Optional[httpx.AsyncClient] = None      # phase 1 (remote chat): may carry proxy + auth header
+_http_llm: Optional[httpx.AsyncClient] = None      # phase 1 (remote chat): may carry proxy; auth header injected per call
 _context_window: int = 0          # context length, set at startup from LLM_CONTEXT_WINDOW
 _last_llm_call_time: float = 0.0  # monotonic timestamp of the last phase-1 LLM API call
 _llm_call_error: bool = False     # True after a phase-1 API error; causes 20x interval on next call
-_llm_call_lock: Optional[asyncio.Lock] = None      # serialises rate-limit enforcement across concurrent requests
+_llm_call_lock: Optional[asyncio.Lock] = None      # serialises rate-limit enforcement and token rotation
+
+# Token rotation state (protected by _llm_call_lock)
+_token_list: List[str] = []       # parsed from LLM_SERVER_TOKEN_LIST
+_token_index: int = 0             # current position in _token_list (round-robin)
+_token_usage_counts: List[int] = []  # per-token call count (same length as _token_list)
 
 # LLM API usage statistics (phase 1 only)
 _llm_call_count: int = 0
@@ -480,26 +486,34 @@ _sec_stats_lock: Optional[asyncio.Lock] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _http, _http_llm, _context_window, _llm_call_lock, _sec_stats_lock
+    global _token_list, _token_index, _token_usage_counts
 
     _llm_call_lock = asyncio.Lock()
     _sec_stats_lock = asyncio.Lock()
 
+    # Parse token list; pick a random start position so load is spread from the first call.
+    raw_tokens = LLM_SERVER_TOKEN_LIST.strip()
+    _token_list = [t.strip() for t in raw_tokens.split(",") if t.strip()] if raw_tokens else []
+    if _token_list:
+        _token_index = random.randint(0, len(_token_list) - 1)
+        _token_usage_counts = [0] * len(_token_list)
+    else:
+        _token_index = 0
+        _token_usage_counts = []
+
     # Local client (no proxy): phase 2 completions, secure /models, passthrough.
     _http = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
 
-    # Phase-1 client for the remote chat backend. Carries the proxy and/or bearer token only
-    # when configured; with the defaults ("" proxy, "NOKEY" token) it behaves like a plain client.
+    # Phase-1 client for the remote chat backend. Auth token is injected per-call during rotation.
     llm_kwargs: Dict[str, Any] = {"timeout": REQUEST_TIMEOUT}
     if LLM_SERVER_PROXY:
         llm_kwargs["proxy"] = LLM_SERVER_PROXY
-    if LLM_SERVER_TOKEN and LLM_SERVER_TOKEN != "NOKEY":
-        llm_kwargs["headers"] = {"Authorization": f"Bearer {LLM_SERVER_TOKEN}"}
     _http_llm = httpx.AsyncClient(**llm_kwargs)
     log.info(
-        "HTTP clients created (timeout=%ds, phase1_proxy=%s, phase1_auth=%s)",
+        "HTTP clients created (timeout=%ds, phase1_proxy=%s, phase1_tokens=%d)",
         REQUEST_TIMEOUT,
         LLM_SERVER_PROXY or "none",
-        "yes" if "headers" in llm_kwargs else "no",
+        len(_token_list),
     )
 
     # Phase 1 targets a chat backend that cannot report max_model_len via /models, so the
@@ -824,6 +838,7 @@ def _log_llm_stats() -> None:
                 "elapsed_ms": round(_llm_elapsed_ms),
                 "avg_ms": round(_llm_elapsed_ms / _llm_call_count) if _llm_call_count else 0,
             },
+            "token_usage": list(_token_usage_counts),
             "errors": {
                 t: {"count": _llm_error_counts[t], "input_tokens": _llm_error_input_tokens.get(t, 0), "output_tokens": _llm_error_output_tokens.get(t, 0)}
                 for t in sorted(_llm_error_counts)
@@ -870,6 +885,7 @@ async def _call_chat_completions(
     global _llm_length_count, _llm_length_input_tokens, _llm_length_output_tokens
     global _llm_elapsed_ms
     global _llm_error_counts, _llm_error_input_tokens, _llm_error_output_tokens
+    global _token_index, _token_usage_counts
 
     async with _llm_call_lock:
         interval = LLM_API_CALL_INTERVAL * 20 if _llm_call_error else LLM_API_CALL_INTERVAL
@@ -879,6 +895,17 @@ async def _call_chat_completions(
             log.debug("[phase1] rate limit: sleeping %.2fs before LLM API call (error_mode=%s)", wait, _llm_call_error)
             await asyncio.sleep(wait)
         _last_llm_call_time = time.monotonic()
+        # Select the next token in round-robin order.
+        if _token_list:
+            current_token = _token_list[_token_index]
+            _token_usage_counts[_token_index] += 1
+            _token_index = (_token_index + 1) % len(_token_list)
+        else:
+            current_token = ""
+
+    req_headers: Dict[str, str] = {}
+    if current_token and current_token != "NOKEY":
+        req_headers["Authorization"] = f"Bearer {current_token}"
 
     payload: Dict[str, Any] = {
         **fwd,
@@ -894,7 +921,9 @@ async def _call_chat_completions(
     t_start = time.monotonic()
     try:
         r = await _http_llm.post(
-            f"{LLM_SERVER_URL.rstrip('/')}/chat/completions", json=payload,
+            f"{LLM_SERVER_URL.rstrip('/')}/chat/completions",
+            json=payload,
+            headers=req_headers if req_headers else None,
         )
         r.raise_for_status()
     except Exception as exc:
@@ -2236,7 +2265,7 @@ async def health():
 
 def main():
     global LLM_SERVER_URL, LLM_MODEL_ID, SECURE_SERVER_URL, SECURE_MODEL_ID, BASE_MODEL_PATH
-    global LLM_SERVER_PROXY, LLM_SERVER_TOKEN, LLM_CONTEXT_WINDOW
+    global LLM_SERVER_PROXY, LLM_SERVER_TOKEN_LIST, LLM_CONTEXT_WINDOW
     global SEC_INFERENCE_MAX_TOKENS, REQUEST_TIMEOUT, LLM_API_CALL_INTERVAL, LLM_INFERENCE_MAX_TOKENS
     global LISTEN_HOST, LISTEN_PORT, LOG_FILE_NAME, ENABLE_THINKING
     global PHASE2_ENABLE, PHASE2_TOOL_REASON_RETRY_COUNT
@@ -2256,8 +2285,8 @@ def main():
                         help=f"model ID for phase 1 LLM (default: {LLM_MODEL_ID})")
     parser.add_argument("--llm-server-proxy",      default=None, metavar="URL",
                         help=f"HTTP(S) proxy for the phase-1 remote LLM; empty = direct (default: {LLM_SERVER_PROXY!r})")
-    parser.add_argument("--llm-server-token",      default=None, metavar="TOKEN",
-                        help=f"bearer token for the phase-1 remote LLM; empty = read the LLM_SERVER_TOKEN env var (default: {LLM_SERVER_TOKEN!r})")
+    parser.add_argument("--llm-server-token-list",  default=None, metavar="T1,T2,...",
+                        help=f"comma-separated bearer tokens for phase-1; rotated round-robin per call (env: LLM_SERVER_TOKEN_LIST)")
     parser.add_argument("--llm-context-window",    type=int, default=None, metavar="N",
                         help=f"phase-1 context length in tokens (default: {LLM_CONTEXT_WINDOW})")
     parser.add_argument("--llm_api_call_interval", type=float, default=None, metavar="SEC",
@@ -2352,19 +2381,19 @@ def main():
     args = parser.parse_args()
 
     # CLI args first, then env vars override (env vars take highest priority).
-    if args.llm_server_url:                    LLM_SERVER_URL      = args.llm_server_url
-    if args.llm_model_id:                      LLM_MODEL_ID        = args.llm_model_id
-    if args.llm_server_proxy is not None:      LLM_SERVER_PROXY    = args.llm_server_proxy
-    if args.llm_server_token is not None:      LLM_SERVER_TOKEN    = args.llm_server_token
-    if args.llm_context_window:                LLM_CONTEXT_WINDOW  = args.llm_context_window
-    if args.llm_api_call_interval is not None: LLM_API_CALL_INTERVAL = args.llm_api_call_interval
+    if args.llm_server_url:                        LLM_SERVER_URL        = args.llm_server_url
+    if args.llm_model_id:                          LLM_MODEL_ID          = args.llm_model_id
+    if args.llm_server_proxy is not None:          LLM_SERVER_PROXY      = args.llm_server_proxy
+    if args.llm_server_token_list is not None:     LLM_SERVER_TOKEN_LIST = args.llm_server_token_list
+    if args.llm_context_window:                    LLM_CONTEXT_WINDOW    = args.llm_context_window
+    if args.llm_api_call_interval is not None:     LLM_API_CALL_INTERVAL = args.llm_api_call_interval
 
-    if os.environ.get("LLM_SERVER_URL"):        LLM_SERVER_URL      = os.environ["LLM_SERVER_URL"]
-    if os.environ.get("LLM_MODEL_ID"):          LLM_MODEL_ID        = os.environ["LLM_MODEL_ID"]
-    if "LLM_SERVER_PROXY" in os.environ:        LLM_SERVER_PROXY    = os.environ["LLM_SERVER_PROXY"]
-    if os.environ.get("LLM_SERVER_TOKEN"):      LLM_SERVER_TOKEN    = os.environ["LLM_SERVER_TOKEN"]
-    if os.environ.get("LLM_CONTEXT_WINDOW"):    LLM_CONTEXT_WINDOW  = int(os.environ["LLM_CONTEXT_WINDOW"])
-    if os.environ.get("LLM_API_CALL_INTERVAL"): LLM_API_CALL_INTERVAL = float(os.environ["LLM_API_CALL_INTERVAL"])
+    if os.environ.get("LLM_SERVER_URL"):           LLM_SERVER_URL        = os.environ["LLM_SERVER_URL"]
+    if os.environ.get("LLM_MODEL_ID"):             LLM_MODEL_ID          = os.environ["LLM_MODEL_ID"]
+    if "LLM_SERVER_PROXY" in os.environ:           LLM_SERVER_PROXY      = os.environ["LLM_SERVER_PROXY"]
+    if os.environ.get("LLM_SERVER_TOKEN_LIST"):    LLM_SERVER_TOKEN_LIST = os.environ["LLM_SERVER_TOKEN_LIST"]
+    if os.environ.get("LLM_CONTEXT_WINDOW"):       LLM_CONTEXT_WINDOW    = int(os.environ["LLM_CONTEXT_WINDOW"])
+    if os.environ.get("LLM_API_CALL_INTERVAL"):    LLM_API_CALL_INTERVAL = float(os.environ["LLM_API_CALL_INTERVAL"])
     if args.secure_server_url:   SECURE_SERVER_URL    = args.secure_server_url
     if args.secure_model_id:     SECURE_MODEL_ID      = args.secure_model_id
     if args.base_model_path:     BASE_MODEL_PATH      = args.base_model_path
@@ -2433,7 +2462,8 @@ def main():
     log.info("  listen           : http://%s:%d/v1", LISTEN_HOST, LISTEN_PORT)
     log.info("  llm server       : %s  model=%s  (phase 1: /chat/completions)", LLM_SERVER_URL, LLM_MODEL_ID)
     log.info("  llm proxy        : %s", LLM_SERVER_PROXY or "none")
-    log.info("  llm auth token   : %s", "set" if LLM_SERVER_TOKEN and LLM_SERVER_TOKEN != "NOKEY" else "none")
+    _parsed_token_count = len([t for t in LLM_SERVER_TOKEN_LIST.split(",") if t.strip()]) if LLM_SERVER_TOKEN_LIST.strip() else 0
+    log.info("  llm token list   : %d token(s) configured", _parsed_token_count)
     log.info("  llm context win  : %d tokens (manual config)", LLM_CONTEXT_WINDOW)
     log.info("  llm call interval: %.2fs", LLM_API_CALL_INTERVAL)
     log.info("  llm max tokens   : %d per call", LLM_INFERENCE_MAX_TOKENS)
