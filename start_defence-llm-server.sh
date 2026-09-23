@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 
 # -----------------------------------------------------------------------
+# Capture environment variables before the defaults below overwrite them.
+# If these are set in the shell environment, they will override the defaults.
+# -----------------------------------------------------------------------
+_ENV_LLM_SERVER_URL="$LLM_SERVER_URL"
+_ENV_LLM_MODEL_ID="$LLM_MODEL_ID"
+_ENV_LLM_SERVER_PROXY="$LLM_SERVER_PROXY"
+_ENV_LLM_SERVER_TOKEN="$LLM_SERVER_TOKEN"
+_ENV_LLM_CONTEXT_WINDOW="$LLM_CONTEXT_WINDOW"
+_ENV_LLM_API_CALL_INTERVAL="$LLM_API_CALL_INTERVAL"
+
+# -----------------------------------------------------------------------
 # Configurable parameters — edit these before starting the server
 # -----------------------------------------------------------------------
 
@@ -13,6 +24,7 @@ LLM_SERVER_PROXY="http://127.0.0.1:1085"
 # Bearer token for the remote LLM: keep it OUT of this file. Export it in your environment instead:
 #   export LLM_SERVER_TOKEN="nvapi-xxxxxxxx"
 # The server reads the LLM_SERVER_TOKEN environment variable when no token is configured.
+LLM_SERVER_TOKEN=""
 # Phase-1 context length in tokens; remote chat APIs cannot report max_model_len via /models.
 LLM_CONTEXT_WINDOW=32768
 # Minimum seconds between consecutive phase-1 LLM API calls (Nvidia free API rate limit).
@@ -60,6 +72,18 @@ DEFENCE_SAFE_METHOD_LIST="remove_trigger_words"
 # remove_trigger_words parameters for the DEFENCE_SAFE_METHOD_LIST (safe-verdict) path.
 DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL=false   # true: match-tool-call false-positive guard
 DEFENCE_SAFE_REMOVE_TRIGGER_WORDS_FUZZY_SEARCH=false     # false: exact matching only on the safe path
+
+# -----------------------------------------------------------------------
+# Apply environment variable overrides
+# If any of the Phase-1 LLM variables were set in the shell environment
+# before running this script, they take priority over the defaults above.
+# -----------------------------------------------------------------------
+[ -n "$_ENV_LLM_SERVER_URL" ]        && LLM_SERVER_URL="$_ENV_LLM_SERVER_URL"
+[ -n "$_ENV_LLM_MODEL_ID" ]          && LLM_MODEL_ID="$_ENV_LLM_MODEL_ID"
+[ -n "$_ENV_LLM_SERVER_PROXY" ]      && LLM_SERVER_PROXY="$_ENV_LLM_SERVER_PROXY"
+[ -n "$_ENV_LLM_SERVER_TOKEN" ]      && LLM_SERVER_TOKEN="$_ENV_LLM_SERVER_TOKEN"
+[ -n "$_ENV_LLM_CONTEXT_WINDOW" ]    && LLM_CONTEXT_WINDOW="$_ENV_LLM_CONTEXT_WINDOW"
+[ -n "$_ENV_LLM_API_CALL_INTERVAL" ] && LLM_API_CALL_INTERVAL="$_ENV_LLM_API_CALL_INTERVAL"
 
 # -----------------------------------------------------------------------
 # Launch
