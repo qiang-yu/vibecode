@@ -2351,16 +2351,20 @@ def main():
                         help="log level: debug/info/warning/error (default: info)")
     args = parser.parse_args()
 
-    if args.llm_server_url:      LLM_SERVER_URL       = args.llm_server_url
-    if args.llm_model_id:        LLM_MODEL_ID         = args.llm_model_id
-    if args.llm_server_proxy is not None:    LLM_SERVER_PROXY   = args.llm_server_proxy
-    if args.llm_server_token is not None:    LLM_SERVER_TOKEN   = args.llm_server_token
-    # When no token is configured, fall back to the LLM_SERVER_TOKEN environment variable so the
-    # secret can be kept out of the start script.
-    if not LLM_SERVER_TOKEN:
-        LLM_SERVER_TOKEN = os.environ.get("LLM_SERVER_TOKEN", "")
-    if args.llm_context_window:  LLM_CONTEXT_WINDOW   = args.llm_context_window
+    # CLI args first, then env vars override (env vars take highest priority).
+    if args.llm_server_url:                    LLM_SERVER_URL      = args.llm_server_url
+    if args.llm_model_id:                      LLM_MODEL_ID        = args.llm_model_id
+    if args.llm_server_proxy is not None:      LLM_SERVER_PROXY    = args.llm_server_proxy
+    if args.llm_server_token is not None:      LLM_SERVER_TOKEN    = args.llm_server_token
+    if args.llm_context_window:                LLM_CONTEXT_WINDOW  = args.llm_context_window
     if args.llm_api_call_interval is not None: LLM_API_CALL_INTERVAL = args.llm_api_call_interval
+
+    if os.environ.get("LLM_SERVER_URL"):        LLM_SERVER_URL      = os.environ["LLM_SERVER_URL"]
+    if os.environ.get("LLM_MODEL_ID"):          LLM_MODEL_ID        = os.environ["LLM_MODEL_ID"]
+    if "LLM_SERVER_PROXY" in os.environ:        LLM_SERVER_PROXY    = os.environ["LLM_SERVER_PROXY"]
+    if os.environ.get("LLM_SERVER_TOKEN"):      LLM_SERVER_TOKEN    = os.environ["LLM_SERVER_TOKEN"]
+    if os.environ.get("LLM_CONTEXT_WINDOW"):    LLM_CONTEXT_WINDOW  = int(os.environ["LLM_CONTEXT_WINDOW"])
+    if os.environ.get("LLM_API_CALL_INTERVAL"): LLM_API_CALL_INTERVAL = float(os.environ["LLM_API_CALL_INTERVAL"])
     if args.secure_server_url:   SECURE_SERVER_URL    = args.secure_server_url
     if args.secure_model_id:     SECURE_MODEL_ID      = args.secure_model_id
     if args.base_model_path:     BASE_MODEL_PATH      = args.base_model_path
