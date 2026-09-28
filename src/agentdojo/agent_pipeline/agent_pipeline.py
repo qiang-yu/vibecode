@@ -471,7 +471,9 @@ def get_llm(provider: str, model: str, model_id: str | None, tool_delimiter: str
             api_key="EMPTY",
             base_url=f"http://localhost:{port}/v1",
         )
-        llm = OpenAILLM(client, _get_local_model_id(port))
+        # llm = OpenAILLM(client, _get_local_model_id(port))
+        # use model_id instead
+        llm = OpenAILLM(client, model_id)
     else:
         raise ValueError("Invalid provider")
     return llm

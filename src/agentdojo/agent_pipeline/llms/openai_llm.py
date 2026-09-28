@@ -177,6 +177,13 @@ def chat_completion_request(
     reasoning_effort: ChatCompletionReasoningEffort | None,
     temperature: float | None = 0.0,
 ):
+    import os
+    max_tokens_env = os.getenv("MAX_INFERENCE_TOKENS", None)
+    if max_tokens_env is None:
+        max_tokens = NOT_GIVEN
+    else:
+        max_tokens = int(max_tokens_env)
+
     effective_temperature = temperature if _supports_temperature(model) else None
     return client.chat.completions.create(
         model=model,
@@ -185,6 +192,7 @@ def chat_completion_request(
         tool_choice="auto" if tools else NOT_GIVEN,
         temperature=effective_temperature if effective_temperature is not None else NOT_GIVEN,
         reasoning_effort=reasoning_effort or NOT_GIVEN,
+        max_tokens=max_tokens,
     )
 
 
