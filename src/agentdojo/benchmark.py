@@ -1,4 +1,4 @@
-import json
+# import json
 from json import JSONDecodeError
 import logging
 import warnings
@@ -119,35 +119,46 @@ def run_task_with_injection_tasks(
                         agent_pipeline, user_task, injection_task, task_injections
                     )
                 except BadRequestError as e:
-                    if (
-                        e.code == "context_length_exceeded"
-                        or e.param == "max_tokens"
-                        or "reduce the length of the messages." in repr(e)
-                    ):
-                        logger.log_error(
-                            f"Skipping task '{user_task.ID}' with '{injection_task.ID}' due to context_length_exceeded: {e}"
-                        )
-                        utility = False
-                        security = True
-                    else:
-                        raise e
-                except ApiError as e:
-                    if "internal server error" in str(e):
-                        logger.log_error(
-                            f"Skipping task '{user_task.ID}' with '{injection_task.ID}' because of internal server error: {e}"
-                        )
-                        utility = False
-                        security = True
-                    else:
-                        raise e
-                except ServerError as e:
                     logger.log_error(
-                        f"Skipping task '{user_task.ID}' with '{injection_task.ID}' because of internal server error: {e}"
+                        f"Skipping task '{user_task.ID}' with '{injection_task.ID}' due to context_length_exceeded: {e}"
                     )
                     utility = False
                     security = True
+                    # if (
+                    #     e.code == "context_length_exceeded"
+                    #     or e.param == "max_tokens"
+                    #     or "reduce the length of the messages." in repr(e)
+                    # ):
+                    #     logger.log_error(
+                    #         f"Skipping task '{user_task.ID}' with '{injection_task.ID}' due to context_length_exceeded: {e}"
+                    #     )
+                    #     utility = False
+                    #     security = True
+                    # else:
+                    #     raise e
+                except ApiError as e:
+                    logger.log_error(
+                        f"Skipping task '{user_task.ID}' with '{injection_task.ID}' because of ApiError: {e}"
+                    )
+                    utility = False
+                    security = True
+                    # if "internal server error" in str(e):
+                    #     logger.log_error(
+                    #         f"Skipping task '{user_task.ID}' with '{injection_task.ID}' because of internal server error: {e}"
+                    #     )
+                    #     utility = False
+                    #     security = True
+                    # else:
+                    #     raise e
                 except JSONDecodeError as e:
                     logger.log_error(f"Skipping task {user_task.ID} with '{injection_task.ID}' because of JSON decode error: {e}")
+                    utility = False
+                    security = True
+                # except ServerError as e:
+                except Exception as e:
+                    logger.log_error(
+                        f"Skipping task '{user_task.ID}' with '{injection_task.ID}' because of internal server error: {e}"
+                    )
                     utility = False
                     security = True
 
@@ -287,36 +298,46 @@ def run_task_without_injection_tasks(
         try:
             utility, security = suite.run_task_with_pipeline(agent_pipeline, task, injection_task=None, injections={})
         except BadRequestError as e:
-            if (
-                e.code == "context_length_exceeded"
-                or e.param == "max_tokens"
-                or "reduce the length of the messages." in repr(e)
-            ):
-                logger.log_error(f"Skipping task {task.ID} due to context_length_exceeded: {e}")
-                utility = False
-                security = True
-            else:
-                raise e
-        except UnprocessableEntityError as e:
-            if "max_new_tokens" in str(e):
-                logger.log_error(f"Skipping task {task.ID} due to context_length_exceeded: {e}")
-                utility = False
-                security = True
-            else:
-                raise e
-        except ApiError as e:
-            if "internal server error" in str(e):
-                logger.log_error(f"Skipping task {task.ID} because of internal server error: {e}")
-                utility = False
-                security = True
-            else:
-                raise e
-        except ServerError as e:
-            logger.log_error(f"Skipping task {task.ID} because of internal server error: {e}")
+            logger.log_error(f"Skipping task {task.ID} due to context_length_exceeded: {e}")
             utility = False
             security = True
+            # if (
+            #     e.code == "context_length_exceeded"
+            #     or e.param == "max_tokens"
+            #     or "reduce the length of the messages." in repr(e)
+            # ):
+            #     logger.log_error(f"Skipping task {task.ID} due to context_length_exceeded: {e}")
+            #     utility = False
+            #     security = True
+            # else:
+            #     raise e
+        except UnprocessableEntityError as e:
+            logger.log_error(f"Skipping task {task.ID} due to context_length_exceeded: {e}")
+            utility = False
+            security = True
+            # if "max_new_tokens" in str(e):
+            #     logger.log_error(f"Skipping task {task.ID} due to context_length_exceeded: {e}")
+            #     utility = False
+            #     security = True
+            # else:
+            #     raise e
+        except ApiError as e:
+            logger.log_error(f"Skipping task {task.ID} because of ApiError: {e}")
+            utility = False
+            security = True
+            # if "internal server error" in str(e):
+            #     logger.log_error(f"Skipping task {task.ID} because of internal server error: {e}")
+            #     utility = False
+            #     security = True
+            # else:
+            #     raise e
         except JSONDecodeError as e:
             logger.log_error(f"Skipping task {task.ID} because of JSON decode error: {e}")
+            utility = False
+            security = True
+        # except ServerError as e:
+        except Exception as e:
+            logger.log_error(f"Skipping task {task.ID} because of other server error: {e}")
             utility = False
             security = True
         logger.set_contextarg("utility", utility)
