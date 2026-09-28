@@ -1,2 +1,0 @@
-# vibecode
-vide code 
