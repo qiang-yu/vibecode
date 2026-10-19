@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  
+  <meta name="title" content="DRIFT: Dynamic Rule-Based Defense with Injection Isolation for Securing LLM Agents">
+  <meta name="description" content="DRIFT is a system-level defense framework for LLM agents against prompt injection attacks, combining dynamic rule-based policies with memory-stream injection isolation. NeurIPS 2025.">
+  <meta name="keywords" content="prompt injection, LLM agents, AI security, DRIFT, NeurIPS 2025, dynamic defense, injection isolation, large language models">
+  <meta name="author" content="Hao Li, Xiaogeng Liu, Hung-Chun Chiu, Dianqi Li, Ning Zhang, Chaowei Xiao">
+  <meta name="robots" content="index, follow">
+  <meta name="language" content="English">
+  
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="SaFo Lab">
+  <meta property="og:title" content="DRIFT: Dynamic Rule-Based Defense with Injection Isolation for Securing LLM Agents">
+  <meta property="og:description" content="DRIFT protects LLM-based agents from prompt injection attacks via dynamic policy enforcement and memory-stream isolation. NeurIPS 2025.">
+  <meta property="og:url" content="https://safolab-wisc.github.io/DRIFT">
+  <meta property="og:image" content="https://arxiv.org/html/2506.12104v2/x2.png">
+  <meta property="og:image:alt" content="DRIFT Framework Workflow">
+  <meta property="article:published_time" content="2025-06-13T00:00:00.000Z">
+  <meta property="article:author" content="Hao Li">
+  <meta property="article:section" content="Research">
+  <meta property="article:tag" content="prompt injection">
+  <meta property="article:tag" content="LLM agents security">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="DRIFT: Dynamic Rule-Based Defense with Injection Isolation for Securing LLM Agents">
+  <meta name="twitter:description" content="DRIFT protects LLM agents from prompt injection attacks via dynamic policies and memory isolation. NeurIPS 2025.">
+  <meta name="twitter:image" content="https://arxiv.org/html/2506.12104v2/x2.png">
+
+  <meta name="citation_title" content="DRIFT: Dynamic Rule-Based Defense with Injection Isolation for Securing LLM Agents">
+  <meta name="citation_author" content="Li, Hao">
+  <meta name="citation_author" content="Liu, Xiaogeng">
+  <meta name="citation_author" content="Chiu, Hung-Chun">
+  <meta name="citation_author" content="Li, Dianqi">
+  <meta name="citation_author" content="Zhang, Ning">
+  <meta name="citation_author" content="Xiao, Chaowei">
+  <meta name="citation_publication_date" content="2025">
+  <meta name="citation_conference_title" content="Neural Information Processing Systems (NeurIPS)">
+  <meta name="citation_arxiv_id" content="2506.12104">
+  <meta name="citation_pdf_url" content="https://arxiv.org/pdf/2506.12104">
+  
+  <meta name="theme-color" content="#2563eb">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="preconnect" href="https://ajax.googleapis.com">
+  <link rel="preconnect" href="https://cdn.jsdelivr.net">
+
+  <title>DRIFT: Dynamic Rule-Based Defense for LLM Agents | NeurIPS 2025</title>
+  
+  <link rel="icon" type="image/x-icon" href="static/images/favicon.ico">
+  <link rel="apple-touch-icon" href="static/images/favicon.ico">
+  
+  <link rel="stylesheet" href="static/css/bulma.min.css">
+  <link rel="stylesheet" href="static/css/index.css">
+  
+  <link rel="preload" href="static/css/bulma-carousel.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  <link rel="preload" href="static/css/bulma-slider.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  <link rel="preload" href="static/css/fontawesome.all.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  <link rel="preload" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
+  
+  <noscript>
+    <link rel="stylesheet" href="static/css/bulma-carousel.min.css">
+    <link rel="stylesheet" href="static/css/bulma-slider.min.css">
+    <link rel="stylesheet" href="static/css/fontawesome.all.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+  </noscript>
+  
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  
+  <script defer src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+  <script defer src="static/js/fontawesome.all.min.js"></script>
+  <script defer src="static/js/bulma-carousel.min.js"></script>
+  <script defer src="static/js/bulma-slider.min.js"></script>
+  <script defer src="static/js/index.js"></script>
+  
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "ScholarlyArticle",
+    "headline": "DRIFT: Dynamic Rule-Based Defense with Injection Isolation for Securing LLM Agents",
+    "description": "DRIFT is a system-level defense framework that protects LLM-based agents from prompt injection attacks via dynamic policy enforcement and memory-stream injection isolation.",
+    "author": [
+      {"@type": "Person", "name": "Hao Li", "affiliation": {"@type": "Organization", "name": "Washington University in St. Louis"}},
+      {"@type": "Person", "name": "Xiaogeng Liu", "affiliation": {"@type": "Organization", "name": "Johns Hopkins University"}},
+      {"@type": "Person", "name": "Hung-Chun Chiu", "affiliation": {"@type": "Organization", "name": "Independent Researcher"}},
+      {"@type": "Person", "name": "Dianqi Li", "affiliation": {"@type": "Organization", "name": "Independent Researcher"}},
+      {"@type": "Person", "name": "Ning Zhang", "affiliation": {"@type": "Organization", "name": "Washington University in St. Louis"}},
+      {"@type": "Person", "name": "Chaowei Xiao", "affiliation": {"@type": "Organization", "name": "Johns Hopkins University"}}
+    ],
+    "datePublished": "2025-06-13",
+    "publisher": {"@type": "Organization", "name": "Neural Information Processing Systems (NeurIPS 2025)"},
+    "url": "https://arxiv.org/abs/2506.12104",
+    "keywords": ["prompt injection", "LLM agents", "AI security", "dynamic defense", "memory isolation"],
+    "isAccessibleForFree": true
+  }
+  </script>
+</head>
+<body>
+
+  <button class="scroll-to-top" onclick="scrollToTop()" title="Scroll to top" aria-label="Scroll to top">
+    <i class="fas fa-chevron-up"></i>
+  </button>
+
+  <div class="more-works-container">
+    <button class="more-works-btn" onclick="toggleMoreWorks()" title="View More Works from Our Lab">
+      <i class="fas fa-flask"></i>
+      More Works
+      <i class="fas fa-chevron-down dropdown-arrow"></i>
+    </button>
+    <div class="more-works-dropdown" id="moreWorksDropdown">
+      <div class="dropdown-header">
+        <h4>More Works from Our Lab</h4>
+        <button class="close-btn" onclick="toggleMoreWorks()">
+          <i class="fas fa-times"></i>
+        </button>
+      </div>
+      <div class="works-list">
+        <a href="https://arxiv.org/abs/2405.09360" class="work-item" target="_blank">
+          <div class="work-info">
+            <h5>InjecGuard: Benchmarking and Mitigating Over-defense in Prompt Injection Guardrail Models</h5>
+            <p>A guardrail approach that mitigates overdefense in prompt injection detection.</p>
+            <span class="work-venue">ACL 2025</span>
+          </div>
+          <i class="fas fa-external-link-alt"></i>
+        </a>
+        <a href="https://arxiv.org/abs/2403.04957" class="work-item" target="_blank">
+          <div class="work-info">
+            <h5>Automatic and Universal Prompt Injection Attacks against Large Language Models</h5>
+            <p>Investigates automated generation of universal prompt injection attacks against LLMs.</p>
+            <span class="work-venue">arXiv 2024</span>
+          </div>
+          <i class="fas fa-external-link-alt"></i>
+        </a>
+        <a href="https://arxiv.org/abs/2409.19091" class="work-item" target="_blank">
+          <div class="work-info">
+            <h5>System-Level Defense against Indirect Prompt Injection: An Information Flow Control Perspective</h5>
+            <p>Defends LLM agents via information flow control to prevent injection propagation.</p>
+            <span class="work-venue">arXiv 2024</span>
+          </div>
+          <i class="fas fa-external-link-alt"></i>
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <main id="main-content">
+
+  <!-- ==================== HERO ==================== -->
+  <section class="hero hero-publication">
+    <div class="hero-body" style="padding: 2.5rem 1.5rem 2.5rem;">
+      <div class="container is-max-desktop">
+        <div class="columns is-centered">
+          <div class="column is-11 has-text-centered">
+
+            <!-- Logo bar: NeurIPS left, institutions right -->
+            <div class="hero-logo-bar">
+              <a href="https://neurips.cc/" target="_blank" class="hero-logo-link">
+                <img src="static/images/NeurIPS-logo.svg" alt="NeurIPS" class="hero-logo hero-logo--neurips" />
+              </a>
+              <div class="hero-inst-logos">
+                <img src="static/images/washu.png" alt="Washington University in St. Louis" class="hero-logo hero-logo--inst" />
+                <img src="static/images/JHU.logo_vertical.blue.png" alt="Johns Hopkins University" class="hero-logo hero-logo--inst" />
+              </div>
+            </div>
+
+            <!-- Title -->
+            <h1 class="title publication-title" style="font-size:3rem; font-weight:800; line-height:1.15; color:#111; margin-bottom:1rem; margin-top: 1.5rem;">
+              DRIFT: Dynamic Rule-Based Defense with Injection Isolation for Securing LLM Agents
+            </h1>
+
+            <!-- Authors -->
+            <p class="hero-authors" style="margin-bottom:0.4rem;">
+              <a href="https://leolee99.github.io/" target="_blank">Hao Li</a><sup>1</sup><span class="sep">,</span>
+              <a href="https://xiaogeng-liu.com/" target="_blank">Xiaogeng Liu</a><sup>2</sup><span class="sep">,</span>
+              <a href="https://qhjchc.notion.site/" target="_blank">Hung-Chun Chiu</a><sup>3</sup><span class="sep">,</span>
+              <a href="https://scholar.google.com/citations?user=K40nbiQAAAAJ&hl=en" target="_blank">Dianqi Li</a><sup>3</sup><span class="sep">,</span>
+              <a href="https://engineering.wustl.edu/faculty/Ning-Zhang.html" target="_blank">Ning Zhang</a><sup>1</sup><span class="sep">,</span>
+              <a href="https://xiaocw11.github.io/" target="_blank">Chaowei Xiao</a><sup>2</sup>
+            </p>
+
+            <!-- Affiliations plain text -->
+            <p class="hero-affil-text">
+              <sup>1</sup>Washington University in St. Louis
+              &nbsp;&nbsp;
+              <sup>2</sup>Johns Hopkins University
+              &nbsp;&nbsp;
+              <sup>3</sup>Independent Researcher
+            </p>
+
+            <div class="hero-divider" style="margin: 1rem auto;"></div>
+
+            <!-- Buttons -->
+            <div class="hero-buttons">
+              <a href="https://arxiv.org/pdf/2506.12104" target="_blank"
+                 class="external-link button is-normal is-rounded is-dark hero-btn">
+                <span class="icon"><i class="fas fa-file-pdf"></i></span>
+                <span>Paper</span>
+              </a>
+              <a href="https://github.com/SaFoLab-WISC/DRIFT" target="_blank"
+                 class="external-link button is-normal is-rounded is-dark hero-btn">
+                <span class="icon"><i class="fab fa-github"></i></span>
+                <span>Code</span>
+              </a>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+
+
+  <!-- ==================== COMPARISON VIDEOS ==================== -->
+  <section class="section" style="padding-top:2.5rem; padding-bottom:2rem;">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered" style="margin-bottom:1.5rem;">Defense Comparison</h2>
+      <div class="columns is-variable is-3">
+        <div class="column has-text-centered">
+          <div style="border-radius:10px; overflow:hidden; box-shadow:0 8px 20px rgba(0,0,0,.12);">
+            <video controls autoplay muted loop playsinline style="width:100%; display:block;">
+              <source src="static/videos/Guard.mp4" type="video/mp4" />
+            </video>
+          </div>
+          <p style="margin-top:0.6rem; font-size:0.9rem; font-weight:600; color:var(--text-primary);">Injection Detector</p>
+        </div>
+        <div class="column has-text-centered">
+          <div style="border-radius:10px; overflow:hidden; box-shadow:0 8px 20px rgba(0,0,0,.12);">
+            <video controls autoplay muted loop playsinline style="width:100%; display:block;">
+              <source src="static/videos/CaMeL.mp4" type="video/mp4" />
+            </video>
+          </div>
+          <p style="margin-top:0.6rem; font-size:0.9rem; font-weight:600; color:var(--text-primary);">CaMeL</p>
+        </div>
+        <div class="column has-text-centered">
+          <div style="border-radius:10px; overflow:hidden; box-shadow:0 8px 20px rgba(0,0,0,.12);">
+            <video controls autoplay muted loop playsinline style="width:100%; display:block;">
+              <source src="static/videos/Progent.mp4" type="video/mp4" />
+            </video>
+          </div>
+          <p style="margin-top:0.6rem; font-size:0.9rem; font-weight:600; color:var(--text-primary);">Progent</p>
+        </div>
+        <div class="column has-text-centered">
+          <div style="border-radius:10px; overflow:hidden; box-shadow:0 8px 20px rgba(0,0,0,.12);">
+            <video controls autoplay muted loop playsinline style="width:100%; display:block;">
+              <source src="static/videos/DRIFT.mp4" type="video/mp4" />
+            </video>
+          </div>
+          <p style="margin-top:0.6rem; font-size:0.9rem; font-weight:700; color:var(--primary-color);">DRIFT (Ours)</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- ==================== ABSTRACT ==================== -->
+  <section class="section hero is-light">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered has-text-centered">
+        <div class="column is-four-fifths">
+          <h2 class="title is-3">Abstract</h2>
+          <div class="content has-text-justified">
+            <p>
+              Large Language Models (LLMs) are increasingly central to agentic systems due to their
+              strong reasoning and planning capabilities. By interacting with external environments
+              through predefined tools, these agents can carry out complex user tasks. Nonetheless,
+              this interaction also introduces the risk of <strong>prompt injection attacks</strong>, where malicious
+              inputs from external sources can mislead the agent&rsquo;s behavior, potentially resulting in
+              economic loss, privacy leakage, or system compromise.
+
+              System-level defenses have recently shown promise by enforcing static or predefined
+              policies, but they still face two key challenges: the ability to <em>dynamically update</em>
+              security rules and the need for <em>memory stream isolation</em>. To address these challenges,
+              we propose <strong>DRIFT</strong>, a <strong>D</strong>ynamic <strong>R</strong>ule-based
+              <strong>I</strong>solation <strong>F</strong>ramework for <strong>T</strong>rustworthy agentic
+              systems, which enforces both control- and data-level constraints.
+
+              A <strong>Secure Planner</strong> first constructs a minimal function trajectory and a
+              JSON-schema-style parameter checklist for each function node based on the user query.
+              A <strong>Dynamic Validator</strong> then monitors deviations from the original plan, assessing
+              whether changes comply with privilege limitations and the user&rsquo;s intent.
+              Finally, an <strong>Injection Isolator</strong> detects and masks any instructions that may
+              conflict with the user query from the memory stream to mitigate long-term risks.
+              We empirically validate the effectiveness of DRIFT on the <strong>AgentDojo</strong> and
+              <strong>ASB</strong> benchmarks, demonstrating its strong security performance while maintaining
+              high utility across diverse models&mdash;showcasing both its robustness and adaptability.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+
+
+
+  <!-- ==================== METHOD ==================== -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Method</h2>
+      <div class="columns is-centered">
+        <div class="column is-11">
+          <figure class="image" style="border-radius:14px; overflow:hidden; box-shadow:0 16px 24px -4px rgba(0,0,0,.12);">
+            <img src="static/images/modules.png"
+                 alt="Overview of DRIFT components"
+                 style="width:100%; border-radius:14px;" />
+          </figure>
+          <p class="has-text-centered" style="margin-top:1rem; color:var(--text-secondary); font-size:0.93rem;">
+            <strong>Figure 1.</strong> Overview of the Secure Planner, Dynamic Validator, and Injection Isolator.
+          </p>
+          <p class="has-text-centered" style="margin-top:1.25rem; font-size:1rem; color:var(--text-secondary); max-width:720px; margin-left:auto; margin-right:auto;">
+            <b>DRIFT</b> integrates a <em>Secure Planner</em>, a <em>Dynamic Validator</em>, and an <em>Injection Isolator</em>
+            into a unified defense pipeline that enforces both control- and data-level constraints
+            while keeping the agent memory stream free of injected content.
+          </p>
+        </div>
+      </div>
+
+      <!-- Three-column cards -->
+      <div class="columns is-multiline" style="margin-top:2rem;">
+        <div class="column is-one-third">
+          <div style="background:var(--background-secondary); border-radius:var(--border-radius-lg); padding:1.5rem; border:1px solid var(--border-color); height:100%;">
+            <h3 style="font-size:1.1rem; font-weight:700; color:var(--primary-color); margin-bottom:0.75rem;">
+              <i class="fas fa-drafting-compass" style="margin-right:0.5rem;"></i>Secure Planner
+            </h3>
+            <p style="color:var(--text-secondary); font-size:0.93rem; line-height:1.7;">
+              Runs <em>before</em> any environment interaction. Decomposes the user query into a
+              <strong>minimal function trajectory</strong> (control constraints) and a
+              <strong>JSON-schema parameter checklist</strong> (data constraints), establishing
+              clean security policies while the system is injection-free.
+            </p>
+          </div>
+        </div>
+        <div class="column is-one-third">
+          <div style="background:var(--background-secondary); border-radius:var(--border-radius-lg); padding:1.5rem; border:1px solid var(--border-color); height:100%;">
+            <h3 style="font-size:1.1rem; font-weight:700; color:var(--primary-color); margin-bottom:0.75rem;">
+              <i class="fas fa-shield-alt" style="margin-right:0.5rem;"></i>Dynamic Validator
+            </h3>
+            <p style="color:var(--text-secondary); font-size:0.93rem; line-height:1.7;">
+              Inspects each tool-call against the Planner&rsquo;s constraints at runtime.
+              Inspired by OS privilege concepts, functions are classified as
+              <strong>Read / Write / Execute</strong>. Deviations are auto-approved for Read
+              operations or assessed for intent alignment before a dynamic policy update.
+            </p>
+          </div>
+        </div>
+        <div class="column is-one-third">
+          <div style="background:var(--background-secondary); border-radius:var(--border-radius-lg); padding:1.5rem; border:1px solid var(--border-color); height:100%;">
+            <h3 style="font-size:1.1rem; font-weight:700; color:var(--primary-color); margin-bottom:0.75rem;">
+              <i class="fas fa-filter" style="margin-right:0.5rem;"></i>Injection Isolator
+            </h3>
+            <p style="color:var(--text-secondary); font-size:0.93rem; line-height:1.7;">
+              After each tool response, scans for instructions that conflict with the
+              original user query and <strong>masks them before storing in memory</strong>.
+              Prevents long-horizon accumulation of injected content that could compromise
+              future reasoning steps or other security modules.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+
+  <!-- ==================== RESULTS KEY NUMBERS ==================== -->
+  <section class="hero is-small is-light">
+    <div class="hero-body">
+      <div class="container is-max-desktop">
+        <h2 class="title is-3 has-text-centered">Key Results</h2>
+        <div class="columns is-multiline is-centered has-text-centered" style="margin-bottom:1rem;">
+          <div class="column is-3-desktop is-6-tablet">
+            <div style="background:linear-gradient(135deg,#f0fdf4,#dcfce7); border-radius:var(--border-radius-lg); padding:1.75rem 1rem; border:1px solid #bbf7d0;">
+              <div style="font-size:2.4rem; font-weight:800; color:#16a34a;">+21.8%</div>
+              <div style="font-size:0.87rem; color:var(--text-secondary); margin-top:0.4rem; font-weight:500;">Benign Utility vs. CaMeL<br><em>Stronger Functionality</em></div>
+            </div>
+          </div>
+          <div class="column is-3-desktop is-6-tablet">
+            <div style="background:linear-gradient(135deg,#f0fdf4,#dcfce7); border-radius:var(--border-radius-lg); padding:1.75rem 1rem; border:1px solid #bbf7d0;">
+              <div style="font-size:2.4rem; font-weight:800; color:#16a34a;">+12.5%</div>
+              <div style="font-size:0.87rem; color:var(--text-secondary); margin-top:0.4rem; font-weight:500;">Attacked Utility vs. CaMeL<br><em>Stronger Flexibility</em></div>
+            </div>
+          </div>
+          <div class="column is-3-desktop is-6-tablet">
+            <div style="background:linear-gradient(135deg,#eff6ff,#dbeafe); border-radius:var(--border-radius-lg); padding:1.75rem 1rem; border:1px solid #bfdbfe;">
+              <div style="font-size:2.4rem; font-weight:800; color:var(--primary-color);">1.3%</div>
+              <div style="font-size:0.87rem; color:var(--text-secondary); margin-top:0.4rem; font-weight:500;">Attack Success Rate<br><em>Stronger Security</em></div>
+            </div>
+          </div>
+          <div class="column is-3-desktop is-6-tablet">
+            <div style="background:linear-gradient(135deg,#eff6ff,#dbeafe); border-radius:var(--border-radius-lg); padding:1.75rem 1rem; border:1px solid #bfdbfe;">
+              <div style="font-size:2.4rem; font-weight:800; color:var(--primary-color);">-61.1%</div>
+              <div style="font-size:0.87rem; color:var(--text-secondary); margin-top:0.4rem; font-weight:500;">Token Cost vs. CaMeL<br><em>Lower Overhead</em></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- ==================== RESULTS FIGURES CAROUSEL ==================== -->
+  <section class="hero is-small">
+    <div class="hero-body">
+      <div class="container">
+        <h2 class="title is-3 has-text-centered">Experimental Figures</h2>
+        <div id="results-carousel" class="carousel results-carousel">
+
+          <div class="item">
+            <img src="static/images/agentdojo_main.png"
+                 alt="Comparison on AgentDojo (GPT-4o-mini)" loading="lazy" />
+            <h2 class="subtitle has-text-centered">
+              <strong>Figure 3.</strong> Defense comparison on <strong>AgentDojo</strong> (GPT-4o-mini).
+              DRIFT achieves 1.3% ASR while outperforming CaMeL by 21.8% in utility.
+            </h2>
+          </div>
+
+          <div class="item">
+            <img src="static/images/asb_main.png"
+                 alt="Comparison on ASB (GPT-4o-mini)" loading="lazy" />
+            <h2 class="subtitle has-text-centered">
+              <strong>Figure 4.</strong> Defense comparison on <strong>ASB</strong>.
+              DRIFT reaches 4.8% ASR, the best among all evaluated defenses.
+            </h2>
+          </div>
+
+          <div class="item">
+            <img src="static/images/defense_compare.png"
+                 alt="DRIFT across diverse LLMs on AgentDojo" loading="lazy" />
+            <h2 class="subtitle has-text-centered">
+              <strong>Figure 5.</strong> DRIFT adaptation across diverse LLMs.
+              Security improvements are consistent&mdash;GPT-4o drops from 51.7% to 1.5% ASR.
+            </h2>
+          </div>
+
+          <div class="item">
+            <img src="static/images/dynamic.png"
+                 alt="Static vs dynamic policy on four AgentDojo sessions" loading="lazy" />
+            <h2 class="subtitle has-text-centered">
+              <strong>Figure 6.</strong> Static vs. dynamic policy across four AgentDojo sessions.
+              DRIFT&rsquo;s dynamic policy wins in all scenarios.
+            </h2>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+
+  <!-- ==================== ABLATION ==================== -->
+  <section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Ablation Study</h2>
+      <div class="content has-text-justified" style="margin-bottom:1.5rem;">
+        <p>
+          We ablate each DRIFT component on AgentDojo (GPT-4o-mini) to understand individual contributions.
+        </p>
+      </div>
+      <div style="overflow-x: auto;">
+        <table class="table is-striped is-hoverable is-fullwidth" style="border-radius: var(--border-radius); overflow:hidden; box-shadow:var(--shadow-md);">
+          <thead style="background: var(--primary-color); color: white;">
+            <tr>
+              <th style="color:white; background:var(--primary-color);">Configuration</th>
+              <th style="color:white; background:var(--primary-color); text-align:center;">Benign Utility (%)</th>
+              <th style="color:white; background:var(--primary-color); text-align:center;">Utility Under Attack (%)</th>
+              <th style="color:white; background:var(--primary-color); text-align:center;">ASR (%)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Native Agent (ReAct)</td>
+              <td style="text-align:center;">63.55</td>
+              <td style="text-align:center;">48.27</td>
+              <td style="text-align:center; color:#dc2626; font-weight:700;">30.67</td>
+            </tr>
+            <tr>
+              <td>+ Secure Planner</td>
+              <td style="text-align:center;">37.71</td>
+              <td style="text-align:center;">32.25</td>
+              <td style="text-align:center; color:#16a34a; font-weight:700;">1.49</td>
+            </tr>
+            <tr>
+              <td>+ Planner &amp; Dynamic Validator</td>
+              <td style="text-align:center;">59.79</td>
+              <td style="text-align:center;">48.43</td>
+              <td style="text-align:center; color:#16a34a; font-weight:700;">3.66</td>
+            </tr>
+            <tr style="background: #f0fdf4;">
+              <td><strong>+ Planner &amp; Validator &amp; Isolator (DRIFT)</strong></td>
+              <td style="text-align:center;"><strong>58.48</strong></td>
+              <td style="text-align:center;"><strong>47.91</strong></td>
+              <td style="text-align:center; color:#16a34a; font-weight:700;"><strong>1.29</strong></td>
+            </tr>
+            <tr>
+              <td>+ Isolator only</td>
+              <td style="text-align:center;">54.85</td>
+              <td style="text-align:center;">47.17</td>
+              <td style="text-align:center; color:#ca8a04; font-weight:700;">7.95</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p style="color:var(--text-secondary); font-size:0.9rem; margin-top:0.75rem;">
+        Table 1. DRIFT achieves the best security (1.29% ASR) while maintaining near-baseline utility,
+        demonstrating that each component plays a complementary role.
+      </p>
+    </div>
+  </section>
+
+
+  <!-- ==================== DEMO VIDEO ==================== -->
+  <section class="section" style="padding-bottom:0;">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Full DRIFT Demo</h2>
+      <div style="border-radius:14px; overflow:hidden; box-shadow:0 16px 24px -4px rgba(0,0,0,.12); max-width:860px; margin:0 auto;">
+        <video controls autoplay muted loop playsinline
+               style="width:100%; display:block; border-radius:14px;">
+          <source src="static/videos/demo.mp4" type="video/mp4" />
+          Your browser does not support the video tag.
+        </video>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- ==================== Reference ==================== -->
+  <section class="section" id="Reference">
+    <div class="container is-max-desktop content">
+      <div class="bibtex-header">
+        <h2 class="title">Reference</h2>
+        <button class="copy-bibtex-btn" onclick="copyBibTeX()" title="Copy BibTeX to clipboard">
+          <i class="fas fa-copy"></i>
+          <span class="copy-text">Copy</span>
+        </button>
+      </div>
+      <pre id="bibtex-code"><code>@inproceedings{li2025drift,
+  title     = {DRIFT: Dynamic Rule-Based Defense with Injection Isolation for Securing LLM Agents},
+  author    = {Hao Li and Xiaogeng Liu and Hung-Chun Chiu and Dianqi Li and Ning Zhang and Chaowei Xiao},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2025},
+  url       = {https://arxiv.org/abs/2506.12104}
+}</code></pre>
+    </div>
+  </section>
+
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <div class="columns is-centered">
+        <div class="column is-8">
+          <div class="content has-text-centered">
+            <p>
+              <strong>DRIFT</strong> &mdash; NeurIPS 2025 &mdash;
+              <a href="https://arxiv.org/abs/2506.12104" target="_blank">arXiv:2506.12104</a> &mdash;
+              <a href="https://github.com/SaFoLab-WISC/DRIFT" target="_blank">
+                <i class="fab fa-github"></i> GitHub
+              </a>
+            </p>
+            <p>Contact: <a href="mailto:li.hao@wustl.edu">li.hao@wustl.edu</a></p>
+            <p style="font-size:0.85rem; color:var(--text-light); margin-top:1rem;">
+              This page was built using the
+              <a href="https://github.com/eliahuhorwitz/Academic-project-page-template" target="_blank">Academic Project Page Template</a>.
+              Licensed under <a rel="license" href="http://creativecommons.org/licenses/by-sa/4.0/" target="_blank">CC BY-SA 4.0</a>.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+</body>
+</html>
