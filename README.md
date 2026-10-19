@@ -42,10 +42,10 @@ export GOOGLE_API_KEY=your_key
 export OPENROUTER_API_KEY=your_key
 ```
 
-#### run task with no attack
+#### run task with no attack (use vllm model)
 ```bash
 python pipeline_main.py \
---model gpt-4o-mini-2024-07-18 \
+--model vllm-Qwen3Base \
 --build_constraints --injection_isolation --dynamic_validation
 --suites banking,slack,travel,workspace
 ```

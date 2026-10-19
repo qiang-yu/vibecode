@@ -52,6 +52,18 @@ def main(args, suite_type):
         tools_pipeline_name = 'gpt-4o-2024-05-13'
         logger.info(f"Using OpenAI Client: {args.model}")
 
+    elif model_name.startswith("vllm-"):
+        # support to use vllm
+        port = os.getenv("LOCAL_LLM_PORT", 19000)
+        client = OpenAIModel(
+            model=model_name.split("-", 1)[1],
+            api_key="EMPTY",
+            api_base=f"http://localhost:{port}/v1",
+            logger=logger
+        )
+        tools_pipeline_name = 'vllm_parsed'
+        logger.info(f"Using vllm_parsed Client: {args.model}")
+
     elif model_name.startswith("gemini-"):
         client = GoogleModel(model=args.model, logger=logger)
         tools_pipeline_name = args.model
