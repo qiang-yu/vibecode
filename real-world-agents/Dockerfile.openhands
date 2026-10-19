@@ -1,0 +1,5 @@
+FROM docker.openhands.dev/openhands/openhands:0.60
+
+RUN apt-get update && apt-get install -y \
+    tmux \
+    && rm -rf /var/lib/apt/lists/*

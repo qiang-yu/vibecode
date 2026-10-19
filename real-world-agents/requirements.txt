@@ -1,0 +1,3 @@
+langchain==1.0.2
+autogen-core==0.7.5
+openai-agents==0.4.2

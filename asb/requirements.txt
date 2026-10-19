@@ -1,0 +1,17 @@
+google-generativeai
+openai
+pandas==2.2.2
+protobuf==4.25.3
+pydantic==2.7.4
+Pympler==1.0.1
+click==8.1.7
+ollama
+fastapi
+torch
+transformers
+accelerate
+anthropic
+langchain_chroma
+langchain_openai
+langchain_ollama
+jsonlines
