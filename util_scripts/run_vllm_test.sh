@@ -38,4 +38,4 @@ attack_method=important_instructions
 # python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --system_message "${system_message}" --logdir ${log_dir} --attack ${attack_method}
 
 
-python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s workspace -ut user_task_0 --defense drift
+python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense drift
