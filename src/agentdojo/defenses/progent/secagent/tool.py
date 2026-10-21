@@ -262,7 +262,6 @@ def api_request(sys_prompt, user_prompt, temperature=0.0) -> None:
         else:
             client = OpenAI()
     if not _supports_openai_temperature(policy_model):
-        print("client.chat.completions.create no temperature")
         chat_completion = client.chat.completions.create(
             messages=[
                 {
@@ -278,7 +277,6 @@ def api_request(sys_prompt, user_prompt, temperature=0.0) -> None:
             seed=0,
         )
     else:
-        print("client.chat.completions.create with temperature")
         chat_completion = client.chat.completions.create(
             messages=[
                 {
@@ -294,7 +292,7 @@ def api_request(sys_prompt, user_prompt, temperature=0.0) -> None:
             temperature=temperature,
             seed=0,
         )
-    # print(chat_completion)
+    print(chat_completion)
     total_completion_tokens += chat_completion.usage.completion_tokens
     total_prompt_tokens += chat_completion.usage.prompt_tokens
     print("[Policy] tokens (completion, prompt): ", chat_completion.usage.completion_tokens, chat_completion.usage.prompt_tokens,
