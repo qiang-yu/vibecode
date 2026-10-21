@@ -132,11 +132,9 @@ def make_tools_pipeline(
             base_url=base_url,
         )
         llm = agent_pipeline.OpenAILLM(client, model.split(":")[1], None)
-        llm.name = "vllm_parsed"
         # raise ValueError("Invalid model")
 
-    if llm.name != "vllm_parsed":
-        llm.name = model.split(":")[1]
+    llm.name = model.split(":")[1]
 
     engine = _SECURITY_POLICY_ENGINES[suite]
 
@@ -173,7 +171,9 @@ def make_tools_pipeline(
         elif "anthropic" in model and (("3-7-sonnet" in model or "sonnet-4" in model) and thinking_budget_tokens):
             tools_pipeline.name = f"{model.split(':')[1]}-{thinking_budget_tokens}"
         else:
-            tools_pipeline.name = model.split(":")[1]
+            # support vllm
+            tools_pipeline.name = "vllm_parsed"
+            # tools_pipeline.name = model.split(":")[1]
         if ad_defense is not None:
             tools_pipeline.name += f"+{ad_defense}"
 
@@ -195,7 +195,9 @@ def make_tools_pipeline(
         elif "anthropic" in model and (("3-7-sonnet" in model or "sonnet-4" in model) and thinking_budget_tokens):
             tools_pipeline.name = f"{model.split(':')[1]}-{thinking_budget_tokens}+camel+secpol"
         else:
-            tools_pipeline.name = f"{model.split(':')[1]}+camel+secpol"
+            # support vllm
+            tools_pipeline.name = f"vllm_parsed+camel+secpol"
+            # tools_pipeline.name = f"{model.split(':')[1]}+camel+secpol"
         if eval_mode == MetadataEvalMode.STRICT:
             tools_pipeline.name += "+strict"
     else:
@@ -217,7 +219,9 @@ def make_tools_pipeline(
         elif "anthropic" in model and (("3-7-sonnet" in model or "sonnet-4" in model) and thinking_budget_tokens):
             tools_pipeline.name = f"{model.split(':')[1]}-{thinking_budget_tokens}+camel"
         else:
-            tools_pipeline.name = f"{model.split(':')[1]}+camel"
+            # support vllm
+            tools_pipeline.name = f"vllm_parsed+camel"
+            # tools_pipeline.name = f"{model.split(':')[1]}+camel"
 
         if q_llm:
             tools_pipeline.name += f"-q:{q_llm.split(':')[1]}"
