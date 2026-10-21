@@ -277,6 +277,7 @@ def api_request(sys_prompt, user_prompt, temperature=0.0) -> None:
             seed=0,
         )
     else:
+        print("chat_completion begin")
         chat_completion = client.chat.completions.create(
             messages=[
                 {
@@ -292,7 +293,7 @@ def api_request(sys_prompt, user_prompt, temperature=0.0) -> None:
             temperature=temperature,
             seed=0,
         )
-    print(chat_completion)
+    print(f"chat_completion end {chat_completion}")
     total_completion_tokens += chat_completion.usage.completion_tokens
     total_prompt_tokens += chat_completion.usage.prompt_tokens
     print("[Policy] tokens (completion, prompt): ", chat_completion.usage.completion_tokens, chat_completion.usage.prompt_tokens,
