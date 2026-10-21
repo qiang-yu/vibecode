@@ -459,7 +459,7 @@ def _extract_generated_policy_from_response(response_text: str):
         if generated_policy is None:
             generated_policy = extract_json(response_text)
     else:
-        print(f"extract_json ==================\n\n {response_text}")
+        print(f"extract_json ==================\n\n{response_text}\n\n==================\n\n")
         generated_policy = extract_json(response_text)
     return _normalize_generated_policy(generated_policy)
 
