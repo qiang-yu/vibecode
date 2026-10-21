@@ -1,13 +1,13 @@
 #!/bin/sh
 
-model_id="Llama3Base"
+model_id="Qwen3Base"
 # model_id="lora-model"
 # model_id="Qwen3Merge"
 
-log_dir="./A2_Attack_Llama3.3-70b_AgentDyn_02"
+log_dir="./run_vllm_test"
 mkdir -p ${log_dir}
 
-export LOCAL_LLM_PORT=19007
+export LOCAL_LLM_PORT=19000
 export LOCAL_LLM_MODEL_ID=${model_id}
 export MAX_INFERENCE_TOKENS=4096
 
@@ -38,5 +38,8 @@ attack_method=important_instructions
 # python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --system-message "${system_message}" -s workspace --logdir ${log_dir} 
 # python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --system_message "${system_message}" --logdir ${log_dir} --attack ${attack_method}
 
+# drift
+# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense drift
 
+# progent
 python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense drift

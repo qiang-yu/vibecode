@@ -252,7 +252,14 @@ def api_request(sys_prompt, user_prompt, temperature=0.0) -> None:
     if policy_model.startswith("meta-llama/") or policy_model.startswith("Qwen/"):
         client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="EMPTY")
     else:
-        client = OpenAI()
+        # policy_model support vllm server
+        port = os.getenv("LOCAL_LLM_PORT", 0)
+        if int(port) > 0:
+            base_url = f"http://localhost:{port}/v1"
+            policy_model = os.getenv("LOCAL_LLM_MODEL_ID", "NoModelID")
+            client = OpenAI(base_url=base_url, api_key="EMPTY")
+        else:
+            client = OpenAI()
     if not _supports_openai_temperature(policy_model):
         chat_completion = client.chat.completions.create(
             messages=[
