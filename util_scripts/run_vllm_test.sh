@@ -43,7 +43,7 @@ attack_method=important_instructions
 # python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense drift
 
 # progent
-python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense progent
+# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense progent
 
 # camel
 python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense camel
