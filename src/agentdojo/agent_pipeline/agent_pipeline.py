@@ -356,7 +356,11 @@ def _build_camel_pipeline(llm_name: str, defense: str) -> BasePipelineElement:
         eval_mode=MetadataEvalMode.NORMAL,
         q_llm=None,
     )
-    pipeline.name = f"{llm_name}-{defense}"
+    # support vllm 
+    if provider == "vllm":
+        pipeline.name = f"vllm_parsed-{llm_name}-{defense}"
+    else:
+        pipeline.name = f"{llm_name}-{defense}"
     return pipeline
 
 
