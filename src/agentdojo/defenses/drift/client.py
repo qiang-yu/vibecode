@@ -146,27 +146,30 @@ class OpenAIModel():
 
 
 class OpenRouterModel():
-    def __init__(self, model="gpt-4o-mini-2024-07-18", api_key=None, api_base="", api_version="2024-10-21", logger=None):
+    def __init__(self, model="gpt-4o-mini-2024-07-18", api_key=None, api_base=None, api_version="2024-10-21", logger=None):
         # OpenAI Client
-        self.api_base = api_base
-        self.api_key= api_key
+        if api_base:
+            self.api_base = api_base
+        else:
+            self.api_base = "https://openrouter.ai/api/v1"
+        self.api_key = api_key
         self.model = model
         self.logger=logger
         self.logger.info(f"Initial Model {model}")
         self.api_version = api_version
         if api_key:
-            self.client = openai.OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
+            self.client = openai.OpenAI(api_key=api_key, base_url=self.api_base)
         else:
             try:
                 self.client = openai.OpenAI(
                     api_key=os.getenv("OPENROUTER_API_KEY"),
-                    base_url="https://openrouter.ai/api/v1",
+                    base_url=self.api_base,
                     )
             except Exception as e:
                 raise ValueError(e)
 
     
-        self.logger.info(f"Using model {model}.")
+        self.logger.info(f"Using model {model} {self.api_base}")
         self.completion_tokens = 0
         self.prompt_tokens = 0
         self.total_tokens = 0

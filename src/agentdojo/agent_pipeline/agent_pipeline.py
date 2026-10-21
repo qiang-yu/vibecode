@@ -374,7 +374,13 @@ def _build_drift_pipeline(
     elif llm_name.startswith("gemini"):
         client = GoogleModel(model=llm_name, logger=drift_logger)
     else:
-        client = OpenRouterModel(model=llm_name, logger=drift_logger)
+        # suport vllm here
+        port = os.getenv("LOCAL_LLM_PORT", 0)
+        if port > 0:
+            base_url = f"http://localhost:{port}/v1"
+            client = OpenRouterModel(model=llm_name, logger=drift_logger, api_key="EMPTY", api_base=base_url)
+        else:
+            client = OpenRouterModel(model=llm_name, logger=drift_logger)
 
     drift_args = SimpleNamespace(
         dynamic_validation=True,
