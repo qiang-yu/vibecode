@@ -86,7 +86,7 @@ class Sleep(agent_pipeline.BasePipelineElement):
 
 
 def make_tools_pipeline(
-    model: KnownModelName,
+    model: str, # change from KnownModelName to str for vllm
     use_original: bool,
     replay_with_policies: bool,
     attack_name: str,
@@ -124,7 +124,15 @@ def make_tools_pipeline(
             client, model.split(":")[1], thinking_budget_tokens=thinking_budget_tokens, max_tokens=max_tokens
         )
     else:
-        raise ValueError("Invalid model")
+        # for vllm to work
+        port = os.getenv("LOCAL_LLM_PORT", 8000)
+        base_url = f"http://localhost:{port}/v1"
+        client = openai.OpenAI(
+            api_key="EMPTY",
+            base_url=base_url,
+        )
+        llm = agent_pipeline.OpenAILLM(client, model.split(":")[1], None)
+        # raise ValueError("Invalid model")
 
     llm.name = model.split(":")[1]
 

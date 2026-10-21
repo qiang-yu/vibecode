@@ -14,7 +14,7 @@ def extract_json(text, enforce_code_block=False):
     Returns:
       The parsed JSON object if extraction and parsing succeed; otherwise, None.
     """
-    # remove think tag for Qwen 
+    # remove think tag for Qwen
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     text = text.strip()
 

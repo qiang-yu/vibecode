@@ -336,9 +336,12 @@ def _build_camel_pipeline(llm_name: str, defense: str) -> BasePipelineElement:
     elif llm_name.startswith("claude"):
         provider = "anthropic"
     else:
-        raise ValueError(
-            f"'{defense}' currently supports OpenAI/Google/Anthropic models. Got model '{llm_name}'."
-        )
+        # make vllm work
+        provider = "vllm"
+        llm_name = os.getenv("LOCAL_LLM_MODEL_ID", "NoModelID")
+        # raise ValueError(
+        #     f"'{defense}' currently supports OpenAI/Google/Anthropic models. Got model '{llm_name}'."
+        # )
 
     camel_model = f"{provider}:{llm_name}"
     pipeline = make_tools_pipeline(
