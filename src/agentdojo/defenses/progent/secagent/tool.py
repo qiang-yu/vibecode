@@ -257,10 +257,12 @@ def api_request(sys_prompt, user_prompt, temperature=0.0) -> None:
         if int(port) > 0:
             base_url = f"http://localhost:{port}/v1"
             policy_model = os.getenv("LOCAL_LLM_MODEL_ID", "NoModelID")
+            print(f"Using model {policy_model} {base_url}")
             client = OpenAI(base_url=base_url, api_key="EMPTY")
         else:
             client = OpenAI()
     if not _supports_openai_temperature(policy_model):
+        print("client.chat.completions.create no temperature")
         chat_completion = client.chat.completions.create(
             messages=[
                 {
@@ -276,6 +278,7 @@ def api_request(sys_prompt, user_prompt, temperature=0.0) -> None:
             seed=0,
         )
     else:
+        print("client.chat.completions.create with temperature")
         chat_completion = client.chat.completions.create(
             messages=[
                 {
