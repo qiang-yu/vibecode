@@ -343,7 +343,7 @@ def _build_camel_pipeline(llm_name: str, defense: str) -> BasePipelineElement:
         #     f"'{defense}' currently supports OpenAI/Google/Anthropic models. Got model '{llm_name}'."
         # )
 
-    camel_model = f"{provider}:vllm_parsed-{llm_name}"
+    camel_model = f"{provider}:{llm_name}"
     pipeline = make_tools_pipeline(
         model=camel_model,
         use_original=False,

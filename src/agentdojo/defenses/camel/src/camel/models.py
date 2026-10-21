@@ -132,9 +132,11 @@ def make_tools_pipeline(
             base_url=base_url,
         )
         llm = agent_pipeline.OpenAILLM(client, model.split(":")[1], None)
+        llm.name = "vllm_parsed"
         # raise ValueError("Invalid model")
 
-    llm.name = model.split(":")[1]
+    if llm.name != "vllm_parsed":
+        llm.name = model.split(":")[1]
 
     engine = _SECURITY_POLICY_ENGINES[suite]
 
