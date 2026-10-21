@@ -376,7 +376,7 @@ def _build_drift_pipeline(
     else:
         # suport vllm here
         port = os.getenv("LOCAL_LLM_PORT", 0)
-        if port > 0:
+        if int(port) > 0:
             base_url = f"http://localhost:{port}/v1"
             client = OpenRouterModel(model=llm_name, logger=drift_logger, api_key="EMPTY", api_base=base_url)
         else:
