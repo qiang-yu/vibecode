@@ -177,7 +177,7 @@ def _supports_openai_temperature(model_name: str) -> bool:
 
 
 def api_request(sys_prompt, user_prompt, temperature=0.0) -> None:
-    global total_completion_tokens, total_prompt_tokens
+    global total_completion_tokens, total_prompt_tokens, policy_model
     if policy_model.startswith("us.anthropic.claude"):
         import boto3
 
