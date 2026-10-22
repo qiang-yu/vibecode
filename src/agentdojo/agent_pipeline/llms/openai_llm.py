@@ -274,6 +274,8 @@ class OpenAILLMToolFilter(BasePipelineElement):
             # Qwen3-8B would put <think>...</think> in content, strip it
             import re
             output_tool_list_str = re.sub(r'<think>.*?</think>', '', output["content"][0]["content"], flags=re.DOTALL)
+            if output_tool_list_str is not None:
+                output_tool_list_str = output_tool_list_str.strip()
 
         print(f"defence tool_filter: {output_tool_list_str}")
 
