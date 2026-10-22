@@ -268,9 +268,18 @@ class OpenAILLMToolFilter(BasePipelineElement):
         )
         output = _openai_to_assistant_message(completion.choices[0].message)
 
+        # for vllm use Qwen3-8B
+        output_tool_list_str = ""
+        if output["content"] is not None:
+            # Qwen3-8B would put <think>...</think> in content, strip it
+            import re
+            output_tool_list_str = re.sub(r'<think>.*?</think>', '', output["content"], flags=re.DOTALL)
+
+        print(f"defence tool_filter: {output_tool_list_str}")
+
         new_tools = {}
         for tool_name, tool in runtime.functions.items():
-            if output["content"] is not None and tool_name in get_text_content_as_str(output["content"]):
+            if tool_name in output_tool_list_str:
                 new_tools[tool_name] = tool
 
         runtime.update_functions(new_tools)
