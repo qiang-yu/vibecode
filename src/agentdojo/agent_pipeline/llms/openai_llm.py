@@ -272,11 +272,8 @@ class OpenAILLMToolFilter(BasePipelineElement):
         output_tool_list_str = ""
         if output["content"] is not None:
             # Qwen3-8B would put <think>...</think> in content, strip it
-            print(f"begin to clean think")
-            print(f"content: {output['content']}")
             import re
-            output_tool_list_str = re.sub(r'<think>.*?</think>', '', output["content"], flags=re.DOTALL)
-            print(f"end to clean think")
+            output_tool_list_str = re.sub(r'<think>.*?</think>', '', output["content"][0]["content"], flags=re.DOTALL)
 
         print(f"defence tool_filter: {output_tool_list_str}")
 
