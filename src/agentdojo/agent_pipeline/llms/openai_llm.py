@@ -84,7 +84,8 @@ def _content_blocks_to_openai_content_blocks(
 def _message_to_openai(message: ChatMessage, model_name: str) -> ChatCompletionMessageParam:
     match message["role"]:
         case "system":
-            if model_name == "qwen3-max":
+            import os
+            if model_name == "qwen3-max" or os.getenv("LOCAL_LLM_PORT"):
                 # Qwen3-Max does not support developer messages
                 return ChatCompletionSystemMessageParam(
                     role="system", content=_content_blocks_to_openai_content_blocks(message)
@@ -268,16 +269,19 @@ class OpenAILLMToolFilter(BasePipelineElement):
         )
         output = _openai_to_assistant_message(completion.choices[0].message)
 
-        # for vllm use Qwen3-8B
-        output_tool_list_str = ""
-        if output["content"] is not None:
-            # Qwen3-8B would put <think>...</think> in content, strip it
-            import re
-            output_tool_list_str = re.sub(r'<think>.*?</think>', '', output["content"][0]["content"], flags=re.DOTALL)
-            if output_tool_list_str is not None:
-                output_tool_list_str = output_tool_list_str.strip()
-
+        # for vllm: Qwen3 may put <think>...</think> in content; keep only text after the last </think>
+        raw = get_text_content_as_str(output["content"]) if output["content"] is not None else ""
+        if "</think>" in raw:
+            raw = raw.split("</think>")[-1]
+        output_tool_list_str = raw.strip()
         print(f"defence tool_filter: {output_tool_list_str}")
+
+        # write cleaned text back so the thinking does not enter the main LLM's history
+        output = ChatAssistantMessage(
+            role="assistant",
+            content=[text_content_block_from_string(output_tool_list_str)],
+            tool_calls=output["tool_calls"],
+        )
 
         new_tools = {}
         for tool_name, tool in runtime.functions.items():
