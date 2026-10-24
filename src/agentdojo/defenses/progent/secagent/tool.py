@@ -333,10 +333,13 @@ USER_QUERY: The user's query.
 Output an array of the restrictions in JSON format."""
 
 
+def _is_local_vllm() -> bool:
+    return int(os.getenv("LOCAL_LLM_PORT", 0)) > 0
+
 def get_SYS_PROMPT() -> str:
     sys_prompt = SYS_PROMPT
     output_formater = ""
-    if policy_model.startswith("o1") or policy_model.startswith("o3") or policy_model.startswith("gpt-4.1") or policy_model.startswith("gemini") or policy_model.startswith("meta-llama/") or policy_model.startswith("Qwen/") or policy_model.startswith("qwen.") or policy_model.startswith("moonshotai"):
+    if policy_model.startswith("o1") or policy_model.startswith("o3") or policy_model.startswith("gpt-4.1") or policy_model.startswith("gemini") or policy_model.startswith("meta-llama/") or policy_model.startswith("Qwen/") or policy_model.startswith("qwen.") or policy_model.startswith("moonshotai") or _is_local_vllm():
         output_formater = "\nOutput format: ```json [{\"name\": tool_name, \"args\": restrictions}, ...] ```"
     if policy_model.startswith("claude") or policy_model.startswith("us.anthropic.claude"):
         sys_prompt = sys_prompt[:-1]
@@ -396,7 +399,7 @@ def get_SYS_PROMPT_2() -> str:
     if policy_model.startswith("gpt-4o-mini"):
         sys_prompt = sys_prompt[:-1]
         output_formater = " with json block. It should be an array of dictionaries like {\"name\": tool_name, \"args\": restrictions}."
-    if policy_model.startswith("gemini") or policy_model.startswith("meta-llama/") or policy_model.startswith("Qwen/") or policy_model.startswith("qwen.") or policy_model.startswith("moonshotai"):
+    if policy_model.startswith("gemini") or policy_model.startswith("meta-llama/") or policy_model.startswith("Qwen/") or policy_model.startswith("qwen.") or policy_model.startswith("moonshotai") or _is_local_vllm():
         sys_prompt = sys_prompt[:-1]
         output_formater = " with json code block. It should be an array of dictionaries like {\"name\": tool_name, \"args\": restrictions}."
     return sys_prompt+output_formater

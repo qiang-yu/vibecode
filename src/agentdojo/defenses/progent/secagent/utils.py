@@ -14,6 +14,10 @@ def extract_json(text, enforce_code_block=False):
     Returns:
       The parsed JSON object if extraction and parsing succeed; otherwise, None.
     """
+    # gpt-oss may return content=None (e.g. tokens used up by reasoning)
+    if not text:
+        return None
+
     # remove think tag for Qwen
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     text = text.strip()

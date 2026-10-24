@@ -123,7 +123,7 @@ def _add_repo_to_syspath(repo_name: str, src_subdir: str | None = None) -> Path:
 class ProgentPolicyBootstrap(BasePipelineElement):
     def __init__(self, suite_name: str | None) -> None:
         self._tools_initialized = False
-        self._wrapped_runtime_ids: set[int] = set()
+        # self._wrapped_runtime_ids: set[int] = set()
         self.suite_name = suite_name
 
     def _apply_suite_defaults(self) -> None:
@@ -241,7 +241,11 @@ class ProgentPolicyBootstrap(BasePipelineElement):
     ) -> tuple[str, FunctionsRuntime, Env, Sequence[ChatMessage], dict]:
         if not self._tools_initialized:
             _add_repo_to_syspath("progent")
-            from secagent import update_available_tools  # type: ignore
+            # from secagent import update_available_tools  # type: ignore
+
+            from secagent import update_available_tools, reset_security_policy  # type: ignore
+            # clear policy left over from a previous suite in the same process
+            reset_security_policy(include_human_policy=True)
 
             tools = [
                 {
@@ -260,8 +264,9 @@ class ProgentPolicyBootstrap(BasePipelineElement):
 
         generate_security_policy(query)
 
-        runtime_id = id(runtime)
-        if runtime_id not in self._wrapped_runtime_ids:
+        # runtime_id = id(runtime)
+        # if runtime_id not in self._wrapped_runtime_ids:
+        if not getattr(runtime, "_progent_wrapped", False):
             _add_repo_to_syspath("progent")
             from secagent import check_tool_call, generate_update_security_policy  # type: ignore
 
@@ -283,7 +288,8 @@ class ProgentPolicyBootstrap(BasePipelineElement):
                 return result, error
 
             runtime.run_function = MethodType(guarded_run_function, runtime)
-            self._wrapped_runtime_ids.add(runtime_id)
+            # self._wrapped_runtime_ids.add(runtime_id)
+            runtime._progent_wrapped = True
 
         return query, runtime, env, messages, extra_args
 
