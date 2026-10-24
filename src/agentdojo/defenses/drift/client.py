@@ -206,6 +206,7 @@ class OpenRouterModel():
 
             elif message["role"] == "gpt":
                 message["role"] = "assistant"
+                message.pop("tool_calls", None)
 
 
         response = self.client.chat.completions.create(
