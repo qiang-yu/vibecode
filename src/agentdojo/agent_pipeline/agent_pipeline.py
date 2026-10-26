@@ -330,24 +330,25 @@ class DriftMessageAdapter(BasePipelineElement):
         return query, runtime, env, output_messages, extra_args
 
 
-def _build_camel_pipeline(llm_name: str, defense: str) -> BasePipelineElement:
+def _build_camel_pipeline(llm_name: str, defense: str, model_id: str | None = None) -> BasePipelineElement:
     _add_repo_to_syspath("camel-prompt-injection", "src")
     from camel.interpreter.interpreter import MetadataEvalMode  # type: ignore
     from camel.models import make_tools_pipeline  # type: ignore
 
-    if llm_name.startswith("gpt") or llm_name.startswith("o1") or llm_name.startswith("o3") or llm_name.startswith("o4"):
+    if llm_name == "vllm_parsed":
+        # make vllm work: use --model-id (same as the no-defense pipeline), fall back to env
+        provider = "vllm"
+        llm_name = model_id or os.getenv("LOCAL_LLM_MODEL_ID", "NoModelID")
+    elif llm_name.startswith("gpt") or llm_name.startswith("o1") or llm_name.startswith("o3") or llm_name.startswith("o4"):
         provider = "openai"
     elif llm_name.startswith("gemini"):
         provider = "google"
     elif llm_name.startswith("claude"):
         provider = "anthropic"
     else:
-        # make vllm work
-        provider = "vllm"
-        llm_name = os.getenv("LOCAL_LLM_MODEL_ID", "NoModelID")
-        # raise ValueError(
-        #     f"'{defense}' currently supports OpenAI/Google/Anthropic models. Got model '{llm_name}'."
-        # )
+        raise ValueError(
+            f"'{defense}' currently supports OpenAI/Google/Anthropic/vllm_parsed models. Got model '{llm_name}'."
+        )
 
     camel_model = f"{provider}:{llm_name}"
     pipeline = make_tools_pipeline(
@@ -584,7 +585,7 @@ class AgentPipeline(BasePipelineElement):
             if not isinstance(llm_name, str):
                 raise ValueError("'camel' defense requires a named model.")
             try:
-                return _build_camel_pipeline(llm_name, config.defense)
+                return _build_camel_pipeline(llm_name, config.defense, config.model_id)
             except ImportError as e:
                 raise ImportError(
                     "Failed to load CaMeL defense. Make sure CaMeL dependencies are installed in this environment "

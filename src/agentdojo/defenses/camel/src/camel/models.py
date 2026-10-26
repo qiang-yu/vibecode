@@ -97,7 +97,24 @@ def make_tools_pipeline(
     eval_mode: MetadataEvalMode,
     q_llm: KnownModelName | None,
 ) -> agent_pipeline.AgentPipeline:
-    if "google" in model:
+    is_vllm = model.startswith("vllm:")
+    q_llm_model = None  # quarantined LLM model object (only used for vllm)
+    if is_vllm:
+        # for vllm to work: check this FIRST, because a served model name such as
+        # "openai/gpt-oss-120b" would otherwise match the `"openai" in model` branch below
+        from pydantic_ai.models.openai import OpenAIModel
+        from pydantic_ai.providers.openai import OpenAIProvider
+
+        port = os.getenv("LOCAL_LLM_PORT", 8000)
+        base_url = f"http://localhost:{port}/v1"
+        client = openai.OpenAI(api_key="EMPTY", base_url=base_url)
+        llm = agent_pipeline.OpenAILLM(client, model.split(":", 1)[1], None)
+        # pydantic_ai cannot parse "vllm:xxx" (raises UserError: Unknown model),
+        # so give the quarantined LLM an explicit OpenAI-compatible model object
+        q_llm_model = OpenAIModel(
+            model.split(":", 1)[1], provider=OpenAIProvider(base_url=base_url, api_key="EMPTY")
+        )
+    elif "google" in model:
         # vertexai.init(project=os.getenv("GCP_PROJECT"), location=os.getenv("GCP_LOCATION"))
         # llm = GoogleLLM(model.split(":")[1])
         # client = genai.Client(vertexai=True, project=os.getenv("GCP_PROJECT"), location=os.getenv("GCP_LOCATION"))
@@ -124,17 +141,9 @@ def make_tools_pipeline(
             client, model.split(":")[1], thinking_budget_tokens=thinking_budget_tokens, max_tokens=max_tokens
         )
     else:
-        # for vllm to work
-        port = os.getenv("LOCAL_LLM_PORT", 8000)
-        base_url = f"http://localhost:{port}/v1"
-        client = openai.OpenAI(
-            api_key="EMPTY",
-            base_url=base_url,
-        )
-        llm = agent_pipeline.OpenAILLM(client, model.split(":")[1], None)
-        # raise ValueError("Invalid model")
+        raise ValueError("Invalid model")
 
-    llm.name = model.split(":")[1]
+    llm.name = model.split(":", 1)[1]
 
     engine = _SECURITY_POLICY_ENGINES[suite]
 
@@ -166,14 +175,14 @@ def make_tools_pipeline(
                 )
             )
 
-        if _is_oai_reasoning_model(model):
+        if not is_vllm and _is_oai_reasoning_model(model):
             tools_pipeline.name = f"{model.split(':')[1]}-{reasoning_effort}"
         elif "anthropic" in model and (("3-7-sonnet" in model or "sonnet-4" in model) and thinking_budget_tokens):
             tools_pipeline.name = f"{model.split(':')[1]}-{thinking_budget_tokens}"
-        else:
-            # support vllm
+        elif is_vllm:
             tools_pipeline.name = "vllm_parsed"
-            # tools_pipeline.name = model.split(":")[1]
+        else:
+            tools_pipeline.name = model.split(":")[1]
         if ad_defense is not None:
             tools_pipeline.name += f"+{ad_defense}"
 
@@ -194,10 +203,10 @@ def make_tools_pipeline(
             tools_pipeline.name = f"{model.split(':')[1]}-{reasoning_effort}+camel+secpol"
         elif "anthropic" in model and (("3-7-sonnet" in model or "sonnet-4" in model) and thinking_budget_tokens):
             tools_pipeline.name = f"{model.split(':')[1]}-{thinking_budget_tokens}+camel+secpol"
+        elif is_vllm:
+            tools_pipeline.name = "vllm_parsed+camel+secpol"
         else:
-            # support vllm
-            tools_pipeline.name = f"vllm_parsed+camel+secpol"
-            # tools_pipeline.name = f"{model.split(':')[1]}+camel+secpol"
+            tools_pipeline.name = f"{model.split(':')[1]}+camel+secpol"
         if eval_mode == MetadataEvalMode.STRICT:
             tools_pipeline.name += "+strict"
     else:
@@ -209,7 +218,7 @@ def make_tools_pipeline(
                 PrivilegedLLM(
                     llm,
                     ADNoSecurityPolicyEngine,
-                    q_llm or model,
+                    q_llm or q_llm_model or model,
                 ),
             ]
         )
@@ -218,10 +227,10 @@ def make_tools_pipeline(
             tools_pipeline.name = f"{model.split(':')[1]}-{reasoning_effort}+camel"
         elif "anthropic" in model and (("3-7-sonnet" in model or "sonnet-4" in model) and thinking_budget_tokens):
             tools_pipeline.name = f"{model.split(':')[1]}-{thinking_budget_tokens}+camel"
+        elif is_vllm:
+            tools_pipeline.name = "vllm_parsed+camel"
         else:
-            # support vllm
-            tools_pipeline.name = f"vllm_parsed+camel"
-            # tools_pipeline.name = f"{model.split(':')[1]}+camel"
+            tools_pipeline.name = f"{model.split(':')[1]}+camel"
 
         if q_llm:
             tools_pipeline.name += f"-q:{q_llm.split(':')[1]}"

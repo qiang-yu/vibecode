@@ -29,7 +29,7 @@ from agentdojo.default_suites.v1.travel.task_suite import TravelEnvironment
 from agentdojo.default_suites.v1.workspace.task_suite import (
     WorkspaceEnvironment,
 )
-from pydantic_ai.models import KnownModelName
+from pydantic_ai.models import KnownModelName, Model
 
 from camel import quarantined_llm, system_prompt_generator
 from camel.capabilities import is_trusted
@@ -191,8 +191,9 @@ def _highlight_exception_code(
     return highlighted_code
 
 
-def _get_quarantined_llm(model: KnownModelName) -> KnownModelName:
-    if "openai" in model and "o1" in model:
+def _get_quarantined_llm(model: KnownModelName | Model) -> KnownModelName | Model:
+    # model may be a pydantic_ai Model object (vllm), not a string
+    if isinstance(model, str) and "openai" in model and "o1" in model:
         return "openai:gpt-4o"
     return model
 
@@ -213,7 +214,7 @@ class PrivilegedLLM(agent_pipeline.BasePipelineElement):
         self,
         llm: agent_pipeline.BasePipelineElement,
         security_policy_engine: type[AgentDojoSecurityPolicyEngine],
-        quarantined_llm_model: KnownModelName,
+        quarantined_llm_model: KnownModelName | Model,  # Model object is used for vllm
         system_prompt_generator: Callable[
             [Iterable[functions_runtime.Function], set[str]], str
         ] = system_prompt_generator.default_system_prompt_generator,
@@ -230,7 +231,7 @@ class PrivilegedLLM(agent_pipeline.BasePipelineElement):
         self.dummy_runtime = functions_runtime.FunctionsRuntime()
         self.max_attempts = max_attempts
         # Gemini thinking and o1-* do not support JSON mode, so we fall back to base base Gemini/4o
-        self.quarantined_llm_model: KnownModelName = _get_quarantined_llm(quarantined_llm_model)
+        self.quarantined_llm_model: KnownModelName | Model = _get_quarantined_llm(quarantined_llm_model)
 
     def run_code(
         self,
