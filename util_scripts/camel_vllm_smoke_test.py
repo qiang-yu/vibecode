@@ -55,9 +55,19 @@ resp = client.chat.completions.create(
     ],
 )
 content = resp.choices[0].message.content or ""
-blocks = re.findall(r"```([a-zA-Z0-9_+\-#]*)\n(.*?)\n```", content, re.DOTALL)
-print(f"[P-LLM] finish_reason={resp.choices[0].finish_reason}  code_blocks={len(blocks)}  has_<think>={'<think>' in content}")
+pattern = r"```([a-zA-Z0-9_+\-#]*)\n(.*?)\n```"
+raw_blocks = re.findall(pattern, content, re.DOTALL)
+print(
+    f"[P-LLM] raw output: finish_reason={resp.choices[0].finish_reason}  "
+    f"code_blocks={len(raw_blocks)}  has_<think>={'<think>' in content}"
+)
+# same processing as CaMeL's privileged_llm.py: keep only text after the last </think>
+camel_content = content.split("</think>")[-1].strip() if "</think>" in content else content
+blocks = re.findall(pattern, camel_content, re.DOTALL)
+print(f"[P-LLM] what CaMeL sees: code_blocks={len(blocks)}  has_<think>={'<think>' in camel_content}")
+if "<think>" in content and "</think>" not in content:
+    print("[P-LLM] WARN -> <think> not closed, output was probably truncated; increase MAX_INFERENCE_TOKENS")
 if len(blocks) != 1:
-    print("[P-LLM] FAIL -> CaMeL requires exactly one code block. Raw content head:\n", content[:800])
+    print("[P-LLM] FAIL -> CaMeL requires exactly one code block. Content head:\n", camel_content[:800])
 else:
     print("[P-LLM] OK")
