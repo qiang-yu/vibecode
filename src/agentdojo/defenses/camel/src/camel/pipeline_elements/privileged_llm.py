@@ -325,6 +325,11 @@ class PrivilegedLLM(agent_pipeline.BasePipelineElement):
             assert code_message["role"] == "assistant"
             if code_message["content"]:
                 code = ad_types.get_text_content_as_str(code_message["content"])
+                # for vllm: Qwen3 (without --reasoning-parser) puts <think>...</think> in content.
+                # Code drafts inside the thinking would break extract_code_block ("exactly one code block")
+                # and the thinking would pile up in the P-LLM history, so keep only text after the last </think>
+                if "</think>" in code:
+                    code = code.split("</think>")[-1].strip()
             attempts -= 1
 
         if code is None or code == "":
