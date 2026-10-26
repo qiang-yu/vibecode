@@ -102,8 +102,7 @@ def make_tools_pipeline(
     if is_vllm:
         # for vllm to work: check this FIRST, because a served model name such as
         # "openai/gpt-oss-120b" would otherwise match the `"openai" in model` branch below
-        from pydantic_ai.models.openai import OpenAIModel
-        from pydantic_ai.providers.openai import OpenAIProvider
+        from camel.quarantined_llm import make_openai_compatible_model
 
         port = os.getenv("LOCAL_LLM_PORT", 8000)
         base_url = f"http://localhost:{port}/v1"
@@ -111,9 +110,7 @@ def make_tools_pipeline(
         llm = agent_pipeline.OpenAILLM(client, model.split(":", 1)[1], None)
         # pydantic_ai cannot parse "vllm:xxx" (raises UserError: Unknown model),
         # so give the quarantined LLM an explicit OpenAI-compatible model object
-        q_llm_model = OpenAIModel(
-            model.split(":", 1)[1], provider=OpenAIProvider(base_url=base_url, api_key="EMPTY")
-        )
+        q_llm_model = make_openai_compatible_model(model.split(":", 1)[1], base_url)
     elif "google" in model:
         # vertexai.init(project=os.getenv("GCP_PROJECT"), location=os.getenv("GCP_LOCATION"))
         # llm = GoogleLLM(model.split(":")[1])

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import time
 from typing import TypeVar
 
@@ -23,6 +24,20 @@ _T = TypeVar("_T")
 
 
 class NotEnoughInformationError(Exception): ...
+
+
+def make_openai_compatible_model(model_name: str, base_url: str, api_key: str = "EMPTY") -> "models.Model":
+    """Builds a pydantic_ai model for an OpenAI-compatible server (e.g. vLLM).
+
+    pydantic_ai compatibility: `OpenAIModel` was renamed to `OpenAIChatModel` in new versions.
+    """
+    try:
+        from pydantic_ai.models.openai import OpenAIChatModel as _OpenAIModel
+    except ImportError:
+        from pydantic_ai.models.openai import OpenAIModel as _OpenAIModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    return _OpenAIModel(model_name, provider=OpenAIProvider(base_url=base_url, api_key=api_key))
 
 
 _SYSTEM_PROMPT = """\
@@ -88,9 +103,15 @@ def query_quarantined_llm(
             output=(output_schema, Field(description="The requested value")),
             have_enough_information=enough_information,
         )
-    model = pydantic_ai.Agent(llm, result_type=output_model, retries=retries, system_prompt=_SYSTEM_PROMPT)
+    # pydantic_ai compatibility: old versions (e.g. 0.2.x) use `result_type` and `.data`,
+    # new versions (>=1.0) renamed them to `output_type` and `.output`
+    if "output_type" in inspect.signature(pydantic_ai.Agent.__init__).parameters:
+        model = pydantic_ai.Agent(llm, output_type=output_model, retries=retries, system_prompt=_SYSTEM_PROMPT)
+    else:
+        model = pydantic_ai.Agent(llm, result_type=output_model, retries=retries, system_prompt=_SYSTEM_PROMPT)
 
-    res = model.run_sync(query).data
+    run_result = model.run_sync(query)
+    res = run_result.output if hasattr(run_result, "output") else run_result.data
 
     if isinstance(llm, str) and "gemini" in llm and "exp" in llm:
         time.sleep(6)

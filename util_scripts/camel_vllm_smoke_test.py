@@ -14,19 +14,20 @@ import re
 import sys
 
 import openai
+import pydantic_ai
 from pydantic import BaseModel
-from pydantic_ai.models.openai import OpenAIModel
-from pydantic_ai.providers.openai import OpenAIProvider
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src", "agentdojo", "defenses", "camel", "src"))
-from camel.quarantined_llm import query_quarantined_llm  # noqa: E402
+from camel.quarantined_llm import make_openai_compatible_model, query_quarantined_llm  # noqa: E402
+
+print("pydantic_ai version:", getattr(pydantic_ai, "__version__", "unknown"))
 
 model_id = sys.argv[1] if len(sys.argv) > 1 else os.getenv("LOCAL_LLM_MODEL_ID", "Qwen3Base")
 base_url = f"http://localhost:{os.getenv('LOCAL_LLM_PORT', 8000)}/v1"
 print(f"model={model_id}  base_url={base_url}")
 
 # 1. Quarantined LLM
-q_model = OpenAIModel(model_id, provider=OpenAIProvider(base_url=base_url, api_key="EMPTY"))
+q_model = make_openai_compatible_model(model_id, base_url)
 
 
 class Contact(BaseModel):

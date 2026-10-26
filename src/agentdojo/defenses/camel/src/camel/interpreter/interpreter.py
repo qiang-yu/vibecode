@@ -2071,7 +2071,8 @@ def _eval_call(
         ret_res, args_by_keyword = evaled_fn.call(evaled_args, evaled_kwargs, namespace)
     except Exception as e:
         if isinstance(e, NotEnoughInformationError) or (
-            isinstance(e, pydantic_ai.UnexpectedModelBehavior) and "Exceeded maximum retries" in str(e)
+            # old pydantic_ai: "Exceeded maximum retries (...)"; new: "Exceeded maximum output retries (...)"
+            isinstance(e, pydantic_ai.UnexpectedModelBehavior) and "Exceeded maximum" in str(e)
         ):
             return EvalResult(
                 result.Error(
