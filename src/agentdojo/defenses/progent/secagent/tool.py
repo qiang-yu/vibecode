@@ -580,9 +580,18 @@ class ValidationError(Exception):
     pass
 
 
+_ARRAY_SCHEMA_KEYS = {"items", "prefixItems", "contains", "minItems", "maxItems", "uniqueItems"}
+
+
 def check_arg(arg_name, value, restriction) -> None:
     if isinstance(restriction, dict):
-        validate(instance=value, schema=restriction)
+        # policy model may put element restrictions (enum/pattern) on the array itself;
+        # in that case apply them to each element
+        if isinstance(value, list) and restriction.get("type") != "array" and not (_ARRAY_SCHEMA_KEYS & restriction.keys()):
+            for item in value:
+                validate(instance=item, schema=restriction)
+        else:
+            validate(instance=value, schema=restriction)
     elif isinstance(restriction, str):
         if not re.match(restriction, value):
             raise ValidationError(f"Invalid value for argument '{arg_name}' value '{value}', the allowed value is '{restriction}'")
