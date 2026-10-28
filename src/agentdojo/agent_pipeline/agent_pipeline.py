@@ -622,12 +622,17 @@ class AgentPipeline(BasePipelineElement):
                 [
                     system_message_component,
                     init_query_component,
-                    OpenAILLMToolFilter(TOOL_FILTER_PROMPT, llm.client, llm_name),
+                    # use the served model id (for vllm_parsed, llm_name is just "vllm_parsed")
+                    OpenAILLMToolFilter(TOOL_FILTER_PROMPT, llm.client, llm.model),
                     llm,
                     tools_loop,
                 ]
             )
-            pipeline.name = f"{llm_name}-{config.defense}"
+            if llm_name == "vllm_parsed":
+                # include model id so different local models do not share logs/cached results
+                pipeline.name = f"vllm_parsed-{llm.model}-{config.defense}"
+            else:
+                pipeline.name = f"{llm_name}-{config.defense}"
             return pipeline
         if config.defense == "transformers_pi_detector" or config.defense == "piguard_detector" or config.defense == "prompt_guard_2_detector":
             if config.defense == "transformers_pi_detector":
