@@ -206,7 +206,11 @@ class OpenRouterModel():
 
             elif message["role"] == "gpt":
                 message["role"] = "assistant"
-                message.pop("tool_calls", None)
+                # Only strip tool_calls for local vLLM: open-source chat templates would re-render them
+                # (duplicate <tool_call> / dropped content). Hosted APIs behind OpenRouter require
+                # every tool message to pair with a preceding tool_calls entry, so keep them there.
+                if "openrouter.ai" not in self.api_base:
+                    message.pop("tool_calls", None)
 
 
         response = self.client.chat.completions.create(
