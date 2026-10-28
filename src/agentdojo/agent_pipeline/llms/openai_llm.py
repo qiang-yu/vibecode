@@ -255,6 +255,13 @@ class OpenAILLMToolFilter(BasePipelineElement):
         messages = [*messages, ChatUserMessage(role="user", content=[text_content_block_from_string(self.prompt)])]
         openai_messages = [_message_to_openai(message, self.model) for message in messages]
         openai_tools = [_function_to_openai(tool) for tool in runtime.functions.values()]
+        # vLLM < 0.10 drops `tools` from the prompt when tool_choice="none", so the model never sees
+        # the tool list. Pass them again via chat_template_kwargs so the model's own chat template
+        # still renders them (tool-call parsing stays disabled because tool_choice is "none").
+        import os
+        extra_body = None
+        if os.getenv("LOCAL_LLM_PORT") and openai_tools:
+            extra_body = {"chat_template_kwargs": {"tools": [dict(t) for t in openai_tools]}}
         completion = self.client.chat.completions.create(
             model=self.model,
             messages=openai_messages,
@@ -266,6 +273,7 @@ class OpenAILLMToolFilter(BasePipelineElement):
                 else NOT_GIVEN
             ),
             reasoning_effort=self.reasoning_effort or NOT_GIVEN,
+            extra_body=extra_body,
         )
         output = _openai_to_assistant_message(completion.choices[0].message)
 
