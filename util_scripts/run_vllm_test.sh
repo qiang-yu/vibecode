@@ -58,8 +58,14 @@ attack_method=important_instructions
 # python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense tool_filter
 
 # transformer detector model
-python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense transformers_pi_detector
+# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense transformers_pi_detector
 
 # python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense piguard_detector
 
 # python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense prompt_guard_2_detector
+
+# spotlighting_with_delimiting
+# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense spotlighting_with_delimiting
+
+# repeat_user_prompt
+python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense repeat_user_prompt
