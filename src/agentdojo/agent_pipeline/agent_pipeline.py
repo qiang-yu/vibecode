@@ -428,6 +428,22 @@ def _get_local_model_id(port) -> str:
     return model_name
 
 
+def _pipeline_name(llm_name: str, llm: BasePipelineElement, defense: str | None = None) -> str:
+    """Name of a pipeline, used as the log directory and for attack model-name lookup.
+
+    For `vllm_parsed`, `llm_name` is the same for every locally served model, so the served model id is
+    included. Otherwise results of different local models (Qwen3-8B, Llama-3.3-70B, gpt-oss-120b, ...)
+    would be written to (and skipped from) the same log directory. The name must still contain
+    "vllm_parsed" so `get_model_name_from_pipeline` can resolve it.
+    """
+    base = llm_name
+    if llm_name == "vllm_parsed":
+        served_model = getattr(llm, "model", None)
+        if served_model:
+            base = f"vllm_parsed-{served_model}"
+    return f"{base}-{defense}" if defense else base
+
+
 def get_llm(provider: str, model: str, model_id: str | None, tool_delimiter: str) -> BasePipelineElement:
     if provider == "openai":
         client = openai.OpenAI()
@@ -579,7 +595,7 @@ class AgentPipeline(BasePipelineElement):
         if config.defense is None:
             tools_loop = ToolsExecutionLoop([ToolsExecutor(tool_output_formatter), llm])
             pipeline = cls([system_message_component, init_query_component, llm, tools_loop])
-            pipeline.name = llm_name
+            pipeline.name = _pipeline_name(llm_name, llm)
             return pipeline
         if config.defense == "camel":
             if not isinstance(llm_name, str):
@@ -595,7 +611,9 @@ class AgentPipeline(BasePipelineElement):
             if not isinstance(llm_name, str):
                 raise ValueError("'drift' defense requires a named model.")
             try:
-                return _build_drift_pipeline(llm_name, tool_output_formatter)
+                pipeline = _build_drift_pipeline(llm_name, tool_output_formatter)
+                pipeline.name = _pipeline_name(llm_name, llm, config.defense)
+                return pipeline
             except ImportError as e:
                 raise ImportError(
                     "Failed to load DRIFT defense. Make sure dependencies are installed in this environment "
@@ -610,7 +628,7 @@ class AgentPipeline(BasePipelineElement):
                 llm,
                 tools_loop,
             ])
-            pipeline.name = f"{llm_name}-{config.defense}"
+            pipeline.name = _pipeline_name(llm_name, llm, config.defense)
             return pipeline
         if config.defense == "tool_filter":
             tools_loop = ToolsExecutionLoop([ToolsExecutor(tool_output_formatter), llm])
@@ -628,11 +646,7 @@ class AgentPipeline(BasePipelineElement):
                     tools_loop,
                 ]
             )
-            if llm_name == "vllm_parsed":
-                # include model id so different local models do not share logs/cached results
-                pipeline.name = f"vllm_parsed-{llm.model}-{config.defense}"
-            else:
-                pipeline.name = f"{llm_name}-{config.defense}"
+            pipeline.name = _pipeline_name(llm_name, llm, config.defense)
             return pipeline
         if config.defense == "transformers_pi_detector" or config.defense == "piguard_detector" or config.defense == "prompt_guard_2_detector":
             if config.defense == "transformers_pi_detector":
@@ -665,12 +679,12 @@ class AgentPipeline(BasePipelineElement):
                     tools_loop,
                 ]
             )
-            pipeline.name = f"{llm_name}-{config.defense}"
+            pipeline.name = _pipeline_name(llm_name, llm, config.defense)
             return pipeline
         if config.defense == "repeat_user_prompt":
             tools_loop = ToolsExecutionLoop([ToolsExecutor(tool_output_formatter), InitQuery(), llm])
             pipeline = cls([system_message_component, init_query_component, llm, tools_loop])
-            pipeline.name = f"{llm_name}-{config.defense}"
+            pipeline.name = _pipeline_name(llm_name, llm, config.defense)
             return pipeline
         if config.defense == "spotlighting_with_delimiting":
             # Defense from https://arxiv.org/abs/2403.14720
@@ -682,6 +696,6 @@ class AgentPipeline(BasePipelineElement):
             delimited_tool_output_formatter = lambda result: f"<<{tool_output_formatter(result)}>>"
             tools_loop = ToolsExecutionLoop([ToolsExecutor(tool_output_formatter=delimited_tool_output_formatter), llm])
             pipeline = cls([system_message_component, init_query_component, llm, tools_loop])
-            pipeline.name = f"{llm_name}-{config.defense}"
+            pipeline.name = _pipeline_name(llm_name, llm, config.defense)
             return pipeline
         raise ValueError("Invalid defense name")

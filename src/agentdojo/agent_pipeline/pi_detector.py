@@ -1,3 +1,4 @@
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -126,6 +127,14 @@ class TransformersBasedPIDetector(PromptInjectionDetector):
             an input is classified as a prompt injection.
         mode: The mode in which the detector should operate. It can be 'message' or 'full_conversation'.
         raise_on_injection: Whether to raise an exception if a prompt injection is detected.
+        max_length: Maximum number of tokens (including special tokens) fed to the classifier at once.
+            Longer inputs are split into chunks instead of being truncated, so an injection hidden at the end
+            of a long tool output is still seen by the detector.
+        chunk_overlap: Number of tokens shared by consecutive chunks.
+        batch_size: Batch size used when classifying the chunks of one input.
+
+    The device is taken from the `DETECTOR_DEVICE` environment variable (e.g. `cuda:3`, `cpu`).
+    It defaults to `cuda:0` if CUDA is available, otherwise `cpu`.
     """
 
     def __init__(
@@ -135,6 +144,9 @@ class TransformersBasedPIDetector(PromptInjectionDetector):
         threshold: float = 0.5,
         mode: Literal["message", "full_conversation"] = "message",
         raise_on_injection: bool = False,
+        max_length: int = 512,
+        chunk_overlap: int = 32,
+        batch_size: int = 8,
     ) -> None:
         super().__init__(mode=mode, raise_on_injection=raise_on_injection)
 
@@ -150,12 +162,42 @@ class TransformersBasedPIDetector(PromptInjectionDetector):
         self.model_name = model_name
         self.safe_label = safe_label
         self.threshold = threshold
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = batch_size
+        device_name = os.getenv("DETECTOR_DEVICE") or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        device = torch.device(device_name)
         self.pipeline = pipeline("text-classification", model=self.model_name, device=device, trust_remote_code=True)
 
+        # Never exceed what the model supports; some tokenizers report a huge model_max_length.
+        model_limit = getattr(self.pipeline.model.config, "max_position_embeddings", None)
+        tokenizer_limit = self.pipeline.tokenizer.model_max_length
+        limits = [x for x in (max_length, model_limit, tokenizer_limit) if isinstance(x, int) and 0 < x < 1_000_000]
+        self.max_length = min(limits)
+        n_special = self.pipeline.tokenizer.num_special_tokens_to_add(pair=False)
+        self._chunk_size = max(self.max_length - n_special, 1)
+        self._chunk_step = max(self._chunk_size - max(chunk_overlap, 0), 1)
+
+    def _split(self, text: str) -> list[str]:
+        """Splits `text` into overlapping chunks that fit in the model's context window."""
+        tokenizer = self.pipeline.tokenizer
+        ids: list[int] = tokenizer(text, add_special_tokens=False, truncation=False, verbose=False)["input_ids"]
+        if len(ids) <= self._chunk_size:
+            return [text]
+        chunks = []
+        for start in range(0, len(ids), self._chunk_step):
+            chunks.append(tokenizer.decode(ids[start : start + self._chunk_size], skip_special_tokens=True))
+            if start + self._chunk_size >= len(ids):
+                break
+        return chunks
+
     def detect(self, tool_output: str) -> tuple[bool, float]:
-        result: dict = self.pipeline(tool_output)[0]  # type: ignore
-        safety_score: float = result["score"] if result["label"].lower() == self.safe_label.lower() else 1 - result["score"]
+        chunks = self._split(tool_output)
+        results: list[dict] = self.pipeline(  # type: ignore
+            chunks, batch_size=self.batch_size, truncation=True, max_length=self.max_length
+        )
+        # An input is as unsafe as its most suspicious chunk.
+        safety_score: float = min(
+            r["score"] if r["label"].lower() == self.safe_label.lower() else 1 - r["score"] for r in results
+        )
         is_injection: bool = safety_score < self.threshold
 
         return is_injection, safety_score
