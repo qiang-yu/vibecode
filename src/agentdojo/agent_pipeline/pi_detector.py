@@ -9,6 +9,27 @@ from agentdojo.functions_runtime import EmptyEnv, Env, FunctionsRuntime
 from agentdojo.types import ChatMessage, MessageContentBlock, get_text_content_as_str, text_content_block_from_string
 
 
+def resolve_detector_model_path(model_name: str) -> str:
+    """Returns where to load a detector model from.
+
+    If the `DETECTOR_MODEL_DIR` environment variable is set, the model is loaded from
+    `$DETECTOR_MODEL_DIR/<model_name>` (e.g. `/home/me/HuggingFace/protectai/deberta-v3-base-prompt-injection-v2`),
+    which is useful on machines without internet access. A missing directory raises an error instead of
+    silently falling back to the hub. If the variable is not set, `model_name` is returned unchanged and the
+    model is resolved through the Hugging Face hub / cache as usual.
+    """
+    model_dir = os.getenv("DETECTOR_MODEL_DIR")
+    if not model_dir:
+        return model_name
+    path = os.path.join(os.path.expanduser(model_dir), model_name)
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            f"DETECTOR_MODEL_DIR is set to '{model_dir}' but the model directory '{path}' does not exist. "
+            f"Download '{model_name}' there first (e.g. with `huggingface-cli download {model_name} --local-dir {path}`)."
+        )
+    return path
+
+
 @dataclass
 class DetectorTask:
     index: int
@@ -135,6 +156,9 @@ class TransformersBasedPIDetector(PromptInjectionDetector):
 
     The device is taken from the `DETECTOR_DEVICE` environment variable (e.g. `cuda:3`, `cpu`).
     It defaults to `cuda:0` if CUDA is available, otherwise `cpu`.
+
+    If `DETECTOR_MODEL_DIR` is set, the model is loaded from `$DETECTOR_MODEL_DIR/<model_name>` instead of
+    the Hugging Face hub (see [`resolve_detector_model_path`][agentdojo.agent_pipeline.pi_detector.resolve_detector_model_path]).
     """
 
     def __init__(
@@ -165,7 +189,8 @@ class TransformersBasedPIDetector(PromptInjectionDetector):
         self.batch_size = batch_size
         device_name = os.getenv("DETECTOR_DEVICE") or ("cuda:0" if torch.cuda.is_available() else "cpu")
         device = torch.device(device_name)
-        self.pipeline = pipeline("text-classification", model=self.model_name, device=device, trust_remote_code=True)
+        model_path = resolve_detector_model_path(self.model_name)
+        self.pipeline = pipeline("text-classification", model=model_path, device=device, trust_remote_code=True)
 
         # Never exceed what the model supports; some tokenizers report a huge model_max_length.
         model_limit = getattr(self.pipeline.model.config, "max_position_embeddings", None)
