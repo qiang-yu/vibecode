@@ -12,7 +12,7 @@ export LOCAL_LLM_MODEL_ID=${model_id}
 export SECAGENT_POLICY_MODEL=${model_id}
 export MAX_INFERENCE_TOKENS=4096
 # device for the HF-based PI detectors (default: cuda:0 if available, else cpu), e.g. cuda:7 or cpu
-export DETECTOR_DEVICE=${DETECTOR_DEVICE:-cuda:0}
+export DETECTOR_DEVICE="cuda:0"
 # PI detector models are loaded from $DETECTOR_MODEL_DIR/<org>/<name>, no internet needed
 export DETECTOR_MODEL_DIR=/home/qiangyu/HuggingFace
 export HF_HUB_OFFLINE=1
@@ -55,9 +55,11 @@ attack_method=important_instructions
 
 
 # tool filter
-python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense tool_filter
+# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense tool_filter
 
-# prompt injection detectors (run locally with transformers, not through vllm)
-# for d in transformers_pi_detector piguard_detector prompt_guard_2_detector; do
-#   python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} --defense $d
-# done
+# transformer detector model
+python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense transformers_pi_detector
+
+# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense piguard_detector
+
+# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense prompt_guard_2_detector
