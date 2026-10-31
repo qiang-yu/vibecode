@@ -61,7 +61,7 @@ set -o pipefail
 set -m   # Job control: each background pipeline gets its own process group
 
 # Maximum number of concurrent tasks
-run_in_parallel=3
+run_in_parallel=4
 suites=(workspace banking travel slack github shopping dailylife)
 
 # Cleanup: kill every background process group on Ctrl+C / SIGTERM
@@ -96,5 +96,8 @@ done
 # 2. Wait for all remaining background jobs to finish
 wait
 
-# 3. Final full run, printing to screen and saving to all.log
+# 3. move all error task out and run it again
+python move_error_results.py  ${log_dir} --move
+
+# 4. Final full run, printing to screen and saving to all.log
 "${cmd[@]}" 2>&1 | tee "${log_dir}/all.log"
