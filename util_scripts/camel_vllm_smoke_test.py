@@ -1,7 +1,8 @@
 """Quick smoke test for the CaMeL defense against a local vLLM server.
 
 Run it BEFORE a full benchmark, once per model:
-    export LOCAL_LLM_PORT=19000
+    export LOCAL_LLM_URL=http://localhost:19000/v1
+    export LOCAL_LLM_KEY=NOKEY   # optional
     python util_scripts/camel_vllm_smoke_test.py Qwen3Base
 
 It checks the two LLM calls CaMeL makes:
@@ -23,11 +24,12 @@ from camel.quarantined_llm import make_openai_compatible_model, query_quarantine
 print("pydantic_ai version:", getattr(pydantic_ai, "__version__", "unknown"))
 
 model_id = sys.argv[1] if len(sys.argv) > 1 else os.getenv("LOCAL_LLM_MODEL_ID", "Qwen3Base")
-base_url = f"http://localhost:{os.getenv('LOCAL_LLM_PORT', 8000)}/v1"
+base_url = (os.getenv("LOCAL_LLM_URL") or f"http://localhost:{os.getenv('LOCAL_LLM_PORT', 8000)}/v1").rstrip("/")
+api_key = os.getenv("LOCAL_LLM_KEY") or "EMPTY"
 print(f"model={model_id}  base_url={base_url}")
 
 # 1. Quarantined LLM
-q_model = make_openai_compatible_model(model_id, base_url)
+q_model = make_openai_compatible_model(model_id, base_url, api_key)
 
 
 class Contact(BaseModel):
@@ -44,7 +46,7 @@ except Exception as e:
     print("[Q-LLM] FAIL ->", type(e).__name__, e)
 
 # 2. Privileged LLM
-client = openai.OpenAI(api_key="EMPTY", base_url=base_url)
+client = openai.OpenAI(api_key=api_key, base_url=base_url)
 resp = client.chat.completions.create(
     model=model_id,
     temperature=0.0,

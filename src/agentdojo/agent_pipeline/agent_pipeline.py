@@ -33,6 +33,14 @@ from agentdojo.agent_pipeline.tool_execution import (
     tool_result_to_str,
 )
 from agentdojo.functions_runtime import EmptyEnv, Env, FunctionsRuntime
+from agentdojo.local_llm_config import (
+    fetch_local_llm_model_id,
+    get_local_llm_key,
+    get_local_llm_model_id,
+    get_local_llm_url,
+    get_local_llm_url_or_default,
+    is_local_llm_configured,
+)
 from agentdojo.logging import Logger
 from agentdojo.models import MODEL_PROVIDERS, ModelsEnum
 from agentdojo.types import ChatMessage, text_content_block_from_string
@@ -338,7 +346,7 @@ def _build_camel_pipeline(llm_name: str, defense: str, model_id: str | None = No
     if llm_name == "vllm_parsed":
         # make vllm work: use --model-id (same as the no-defense pipeline), fall back to env
         provider = "vllm"
-        llm_name = model_id or os.getenv("LOCAL_LLM_MODEL_ID", "NoModelID")
+        llm_name = get_local_llm_model_id(model_id) or "NoModelID"
     elif llm_name.startswith("gpt") or llm_name.startswith("o1") or llm_name.startswith("o3") or llm_name.startswith("o4"):
         provider = "openai"
     elif llm_name.startswith("gemini"):
@@ -374,6 +382,7 @@ def _build_camel_pipeline(llm_name: str, defense: str, model_id: str | None = No
 def _build_drift_pipeline(
     llm_name: str,
     tool_output_formatter: Callable,
+    model_id: str | None = None,
 ) -> BasePipelineElement:
     _add_repo_to_syspath("DRIFT")
     from client import GoogleModel, OpenAIModel, OpenRouterModel  # type: ignore
@@ -389,11 +398,11 @@ def _build_drift_pipeline(
         client = GoogleModel(model=llm_name, logger=drift_logger)
     else:
         # suport vllm here
-        port = os.getenv("LOCAL_LLM_PORT", 0)
-        if int(port) > 0:
-            base_url = f"http://localhost:{port}/v1"
-            model_id = os.getenv("LOCAL_LLM_MODEL_ID", "NoModelID")
-            client = OpenRouterModel(model=model_id, logger=drift_logger, api_key="EMPTY", api_base=base_url)
+        if is_local_llm_configured():
+            base_url = get_local_llm_url()
+            # --model-id wins over LOCAL_LLM_MODEL_ID
+            model_id = get_local_llm_model_id(model_id) or "NoModelID"
+            client = OpenRouterModel(model=model_id, logger=drift_logger, api_key=get_local_llm_key(), api_base=base_url)
         else:
             client = OpenRouterModel(model=llm_name, logger=drift_logger)
 
@@ -418,12 +427,8 @@ def load_system_message(system_message_name: str | None) -> str:
     return system_messages.get(system_message_name, system_messages["default"])
 
 
-def _get_local_model_id(port) -> str:
-    url = f"http://localhost:{port}/v1/models"
-    response = requests.get(url)
-    response.raise_for_status()
-    data = response.json()
-    model_name = data["data"][0]["id"]
+def _get_local_model_id() -> str:
+    model_name = fetch_local_llm_model_id()
     logging.info(f"Using model: {model_name}")
     return model_name
 
@@ -492,24 +497,22 @@ def get_llm(provider: str, model: str, model_id: str | None, tool_delimiter: str
         client = genai.Client(vertexai=True, project=os.getenv("GCP_PROJECT"), location=os.getenv("GCP_LOCATION"))
         llm = GoogleLLM(model, client)
     elif provider == "local":
-        port = os.getenv("LOCAL_LLM_PORT", 8000)
         client = openai.OpenAI(
-            api_key="EMPTY",
-            base_url=f"http://localhost:{port}/v1",
+            api_key=get_local_llm_key(),
+            base_url=get_local_llm_url_or_default(),
         )
-        if model_id is None:
-            model_id = _get_local_model_id(port)
+        # --model-id > LOCAL_LLM_MODEL_ID > ask the server
+        model_id = get_local_llm_model_id(model_id) or _get_local_model_id()
         logging.info(f"Using local model: {model_id}")
         logging.info(f"Using tool delimiter: {tool_delimiter}")
         llm = LocalLLM(client, model_id, tool_delimiter=tool_delimiter)
     elif provider == "vllm_parsed":
-        port = os.getenv("LOCAL_LLM_PORT", 8000)
         client = openai.OpenAI(
-            api_key="EMPTY",
-            base_url=f"http://localhost:{port}/v1",
+            api_key=get_local_llm_key(),
+            base_url=get_local_llm_url_or_default(),
         )
-        # llm = OpenAILLM(client, _get_local_model_id(port))
-        # use model_id instead
+        # --model-id > LOCAL_LLM_MODEL_ID > ask the server
+        model_id = get_local_llm_model_id(model_id) or _get_local_model_id()
         llm = OpenAILLM(client, model_id)
     else:
         raise ValueError("Invalid provider")
@@ -575,6 +578,10 @@ class AgentPipeline(BasePipelineElement):
     @classmethod
     def from_config(cls, config: PipelineConfig) -> Self:
         """Creates a pipeline for a given model and defense."""
+        # --model-id takes precedence over LOCAL_LLM_MODEL_ID; components that only read the env var
+        # (e.g. the progent policy model) then agree with the pipeline's LLM.
+        if config.model_id and isinstance(config.llm, str) and config.llm in ("vllm_parsed", "local"):
+            os.environ["LOCAL_LLM_MODEL_ID"] = config.model_id
         # TODO: make this more elegant
         llm = (
             get_llm(MODEL_PROVIDERS[ModelsEnum(config.llm)], config.llm, config.model_id, config.tool_delimiter)
@@ -611,7 +618,7 @@ class AgentPipeline(BasePipelineElement):
             if not isinstance(llm_name, str):
                 raise ValueError("'drift' defense requires a named model.")
             try:
-                pipeline = _build_drift_pipeline(llm_name, tool_output_formatter)
+                pipeline = _build_drift_pipeline(llm_name, tool_output_formatter, config.model_id)
                 pipeline.name = _pipeline_name(llm_name, llm, config.defense)
                 return pipeline
             except ImportError as e:

@@ -5,6 +5,7 @@ import anthropic
 import openai
 from agentdojo import agent_pipeline, functions_runtime
 from agentdojo.agent_pipeline.agent_pipeline import load_system_message
+from agentdojo.local_llm_config import get_local_llm_key, get_local_llm_url_or_default
 from agentdojo.models import MODEL_NAMES
 from google import genai
 from openai.types.chat import ChatCompletionReasoningEffort
@@ -104,13 +105,13 @@ def make_tools_pipeline(
         # "openai/gpt-oss-120b" would otherwise match the `"openai" in model` branch below
         from camel.quarantined_llm import make_openai_compatible_model
 
-        port = os.getenv("LOCAL_LLM_PORT", 8000)
-        base_url = f"http://localhost:{port}/v1"
-        client = openai.OpenAI(api_key="EMPTY", base_url=base_url)
+        base_url = get_local_llm_url_or_default()
+        api_key = get_local_llm_key()
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
         llm = agent_pipeline.OpenAILLM(client, model.split(":", 1)[1], None)
         # pydantic_ai cannot parse "vllm:xxx" (raises UserError: Unknown model),
         # so give the quarantined LLM an explicit OpenAI-compatible model object
-        q_llm_model = make_openai_compatible_model(model.split(":", 1)[1], base_url)
+        q_llm_model = make_openai_compatible_model(model.split(":", 1)[1], base_url, api_key)
     elif "google" in model:
         # vertexai.init(project=os.getenv("GCP_PROJECT"), location=os.getenv("GCP_LOCATION"))
         # llm = GoogleLLM(model.split(":")[1])

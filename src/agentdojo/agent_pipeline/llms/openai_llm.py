@@ -23,6 +23,7 @@ from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wai
 
 from agentdojo.agent_pipeline.base_pipeline_element import BasePipelineElement
 from agentdojo.functions_runtime import EmptyEnv, Env, Function, FunctionCall, FunctionsRuntime
+from agentdojo.local_llm_config import is_local_llm_configured
 from agentdojo.types import (
     ChatAssistantMessage,
     ChatMessage,
@@ -85,7 +86,7 @@ def _message_to_openai(message: ChatMessage, model_name: str) -> ChatCompletionM
     match message["role"]:
         case "system":
             import os
-            if model_name == "qwen3-max" or os.getenv("LOCAL_LLM_PORT"):
+            if model_name == "qwen3-max" or is_local_llm_configured():
                 # Qwen3-Max does not support developer messages
                 return ChatCompletionSystemMessageParam(
                     role="system", content=_content_blocks_to_openai_content_blocks(message)
@@ -260,7 +261,7 @@ class OpenAILLMToolFilter(BasePipelineElement):
         # still renders them (tool-call parsing stays disabled because tool_choice is "none").
         import os
         extra_body = None
-        if os.getenv("LOCAL_LLM_PORT") and openai_tools:
+        if is_local_llm_configured() and openai_tools:
             extra_body = {"chat_template_kwargs": {"tools": [dict(t) for t in openai_tools]}}
         completion = self.client.chat.completions.create(
             model=self.model,

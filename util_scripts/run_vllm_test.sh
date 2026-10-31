@@ -7,12 +7,16 @@ model_id="Qwen3Base"
 log_dir="./run_vllm_test"
 mkdir -p ${log_dir}
 
-export LOCAL_LLM_PORT=19000
-export LOCAL_LLM_MODEL_ID=${model_id}
+# full control of the vllm (OpenAI-compatible) server
+export LOCAL_LLM_URL="http://localhost:19000/v1"
+export LOCAL_LLM_MODEL_ID=${model_id}   # the command line option --model-id takes precedence over it
+export LOCAL_LLM_KEY="EMPTY"            # sent as the api key; only checked if vllm serve was started with --api-key
+
 export SECAGENT_POLICY_MODEL=${model_id}
-export MAX_INFERENCE_TOKENS=4096
+export MAX_INFERENCE_TOKENS=8192
+
 # device for the HF-based PI detectors (default: cuda:0 if available, else cpu), e.g. cuda:7 or cpu
-export DETECTOR_DEVICE="cuda:0"
+export DETECTOR_DEVICE="cpu" # "cuda:0"
 # PI detector models are loaded from $DETECTOR_MODEL_DIR/<org>/<name>, no internet needed
 export DETECTOR_MODEL_DIR=/home/qiangyu/HuggingFace
 export HF_HUB_OFFLINE=1
@@ -44,28 +48,53 @@ attack_method=important_instructions
 # python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --system-message "${system_message}" -s workspace --logdir ${log_dir} 
 # python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --system_message "${system_message}" --logdir ${log_dir} --attack ${attack_method}
 
-# drift
-# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense drift
+# drift, progent, camel, tool_filter
+# transformers_pi_detector, piguard_detector, prompt_guard_2_detector
+# spotlighting_with_delimiting, repeat_user_prompt
+defense_method=transformers_pi_detector
 
-# progent
-# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense progent
+# defense
+#cmd=(python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id "${model_id}"  --logdir "${log_dir}" --defense "${defense_method}")
+cmd=(python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id "${model_id}" --logdir "${log_dir}" --attack "${attack_method}"  --defense "${defense_method}")
 
-# camel
-# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense camel
+set -o pipefail
+set -m   # Job control: each background pipeline gets its own process group
 
+# Maximum number of concurrent tasks
+run_in_parallel=3
+suites=(workspace banking travel slack github shopping dailylife)
 
-# tool filter
-# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense tool_filter
+# Cleanup: kill every background process group on Ctrl+C / SIGTERM
+cleanup() {
+    trap '' INT TERM            # Ignore further signals during cleanup
+    echo -e "\n[!] Interrupted. Killing all background process groups..."
+    # Send SIGTERM to each job's process group (PGID == PID of the group leader)
+    for pgid in $(jobs -p); do
+        kill -TERM -- "-${pgid}" 2>/dev/null
+    done
+    sleep 2
+    # Force-kill anything that is still alive
+    for pgid in $(jobs -p); do
+        kill -KILL -- "-${pgid}" 2>/dev/null
+    done
+    wait 2>/dev/null
+    exit 130
+}
+trap cleanup INT TERM
 
-# transformer detector model
-# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense transformers_pi_detector
+# 1. Run the suites in parallel, capped at ${run_in_parallel} concurrent jobs
+for s in "${suites[@]}"; do
+    # Concurrency control: block until a slot frees up (requires bash >= 4.3)
+    while [ "$(jobs -rp | wc -l)" -ge "${run_in_parallel}" ]; do
+        wait -n
+    done
 
-# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense piguard_detector
+    # Run in background, printing to screen and saving to a per-suite log
+    "${cmd[@]}" -s "$s" 2>&1 | tee "${log_dir}/${s}.log" &
+done
 
-# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense prompt_guard_2_detector
+# 2. Wait for all remaining background jobs to finish
+wait
 
-# spotlighting_with_delimiting
-# python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense spotlighting_with_delimiting
-
-# repeat_user_prompt
-python -m agentdojo.scripts.benchmark --model VLLM_PARSED --model-id ${model_id} --logdir ${log_dir} --attack ${attack_method} -s slack -ut user_task_0 --defense repeat_user_prompt
+# 3. Final full run, printing to screen and saving to all.log
+"${cmd[@]}" 2>&1 | tee "${log_dir}/all.log"
