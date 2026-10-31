@@ -16,7 +16,8 @@ export SECAGENT_POLICY_MODEL=${model_id}
 export MAX_INFERENCE_TOKENS=8192
 
 # device for the HF-based PI detectors (default: cuda:0 if available, else cpu), e.g. cuda:7 or cpu
-export DETECTOR_DEVICE="cpu" # "cuda:0"
+detector_gpus=(0 1 2 3)
+export DETECTOR_DEVICE="cuda:0" # "cpu"
 # PI detector models are loaded from $DETECTOR_MODEL_DIR/<org>/<name>, no internet needed
 export DETECTOR_MODEL_DIR=/home/qiangyu/HuggingFace
 export HF_HUB_OFFLINE=1
@@ -83,14 +84,18 @@ cleanup() {
 trap cleanup INT TERM
 
 # 1. Run the suites in parallel, capped at ${run_in_parallel} concurrent jobs
+i=0
 for s in "${suites[@]}"; do
     # Concurrency control: block until a slot frees up (requires bash >= 4.3)
     while [ "$(jobs -rp | wc -l)" -ge "${run_in_parallel}" ]; do
         wait -n
     done
 
+    gpu=${detector_gpus[$((i % ${#detector_gpus[@]}))]}
+    i=$((i + 1))
+
     # Run in background, printing to screen and saving to a per-suite log
-    "${cmd[@]}" -s "$s" 2>&1 | tee "${log_dir}/${s}.log" &
+    DETECTOR_DEVICE="cuda:${gpu}" "${cmd[@]}" -s "$s" 2>&1 | tee "${log_dir}/${s}.log" &
 done
 
 # 2. Wait for all remaining background jobs to finish
