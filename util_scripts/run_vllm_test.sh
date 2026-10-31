@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 model_id="Qwen3Base"
 # model_id="lora-model"
