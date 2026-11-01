@@ -7,6 +7,10 @@ model_id="Qwen3Base"
 log_dir="./run_vllm_test"
 mkdir -p ${log_dir}
 
+# make python use UTF-8, sometimes json decode error because LLM output utf-8 characters
+export PYTHONUTF8=1
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
+
 # full control of the vllm (OpenAI-compatible) server
 export LOCAL_LLM_URL="http://localhost:19000/v1"
 export LOCAL_LLM_MODEL_ID=${model_id}   # the command line option --model-id takes precedence over it
