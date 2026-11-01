@@ -87,19 +87,39 @@ cleanup() {
 }
 trap cleanup INT TERM
 
-# 1. Run the suites in parallel, capped at ${run_in_parallel} concurrent jobs
-i=0
+# 1. Run the suites in parallel, one GPU per job.
+#    Each slot k owns GPU ${detector_gpus[k]}; a new suite only starts on a slot
+#    whose previous job has exited, so two jobs never share one GPU (avoids OOM).
+if [ "${run_in_parallel}" -gt "${#detector_gpus[@]}" ]; then
+    echo "[!] run_in_parallel=${run_in_parallel} > ${#detector_gpus[@]} GPUs, capping to ${#detector_gpus[@]}"
+    run_in_parallel=${#detector_gpus[@]}
+fi
+slot_pid=()   # slot_pid[k] = PID of the job currently running on detector_gpus[k]
+
 for s in "${suites[@]}"; do
-    # Concurrency control: block until a slot frees up (requires bash >= 4.3)
-    while [ "$(jobs -rp | wc -l)" -ge "${run_in_parallel}" ]; do
-        wait -n
+    # Find a free slot: never used, or its job is no longer alive
+    while true; do
+        free_slot=-1
+        for ((k = 0; k < run_in_parallel; k++)); do
+            pid=${slot_pid[$k]:-}
+            if [ -z "${pid}" ] || ! kill -0 "${pid}" 2>/dev/null; then
+                free_slot=$k
+                break
+            fi
+        done
+        [ "${free_slot}" -ge 0 ] && break
+        # All GPUs busy: block until some job finishes (requires bash >= 4.3)
+        wait -n 2>/dev/null || sleep 1
     done
 
-    gpu=${detector_gpus[$((i % ${#detector_gpus[@]}))]}
-    i=$((i + 1))
+    gpu=${detector_gpus[$free_slot]}
+    echo "[*] start suite ${s} on cuda:${gpu} (slot ${free_slot})"
 
-    # Run in background, printing to screen and saving to a per-suite log
-    DETECTOR_DEVICE="cuda:${gpu}" "${cmd[@]}" -s "$s" 2>&1 | tee "${log_dir}/${s}.log" &
+    # Run in background, printing to screen and saving to a per-suite log.
+    # Wrapped in a subshell so $! is the PID of the whole pipeline (python + tee),
+    # i.e. the GPU is considered free only after python has really exited.
+    ( DETECTOR_DEVICE="cuda:${gpu}" "${cmd[@]}" -s "$s" 2>&1 | tee "${log_dir}/${s}.log" ) &
+    slot_pid[$free_slot]=$!
 done
 
 # 2. Wait for all remaining background jobs to finish
