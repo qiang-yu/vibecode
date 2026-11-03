@@ -1,6 +1,6 @@
 # DogTray
 
-Windows 托盘启动器，纯 Rust + Windows 自身 API，没有第三方 crate 依赖。
+Windows 托盘启动器，纯 Rust + Windows 自身 API，没有第三方 crate 依赖。【[编译好的程序下载](https://github.com/qiang-yu/vibecode/tree/DogTray/exe)】
 
 - 启动时读当前目录下的 `start_config.ini`；找不到就弹对话框
   “缺少配置文件 start_config.ini”，点确定后退出。
