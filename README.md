@@ -52,7 +52,7 @@ src/main.rs         全部程序逻辑（托盘、启动、跟踪、关闭、输
 .cargo/config.toml  Linux 交叉编译时用的 mingw 链接器配置
 ```
 
-## 编译（推荐：Linux 交叉编译，和作者原来一样）
+## 编译（推荐：Linux 交叉编译，Muse就是在Linux开发的这个程序）
 
 ```bash
 rustup target add x86_64-pc-windows-gnu
