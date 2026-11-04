@@ -304,6 +304,8 @@ struct Shared {
     exe_stem: String,
     tray_tip: String,
     button_sections: Vec<String>,
+    // [main] 里配的全局手工锚点目录，作用于所有段，启动时就写进各段的 anchor_dirs。
+    global_anchor_dirs: Vec<String>,
     output_windows: Mutex<HashMap<HWND, OutputWindowState>>,
     // 主段根进程已退、后代还活着时，上次写诊断日志的时间；首次为 None，立即写一次。
     diag_last_main_blocker: Mutex<Option<Instant>>,
@@ -416,6 +418,7 @@ extern "system" {
     fn CreateJobObjectW(lp_job_attributes: *const c_void, lp_name: *const u16) -> HANDLE;
     fn AssignProcessToJobObject(h_job: HANDLE, h_process: HANDLE) -> BOOL;
     fn GetWindowsDirectoryW(lp_buffer: *mut u16, u_size: UINT) -> UINT;
+    fn GetEnvironmentVariableW(lp_name: *const u16, lp_buffer: *mut u16, n_size: DWORD) -> DWORD;
     fn QueryFullProcessImageNameW(
         h_process: HANDLE,
         dw_flags: DWORD,
@@ -692,10 +695,25 @@ fn strip_quotes(v: &str) -> String {
 }
 
 struct Config {
-    sections: Vec<(String, String)>,
+    // (段名, 脚本, 该段手工锚点目录)
+    sections: Vec<(String, String, Vec<String>)>,
     main_name: String,
     output_log: bool,
     title: Option<String>,
+    // [main] 里配的全局手工锚点目录，作用于所有段。
+    global_anchor_dirs: Vec<String>,
+}
+
+/// 解析 anchor_dirs= 的值：分号分隔，多个值、多个行都累积。
+/// 空值、空项直接跳过，不会记成空锚点。
+fn parse_anchor_dirs_value(val: &str, out: &mut Vec<String>) {
+    for part in val.split(';') {
+        if let Some(dir) = normalize_anchor_dir(part) {
+            if !out.contains(&dir) {
+                out.push(dir);
+            }
+        }
+    }
 }
 
 fn parse_config(text: &str) -> Config {
@@ -720,7 +738,8 @@ fn parse_config(text: &str) -> Config {
     let mut main_name = String::new();
     let mut output_log = false;
     let mut title: Option<String> = None;
-    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut global_anchor_dirs: Vec<String> = Vec::new();
+    let mut sections: Vec<(String, String, Vec<String>)> = Vec::new();
     for (name, lines) in ordered {
         if name.eq_ignore_ascii_case("main") {
             for line in lines {
@@ -741,13 +760,32 @@ fn parse_config(text: &str) -> Config {
                                 title = Some(val);
                             }
                         }
+                        "anchor_dirs" => parse_anchor_dirs_value(&val, &mut global_anchor_dirs),
                         _ => {}
                     }
                 }
             }
         } else {
-            let script = lines.join("\r\n");
-            sections.push((name, script));
+            // 各段里 anchor_dirs= 是配置行，不是批处理命令：
+            // 提取出来当手工锚点，不放进脚本，否则 cmd 会把它当命令执行。
+            // 只有行首就是 anchor_dirs= 才提取，set anchor_dirs= 这种
+            // 批处理里的 set 命令不受影响。
+            let mut sec_anchor_dirs: Vec<String> = Vec::new();
+            let mut script_lines: Vec<String> = Vec::new();
+            for line in lines {
+                let t = line.trim();
+                if let Some(eq) = t.find('=') {
+                    let key = t[..eq].trim().to_ascii_lowercase();
+                    if key == "anchor_dirs" {
+                        let val = strip_quotes(t[eq + 1..].trim());
+                        parse_anchor_dirs_value(&val, &mut sec_anchor_dirs);
+                        continue;
+                    }
+                }
+                script_lines.push(line);
+            }
+            let script = script_lines.join("\r\n");
+            sections.push((name, script, sec_anchor_dirs));
         }
     }
     Config {
@@ -755,6 +793,7 @@ fn parse_config(text: &str) -> Config {
         main_name,
         output_log,
         title,
+        global_anchor_dirs,
     }
 }
 
@@ -947,6 +986,77 @@ fn windows_dir_lower() -> String {
         .clone()
 }
 
+fn user_profile_dir_lower() -> Option<String> {
+    static PROFILE_DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PROFILE_DIR
+        .get_or_init(|| unsafe {
+            let name = wide("USERPROFILE");
+            let mut buf = vec![0u16; 1024];
+            let n = GetEnvironmentVariableW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as DWORD);
+            if n == 0 || n as usize >= buf.len() {
+                return None;
+            }
+            let mut s = String::from_utf16_lossy(&buf[..n as usize])
+                .replace('/', "\\")
+                .to_lowercase();
+            if !s.ends_with('\\') {
+                s.push('\\');
+            }
+            Some(s)
+        })
+        .clone()
+}
+
+/// 锚点目录是不是过宽的根目录：盘符根（d:\）、用户目录根（%USERPROFILE%\）、
+/// UNC 共享根（\\server\share\）。这种目录一旦记成锚点，整个盘、整个用户
+/// 目录、整个共享里的程序都会变成核心，包括装在那里的输入法。
+fn is_broad_root_dir(dir: &str) -> bool {
+    let bytes = dir.as_bytes();
+    if dir.len() == 3 && bytes[1] == b':' && bytes[2] == b'\\' && bytes[0].is_ascii_alphabetic() {
+        return true;
+    }
+    if let Some(profile) = user_profile_dir_lower() {
+        if dir == profile {
+            return true;
+        }
+    }
+    if dir.starts_with("\\\\") {
+        // UNC 根：\\server\share\，除开头的 \\ 外只有 server、share 两段。
+        let rest = &dir[2..];
+        let parts: Vec<&str> = rest.split('\\').filter(|p| !p.is_empty()).collect();
+        if parts.len() == 2 && dir.ends_with('\\') {
+            return true;
+        }
+    }
+    false
+}
+
+/// 手工锚点目录规范化：去引号、/ 转 \、小写、补末尾 \、相对路径按当前目录展开。
+/// 返回 None 表示这行写了空值，调用方直接跳过。
+fn normalize_anchor_dir(raw: &str) -> Option<String> {
+    let mut s = strip_quotes(raw.trim()).trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    s = s.replace('/', "\\");
+    let is_absolute = (s.len() >= 3 && s.as_bytes()[1] == b':' && s.as_bytes()[2] == b'\\')
+        || s.starts_with("\\\\");
+    if !is_absolute {
+        if let Ok(cur) = std::env::current_dir() {
+            let mut cur_s = cur.to_string_lossy().replace('/', "\\").to_lowercase();
+            if !cur_s.ends_with('\\') {
+                cur_s.push('\\');
+            }
+            s = format!("{}{}", cur_s, s);
+        }
+    }
+    let mut lower = s.to_lowercase();
+    if !lower.ends_with('\\') {
+        lower.push('\\');
+    }
+    Some(lower)
+}
+
 fn process_exe_path(pid: u32) -> Option<String> {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -1004,7 +1114,13 @@ fn record_anchor(sec: &mut Section, exe_path: &str) {
         sec.anchor_files.insert(lower);
     } else if let Some(pos) = lower.rfind('\\') {
         let dir = lower[..=pos].to_string();
-        sec.anchor_dirs.insert(dir);
+        if is_broad_root_dir(&dir) {
+            // 盘符根、用户目录根、UNC 共享根太宽：记目录会把整个盘 /
+            // 整个用户目录里的输入法都算成核心，降级为只记完整路径。
+            sec.anchor_files.insert(lower);
+        } else {
+            sec.anchor_dirs.insert(dir);
+        }
     }
 }
 
@@ -1640,6 +1756,38 @@ fn enum_windows_for_pids(pids: &HashSet<u32>) -> Vec<HWND> {
     hwnds
 }
 
+fn process_exe_path_from_handle(handle: HANDLE) -> Option<String> {
+    if handle == 0 || handle == -1 {
+        return None;
+    }
+    unsafe {
+        let mut buf = vec![0u16; 1024];
+        let mut size: DWORD = buf.len() as DWORD;
+        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size);
+        if ok == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..size as usize]))
+    }
+}
+
+/// 只按 exe 路径判断核心：用于句柄复核，不含直接子进程判断。
+/// 路径拿不到时按核心算（保守，和 is_core_process 一致）；
+/// 锚点目录为空时也按核心算（兜底，和 is_core_process 一致）。
+fn is_core_by_path(sec: &Section, exe_path: Option<&str>) -> bool {
+    let Some(path) = exe_path else {
+        return true;
+    };
+    let lower = path.to_lowercase();
+    if sec.anchor_files.contains(&lower) {
+        return true;
+    }
+    if sec.anchor_dirs.iter().any(|d| lower.starts_with(d)) {
+        return true;
+    }
+    sec.anchor_dirs.is_empty()
+}
+
 fn remaining_pids(shared: &Shared) -> Vec<u32> {
     let (alive_set, snap_list) = snapshot_processes();
     let parent_map: HashMap<u32, u32> = snap_list.into_iter().collect();
@@ -1710,6 +1858,88 @@ fn remaining_pids(shared: &Shared) -> Vec<u32> {
     remaining
 }
 
+/// 强杀专用的剩余进程列表：判定核心时就持有进程句柄。
+/// 原理：只要持有进程句柄，内核就不会回收这个进程对象、PID 也就不可能
+/// 被别的进程复用，所以从判定到强杀这段时间内，句柄指向的永远是当初
+/// 判定为核心的那个进程，不会变成刚好复用 PID 的 SGTool。
+/// 句柄拿到后还要复核一次：快照和 OpenProcess 之间也可能发生复用，
+/// 如果句柄的创建时间对不上当初记录的，就再看句柄进程的 exe 路径：
+/// 路径仍在锚点里说明复用它的也是核心进程，句柄照杀无误；
+/// 路径是外来目录说明复用它的是 SGTool 之类，关句柄、跳过不杀。
+/// 句柄打不开时返回 0，强杀时走旧的按 PID 打开、创建时间校验的老路，
+/// 不会因为打不开句柄就漏杀。
+/// 调用方必须在强杀后关掉所有非 0 句柄，否则句柄泄漏、PID 一直占着。
+fn remaining_pids_with_handles(shared: &Shared) -> Vec<(u32, HANDLE)> {
+    let pids = remaining_pids(shared);
+    let mut out: Vec<(u32, HANDLE)> = Vec::new();
+    if pids.is_empty() {
+        return out;
+    }
+    if let Ok(sections) = shared.sections.lock() {
+        for pid in pids {
+            if out.iter().any(|(p, _)| *p == pid) {
+                continue;
+            }
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    0,
+                    pid,
+                )
+            };
+            if handle == 0 || handle == -1 {
+                out.push((pid, 0));
+                continue;
+            }
+            let recorded = sections
+                .iter()
+                .find_map(|s| s.pid_creation.get(&pid).copied())
+                .unwrap_or(0);
+            let mut keep = true;
+            if recorded != 0 {
+                let now = creation_time_from_handle(handle).unwrap_or(0);
+                if now != recorded {
+                    // 快照和打开之间发生了复用：按句柄进程自己的路径再判一次。
+                    let sec_for_path = sections.iter().find(|s| {
+                        s.pids.contains(&pid)
+                            || (s.job_handle != 0
+                                && s.job_handle != -1
+                                && query_job_pids(s.job_handle).contains(&pid))
+                    });
+                    let path = process_exe_path_from_handle(handle);
+                    let core = match sec_for_path {
+                        Some(sec) => is_core_by_path(sec, path.as_deref()),
+                        None => true,
+                    };
+                    if !core {
+                        log_msg(
+                            shared,
+                            &format!(
+                                "跳过强杀 PID {}（句柄创建时间对不上、且路径是外来进程，疑似 PID 复用）",
+                                pid
+                            ),
+                        );
+                        keep = false;
+                    }
+                }
+            }
+            if keep {
+                out.push((pid, handle));
+            } else {
+                unsafe {
+                    CloseHandle(handle);
+                }
+            }
+        }
+    } else {
+        // 拿不到段锁时无法复核，退回按 PID 的老路，句柄都记 0。
+        for pid in pids {
+            out.push((pid, 0));
+        }
+    }
+    out
+}
+
 fn wait_all_exited(shared: &Shared, timeout_ms: u64) -> bool {
     let mut waited: u64 = 0;
     while waited < timeout_ms {
@@ -1759,15 +1989,15 @@ fn send_shutdown(hwnds: &[HWND]) {
 }
 
 fn force_kill_remaining(shared: &Shared) {
-    let remaining = remaining_pids(shared);
+    let remaining = remaining_pids_with_handles(shared);
     if remaining.is_empty() {
         log_msg(shared, "所有子程序已退出");
         return;
     }
     log_msg(shared, &format!("优雅关闭后仍有 {} 个子程序未退出，强行终止", remaining.len()));
-    // 作业成员集合：作业为准时，作业成员就是归属证据，创建时间对不上
-    // 也不能跳过（它可能是作业成员复用了 PID，杀它仍然是对的）。
-    // 只有非作业成员（作业无效回退时）才用创建时间防复用。
+    // 作业成员集合：只用于句柄打不开时的老路。
+    // 句柄能打开时，持有句柄本身就是归属证据，PID 复用不可能发生，
+    // 不再需要“作业成员跳过创建时间校验”这条规则。
     let job_owned: HashSet<u32> = match shared.sections.lock() {
         Ok(sections) => sections
             .iter()
@@ -1776,11 +2006,20 @@ fn force_kill_remaining(shared: &Shared) {
             .collect(),
         Err(_) => HashSet::new(),
     };
-    for pid in &remaining {
+    for (pid, handle) in &remaining {
+        if *handle != 0 && *handle != -1 {
+            // 句柄就是判定核心时拿到的那一个，直接杀它，绝不按 PID 重开。
+            // 只要句柄还开着，PID 就不可能被复用，杀的永远是原进程。
+            unsafe {
+                TerminateProcess(*handle, 1);
+                CloseHandle(*handle);
+            }
+            log_msg(shared, &format!("强行终止 PID {}", pid));
+            continue;
+        }
         if !job_owned.contains(pid) {
-            // 强杀前最后再比对一次创建时间：判断和强杀之间也可能发生复用。
-            // process_creation_time 本身就是每次现查，不走缓存，
-            // 所以 is_same_process 在这里就是现查，不存在缓存误判窗口。
+            // 句柄打不开时的老路：强杀前最后再比对一次创建时间，
+            // 判断和强杀之间也可能发生复用。
             let recorded = match shared.sections.lock() {
                 Ok(sections) => sections
                     .iter()
@@ -1802,10 +2041,11 @@ fn force_kill_remaining(shared: &Shared) {
         }
         log_msg(shared, &format!("强行终止 PID {}", pid));
     }
+    let pids: Vec<u32> = remaining.iter().map(|(pid, _)| *pid).collect();
     for _ in 0..10 {
         std::thread::sleep(Duration::from_millis(200));
         let (alive_set2, _) = snapshot_processes();
-        if remaining.iter().all(|pid| !alive_set2.contains(pid)) {
+        if pids.iter().all(|pid| !alive_set2.contains(pid)) {
             break;
         }
     }
@@ -1918,7 +2158,13 @@ fn delete_temp_bat(shared: &Shared, path: &PathBuf) -> bool {
     ok
 }
 
-fn launch_section(shared_arc: Arc<Shared>, name: &str, script: &str, current_dir: &PathBuf) -> Option<PathBuf> {
+fn launch_section(
+    shared_arc: Arc<Shared>,
+    name: &str,
+    script: &str,
+    current_dir: &PathBuf,
+    manual_anchor_dirs: &[String],
+) -> Option<PathBuf> {
     let shared: &Shared = &shared_arc;
     let dog_pid = std::process::id();
     let sanitized: String = name
@@ -2109,7 +2355,12 @@ fn launch_section(shared_arc: Arc<Shared>, name: &str, script: &str, current_dir
                 pids,
                 pid_creation,
                 pid_last_seen_unix,
-                anchor_dirs: HashSet::new(),
+                // 手工锚点从段创建时就存在，不依赖轮询：
+                // 启动器活得久、真正的程序在别的目录时，真正的程序
+                // 从一开始就是核心，不会被判成外来而提前退出。
+                // 手工目录是用户显式配的，即使是盘符根也不降级，
+                // 降级只针对自动记录的锚点（防止无意中记宽）。
+                anchor_dirs: manual_anchor_dirs.iter().cloned().collect(),
                 anchor_files: HashSet::new(),
                 anchor_recorded: HashMap::new(),
                 exited: false,
@@ -2162,8 +2413,8 @@ fn wait_5_seconds_or_abort(shared: &Shared) -> bool {
     false
 }
 
-fn worker_thread(shared: Arc<Shared>, launches: Vec<(String, String)>, current_dir: PathBuf) {
-    for (idx, (name, script)) in launches.iter().enumerate() {
+fn worker_thread(shared: Arc<Shared>, launches: Vec<(String, String, Vec<String>)>, current_dir: PathBuf) {
+    for (idx, (name, script, sec_anchor_dirs)) in launches.iter().enumerate() {
         if shared.shutdown.load(Ordering::SeqCst) {
             break;
         }
@@ -2171,7 +2422,16 @@ fn worker_thread(shared: Arc<Shared>, launches: Vec<(String, String)>, current_d
             log_msg(&shared, &format!("跳过空程序: {}", name));
             continue;
         }
-        let temp = launch_section(shared.clone(), name, script, &current_dir);
+        // 手工锚点：全局（[main]）+ 本段，启动时就合并进段，
+        // 这样启动器活得久、真正的程序在别的目录时，真正的程序从一开始就是核心，
+        // 不用等自动锚点、也不依赖孤儿规则（孤儿只覆盖启动器早死的情况）。
+        let mut manual: Vec<String> = shared.global_anchor_dirs.clone();
+        for d in sec_anchor_dirs {
+            if !manual.contains(d) {
+                manual.push(d.clone());
+            }
+        }
+        let temp = launch_section(shared.clone(), name, script, &current_dir, &manual);
         // 不管是不是最后一段，启动后都等 5 秒再删临时文件：
         // 这 5 秒足够 cmd 打开文件、读完脚本、把目标程序拉起来，
         // 又不会把临时文件留到 DogTray 退出（可能要跑很久）才删。
@@ -2586,7 +2846,7 @@ fn main() {
         let cfg = parse_config(&config_text);
         let tray_tip = cfg.title.clone().unwrap_or_else(|| stem.clone());
         let log_path = current_dir.join(format!("{}.log", stem));
-        let button_sections: Vec<String> = cfg.sections.iter().map(|(n, _)| n.clone()).collect();
+        let button_sections: Vec<String> = cfg.sections.iter().map(|(n, _, _)| n.clone()).collect();
         let shared = Arc::new(Shared {
             sections: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
@@ -2599,6 +2859,7 @@ fn main() {
             exe_stem: stem.clone(),
             tray_tip: tray_tip.clone(),
             button_sections,
+            global_anchor_dirs: cfg.global_anchor_dirs.clone(),
             output_windows: Mutex::new(HashMap::new()),
             diag_last_main_blocker: Mutex::new(None),
         });
@@ -2684,7 +2945,7 @@ fn main() {
                 h_instance,
                 null(),
             );
-            for (i, (name, _)) in cfg.sections.iter().enumerate() {
+            for (i, (name, _, _)) in cfg.sections.iter().enumerate() {
                 let btn_class = wide("BUTTON");
                 let btn_text = wide(name);
                 let _ = CreateWindowExW(
