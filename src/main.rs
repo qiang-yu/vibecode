@@ -833,10 +833,14 @@ fn log_msg(shared: &Shared, msg: &str) {
     }
 }
 
-/// 诊断日志：不看 output_log，只在主段根进程已退、后代还活着这种
-/// 反常情况下才写，正常使用（浏览器开着）不会写，避免把日志打爆。
-/// 这样即使平时 output_log=false，下次偶发问题时日志里也有诊断行。
+/// 诊断日志：受 output_log 控制，和普通日志一样。
+/// output_log=false 时不写，output_log=true 时才写。
+/// 触发条件本身不变：只在主段根进程已退、后代还活着这种反常情况下才写，
+/// 正常使用（浏览器开着）不会写，避免把日志打爆。
 fn log_diag(shared: &Shared, msg: &str) {
+    if !shared.log_enabled {
+        return;
+    }
     let line = format!("[{}] 诊断: {}\r\n", timestamp(), msg);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&shared.log_path) {
         let _ = f.write_all(line.as_bytes());
