@@ -1121,17 +1121,27 @@ fn check_sections_exited(shared: &Shared) {
             if !root_exited {
                 continue;
             }
-            // 只有三者同时满足才算整段退出：
-            // 1) 根 cmd 已退出；2) 作业对象里已无活进程；
-            // 3) 快照里也没有该段的后代活着（兜底脱离作业的进程）。
-            // 以前只看 1) 和 3)，Chrome 的 launcher 死得太快、
-            // 浏览器没进跟踪集合，就会被误判为已退出。
+            // 退出判定以作业对象为准，父进程 PID 不等于归属：
+            // 作业分配成功时，只看 1) 根 cmd 已退出；2) 作业对象里已无活进程。
+            // 快照后代不再决定退出，只留着做诊断。否则搜狗输入法 SGTool
+            // 这种按需拉起、父进程指向浏览器、但不在作业里的共享助手，
+            // 浏览器退了它还活着，就会让主段永远退不出去；v2rayN 那种
+            // 无关进程树被误吸进来时也是同理。
+            // 只有作业分配失败（job_handle 无效）时，才回退到快照判断，
+            // 因为那时作业根本没有跟踪能力，快照是唯一的来源。
             let job_pids = query_job_pids(sec.job_handle);
             if !job_pids.is_empty() {
                 continue;
             }
-            // 快照后代要按 PID+创建时间比对：创建时间对不上的就是
-            // 旧进程死了、新进程复用了 PID，直接从集合里清掉，不算活着。
+            let job_valid = sec.job_handle != 0 && sec.job_handle != -1;
+            if job_valid {
+                sec.exited = true;
+                newly.push(sec.name.clone());
+                continue;
+            }
+            // 回退：作业无效时，快照后代要按 PID+创建时间比对：
+            // 创建时间对不上的就是旧进程死了、新进程复用了 PID，
+            // 直接从集合里清掉，不算活着。
             let mut reused: Vec<u32> = Vec::new();
             let any_desc_alive = sec
                 .pids
@@ -1171,7 +1181,7 @@ fn maybe_log_main_blockers(shared: &Shared) {
     if shared.main_name.is_empty() {
         return;
     }
-    let (main_name, root_exited, job_pids, desc_alive) = {
+    let (main_name, root_exited, job_pids, desc_alive, job_valid) = {
         let Ok(sections) = shared.sections.lock() else {
             return;
         };
@@ -1181,6 +1191,7 @@ fn maybe_log_main_blockers(shared: &Shared) {
         else {
             return;
         };
+        let job_valid = sec.job_handle != 0 && sec.job_handle != -1;
         let root_exited = if sec.root_handle == 0 {
             true
         } else {
@@ -1205,10 +1216,17 @@ fn maybe_log_main_blockers(shared: &Shared) {
             }
             desc.push(*pid);
         }
-        (sec.name.clone(), root_exited, job_pids, desc)
+        (sec.name.clone(), root_exited, job_pids, desc, job_valid)
     };
     let _ = root_exited;
-    if job_pids.is_empty() && desc_alive.is_empty() {
+    // 作业为准时，快照后代再多也不算阻塞，不写“段未判定退出”：
+    // 否则 SGTool 还活着时日志会一直刷，好像主段还卡着，其实它已经
+    // 按作业规则退出了。作业无效回退时，快照后代才算阻塞。
+    if job_valid {
+        if job_pids.is_empty() {
+            return;
+        }
+    } else if job_pids.is_empty() && desc_alive.is_empty() {
         return;
     }
     let should_log = {
@@ -1231,15 +1249,22 @@ fn maybe_log_main_blockers(shared: &Shared) {
         return;
     }
     let names = snapshot_pid_names();
-    log_diag(
-        shared,
-        &format!(
-            "主程序 {} 根进程已退出，但后代还活着，段未判定退出：作业对象活进程 [{}]，后代活进程 [{}]",
+    let msg = if job_valid {
+        format!(
+            "主程序 {} 根进程已退出，但作业后代还活着，段未判定退出：作业对象活进程 [{}]，快照后代（仅诊断，不阻塞退出） [{}]",
             main_name,
             fmt_pid_list(&job_pids, &names),
             fmt_pid_list(&desc_alive, &names)
-        ),
-    );
+        )
+    } else {
+        format!(
+            "主程序 {} 根进程已退出，但后代还活着，段未判定退出（作业无效，回退快照判断）：作业对象活进程 [{}]，后代活进程 [{}]",
+            main_name,
+            fmt_pid_list(&job_pids, &names),
+            fmt_pid_list(&desc_alive, &names)
+        )
+    };
+    log_diag(shared, &msg);
 }
 
 fn is_main_exited(shared: &Shared) -> bool {
@@ -1255,12 +1280,24 @@ fn is_main_exited(shared: &Shared) -> bool {
         .any(|s| s.name.to_ascii_lowercase() == shared.main_name && s.exited)
 }
 
+/// DogTray 拥有、可以关闭/强杀的进程集合：作业为准。
+/// 作业有效时只含作业成员，快照-only 的 SGTool、v2rayN 之类共享/无关进程
+/// 不在里面，退出时不会给它们发 WM_CLOSE、不会强杀它们。
+/// 作业无效时回退到跟踪集合（快照），因为那时没有别的归属证据。
 fn tracked_pids(shared: &Shared) -> HashSet<u32> {
     let mut set = HashSet::new();
     if let Ok(sections) = shared.sections.lock() {
         for sec in sections.iter() {
-            for pid in &sec.pids {
-                set.insert(*pid);
+            if sec.job_handle != 0 && sec.job_handle != -1 {
+                for pid in query_job_pids(sec.job_handle) {
+                    set.insert(pid);
+                }
+                // 根 cmd 活着时一定在作业里，上面已含；根已退时不在作业里，
+                // 也不用再把它加回来（退出判定里根已退就不再等它）。
+            } else {
+                for pid in &sec.pids {
+                    set.insert(*pid);
+                }
             }
         }
     }
@@ -1294,11 +1331,36 @@ fn remaining_pids(shared: &Shared) -> Vec<u32> {
     let mut remaining: Vec<u32> = Vec::new();
     if let Ok(sections) = shared.sections.lock() {
         for sec in sections.iter() {
+            if sec.job_handle != 0 && sec.job_handle != -1 {
+                // 作业为准：作业成员就是内核证明的归属，创建时间比对
+                // 在这里不再用来排除它（作业成员复用 PID 也是作业成员，
+                // 杀它仍然是对的；快照-only 的进程根本不会出现在这里）。
+                for pid in query_job_pids(sec.job_handle) {
+                    if !alive_set.contains(&pid) {
+                        continue;
+                    }
+                    if pid == sec.root_pid {
+                        let root_exited = if sec.root_handle == 0 {
+                            true
+                        } else {
+                            unsafe { WaitForSingleObject(sec.root_handle, 0) == 0 }
+                        };
+                        if root_exited {
+                            continue;
+                        }
+                    }
+                    if !remaining.contains(&pid) {
+                        remaining.push(pid);
+                    }
+                }
+                continue;
+            }
+            // 回退：作业无效时用跟踪集合（快照），且强杀前比对创建时间：
+            // 对不上就是 PID 被复用了，绝不杀它。
             for pid in &sec.pids {
                 if !alive_set.contains(pid) {
                     continue;
                 }
-                // 强杀前再比对创建时间：对不上就是 PID 被复用了，绝不杀它。
                 let recorded = sec.pid_creation.get(pid).copied().unwrap_or(0);
                 if recorded != 0 && !is_same_process(*pid, recorded) {
                     continue;
@@ -1377,18 +1439,31 @@ fn force_kill_remaining(shared: &Shared) {
         return;
     }
     log_msg(shared, &format!("优雅关闭后仍有 {} 个子程序未退出，强行终止", remaining.len()));
+    // 作业成员集合：作业为准时，作业成员就是归属证据，创建时间对不上
+    // 也不能跳过（它可能是作业成员复用了 PID，杀它仍然是对的）。
+    // 只有非作业成员（作业无效回退时）才用创建时间防复用。
+    let job_owned: HashSet<u32> = match shared.sections.lock() {
+        Ok(sections) => sections
+            .iter()
+            .filter(|s| s.job_handle != 0 && s.job_handle != -1)
+            .flat_map(|s| query_job_pids(s.job_handle))
+            .collect(),
+        Err(_) => HashSet::new(),
+    };
     for pid in &remaining {
-        // 强杀前最后再比对一次创建时间：判断和强杀之间也可能发生复用。
-        let recorded = match shared.sections.lock() {
-            Ok(sections) => sections
-                .iter()
-                .find_map(|s| s.pid_creation.get(pid).copied())
-                .unwrap_or(0),
-            Err(_) => 0,
-        };
-        if recorded != 0 && !is_same_process(*pid, recorded) {
-            log_msg(shared, &format!("跳过强杀 PID {}（创建时间对不上，疑似 PID 复用）", pid));
-            continue;
+        if !job_owned.contains(pid) {
+            // 强杀前最后再比对一次创建时间：判断和强杀之间也可能发生复用。
+            let recorded = match shared.sections.lock() {
+                Ok(sections) => sections
+                    .iter()
+                    .find_map(|s| s.pid_creation.get(pid).copied())
+                    .unwrap_or(0),
+                Err(_) => 0,
+            };
+            if recorded != 0 && !is_same_process(*pid, recorded) {
+                log_msg(shared, &format!("跳过强杀 PID {}（创建时间对不上，疑似 PID 复用）", pid));
+                continue;
+            }
         }
         unsafe {
             let h = OpenProcess(PROCESS_TERMINATE, 0, *pid);
