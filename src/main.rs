@@ -829,6 +829,47 @@ fn exit_time_from_handle(handle: HANDLE) -> Option<u64> {
 }
 
 fn process_creation_time(pid: u32) -> Option<u64> {
+    // 创建时间缓存：同一 PID 在 1 秒内重复查时不再 OpenProcess。
+    // 一轮轮询里 update_descendants、check_sections_exited、tracked/remaining、
+    // 诊断日志都会对同一个作业成员查创建时间，不缓存就是每轮好几次 OpenProcess，
+    // exe 路径缓存省掉的只是 QueryFullProcessImageNameW 那一半。
+    // 只缓存成功拿到的创建时间，不缓存 None：进程已死、PID 又被复用时，
+    // 缓存的 None 会把新进程误判为已死。成功值的复用误判窗口最多 1 秒，
+    // 远小于 5 秒的优雅关闭等待，且强杀前还会再查（缓存已过期或重新查）。
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<u32, (u64, std::time::Instant)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some((t, at)) = map.get(&pid) {
+            if at.elapsed() < std::time::Duration::from_secs(1) {
+                return Some(*t);
+            }
+        }
+    }
+    let t = unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 || h == -1 {
+            return None;
+        }
+        let t = creation_time_from_handle(h);
+        CloseHandle(h);
+        t
+    };
+    if let Some(t) = t {
+        if let Ok(mut map) = cache.lock() {
+            if map.len() > 10000 {
+                map.clear();
+            }
+            map.insert(pid, (t, std::time::Instant::now()));
+        }
+    }
+    t
+}
+
+/// 不走缓存的创建时间查询，专供强杀前最后一次校验：
+/// 强杀是不可逆操作，不能接受 1 秒缓存带来的复用误判窗口，
+/// 这里必须现打开进程、现取时间。
+fn process_creation_time_fresh(pid: u32) -> Option<u64> {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h == 0 || h == -1 {
@@ -1060,6 +1101,15 @@ fn is_core_process(
 }
 
 fn root_exit_time_of(sec: &Section) -> u64 {
+    if sec.root_handle == 0 || sec.root_handle == -1 {
+        return 0;
+    }
+    // GetProcessTimes 在进程还活着时返回的退出时间是“未定义”的，
+    // 文档不保证是 0，所以必须先确认根进程已经退出再取，没退出就返回 0。
+    let exited = unsafe { WaitForSingleObject(sec.root_handle, 0) == 0 };
+    if !exited {
+        return 0;
+    }
     exit_time_from_handle(sec.root_handle).unwrap_or(0)
 }
 
@@ -1230,7 +1280,7 @@ fn update_descendants(shared: &Shared) {
                 sec.pid_last_seen_unix.insert(*pid, now_unix);
             }
         }
-        // 锚点记录：轮询作业成员时记两种锚点。
+        // 锚点记录：轮询作业成员时记两种锚点，分两阶段，先直接子进程、后孤儿。
         // 1) 父进程是本段根 cmd 的直接子进程，就记下它的 exe 归属。
         //    判断时用原始 FILETIME 比较，子进程必须晚于根 cmd，
         //    且根 cmd 已退出时必须早于根 cmd 退出时间，否则是 PID 复用
@@ -1238,32 +1288,44 @@ fn update_descendants(shared: &Shared) {
         //    把 xray、VirtualBrowser 这种几乎和 cmd 同时启动的程序漏掉。
         //    根 cmd 死了以后，快照里孤儿的父进程 PID 仍然是根 cmd，所以即使
         //    根 cmd 已退，主程序还活着时锚点仍能记下来。
-        // 2) 父进程已经不在了、而且从未出现在 sec.pids 里（说明父进程是个
-        //    没来得及观察到的短命中间进程，比如 Chrome launcher），
+        // 2) 孤儿锚点：父进程已经不在了、而且从未出现在 sec.pids 里
+        //    （说明父进程是个没来得及观察到的短命中间进程，比如 Chrome launcher），
         //    就把这个作业成员本身也当作锚点，记下它的目录。
         //    SGTool 不会命中这条，因为它的父进程是浏览器，浏览器早已被观察到、
         //    一定在 sec.pids 里。
+        //    孤儿规则只在 anchor_dirs 还为空时生效，且必须在直接子进程
+        //    锚点记完之后再判：这条本来就是为了“启动器早死、主程序目录还没记上”
+        //    兜底的，一旦记到了任何一个非 Windows 目录锚点，就说明主程序
+        //    已经找到了，之后不再接受孤儿锚点。否则外来软件先起一个短命
+        //    中转进程、再拉起常驻进程（输入法更新器、安全软件中转），
+        //    常驻进程的目录也会被记成锚点，SGTool 又会变回核心。
         // 已经记过锚点的直接子进程（同一 PID + 创建时间）本轮跳过，不再查路径。
         {
             let root_creation = sec.pid_creation.get(&sec.root_pid).copied().unwrap_or(0);
             let root_exit = root_exit_time_of(sec);
+            let record_one = |sec: &mut Section, pid: u32| {
+                let child_creation = sec.pid_creation.get(&pid).copied().unwrap_or(0);
+                if sec.anchor_recorded.get(&pid).copied().unwrap_or(0) == child_creation
+                    && child_creation != 0
+                {
+                    return;
+                }
+                if let Some(path) = cached_exe_path(sec, pid) {
+                    record_anchor(sec, &path);
+                    sec.anchor_recorded.insert(pid, child_creation);
+                }
+            };
+            // 阶段一：直接子进程。
             for (pid, ppid) in &list {
-                if *pid == sec.root_pid {
+                if *pid == sec.root_pid || *ppid != sec.root_pid {
                     continue;
                 }
                 let in_job = idx < job_lists.len() && job_lists[idx].contains(pid);
                 if !in_job && !sec.pids.contains(pid) {
                     continue;
                 }
-                let is_direct_child = *ppid == sec.root_pid;
-                let is_orphan_from_unseen_parent = *ppid != 0
-                    && !alive_set.contains(ppid)
-                    && !sec.pids.contains(ppid);
-                if !is_direct_child && !is_orphan_from_unseen_parent {
-                    continue;
-                }
                 let child_creation = sec.pid_creation.get(pid).copied().unwrap_or(0);
-                if is_direct_child && root_creation != 0 && child_creation != 0 {
+                if root_creation != 0 && child_creation != 0 {
                     if child_creation <= root_creation {
                         continue;
                     }
@@ -1271,14 +1333,22 @@ fn update_descendants(shared: &Shared) {
                         continue;
                     }
                 }
-                if sec.anchor_recorded.get(pid).copied().unwrap_or(0) == child_creation
-                    && child_creation != 0
-                {
-                    continue;
-                }
-                if let Some(path) = cached_exe_path(sec, *pid) {
-                    record_anchor(sec, &path);
-                    sec.anchor_recorded.insert(*pid, child_creation);
+                record_one(sec, *pid);
+            }
+            // 阶段二：孤儿锚点，只在直接子进程记完后 anchor_dirs 仍为空时。
+            if sec.anchor_dirs.is_empty() {
+                for (pid, ppid) in &list {
+                    if *pid == sec.root_pid || *ppid == 0 {
+                        continue;
+                    }
+                    let in_job = idx < job_lists.len() && job_lists[idx].contains(pid);
+                    if !in_job && !sec.pids.contains(pid) {
+                        continue;
+                    }
+                    if alive_set.contains(ppid) || sec.pids.contains(ppid) {
+                        continue;
+                    }
+                    record_one(sec, *pid);
                 }
             }
         }
@@ -1362,13 +1432,15 @@ fn check_sections_exited(shared: &Shared) {
             // 只有作业分配失败（job_handle 无效）时，才回退到快照判断，
             // 因为那时作业根本没有跟踪能力，快照是唯一的来源。
             let job_pids = query_job_pids(sec.job_handle);
+            // 根退出时间每段只取一次，不在每个 pid 的 filter 里重复调。
+            let root_exit = root_exit_time_of(sec);
             let job_core: Vec<u32> = job_pids
                 .iter()
                 .copied()
                 .filter(|pid| {
                     let ppid = parent_map.get(pid).copied();
                     let path = cached_exe_path(sec, *pid);
-                    is_core_process(sec, *pid, ppid, path.as_deref(), root_exit_time_of(sec))
+                    is_core_process(sec, *pid, ppid, path.as_deref(), root_exit)
                 })
                 .collect();
             if !job_core.is_empty() {
@@ -1400,7 +1472,7 @@ fn check_sections_exited(shared: &Shared) {
                     // 回退时同样按锚点区分核心/外来，外来进程不阻塞退出。
                     let ppid = parent_map.get(pid).copied();
                     let path = cached_exe_path(sec, *pid);
-                    is_core_process(sec, *pid, ppid, path.as_deref(), root_exit_time_of(sec))
+                    is_core_process(sec, *pid, ppid, path.as_deref(), root_exit)
                 });
             for pid in reused {
                 sec.pids.remove(&pid);
@@ -1447,12 +1519,13 @@ fn maybe_log_main_blockers(shared: &Shared) {
         let job_pids = query_job_pids(sec.job_handle);
         let (alive_set, snap_list) = snapshot_processes();
         let parent_map: HashMap<u32, u32> = snap_list.into_iter().collect();
+        let root_exit = root_exit_time_of(sec);
         let mut core = Vec::new();
         let mut foreign = Vec::new();
         for pid in &job_pids {
             let ppid = parent_map.get(pid).copied();
             let path = cached_exe_path(sec, *pid);
-            if is_core_process(sec, *pid, ppid, path.as_deref(), root_exit_time_of(sec)) {
+            if is_core_process(sec, *pid, ppid, path.as_deref(), root_exit) {
                 core.push(*pid);
             } else {
                 foreign.push(*pid);
@@ -1548,11 +1621,12 @@ fn tracked_pids(shared: &Shared) -> HashSet<u32> {
     let parent_map: HashMap<u32, u32> = snap_list.into_iter().collect();
     if let Ok(sections) = shared.sections.lock() {
         for sec in sections.iter() {
+            let root_exit = root_exit_time_of(sec);
             if sec.job_handle != 0 && sec.job_handle != -1 {
                 for pid in query_job_pids(sec.job_handle) {
                     let ppid = parent_map.get(&pid).copied();
                     let path = cached_exe_path(sec, pid);
-                    if is_core_process(sec, pid, ppid, path.as_deref(), root_exit_time_of(sec)) {
+                    if is_core_process(sec, pid, ppid, path.as_deref(), root_exit) {
                         set.insert(pid);
                     }
                 }
@@ -1562,7 +1636,7 @@ fn tracked_pids(shared: &Shared) -> HashSet<u32> {
                 for pid in &sec.pids {
                     let ppid = parent_map.get(pid).copied();
                     let path = cached_exe_path(sec, *pid);
-                    if is_core_process(sec, *pid, ppid, path.as_deref(), root_exit_time_of(sec)) {
+                    if is_core_process(sec, *pid, ppid, path.as_deref(), root_exit) {
                         set.insert(*pid);
                     }
                 }
@@ -1600,6 +1674,7 @@ fn remaining_pids(shared: &Shared) -> Vec<u32> {
     let mut remaining: Vec<u32> = Vec::new();
     if let Ok(sections) = shared.sections.lock() {
         for sec in sections.iter() {
+            let root_exit = root_exit_time_of(sec);
             if sec.job_handle != 0 && sec.job_handle != -1 {
                 // 作业为准、锚点区分核心/外来：作业成员里只有核心进程才进
                 // 关闭/强杀名单，外来进程（SGTool 等）即使在作业里也不杀。
@@ -1610,7 +1685,7 @@ fn remaining_pids(shared: &Shared) -> Vec<u32> {
                     }
                     let ppid = parent_map.get(&pid).copied();
                     let path = cached_exe_path(sec, pid);
-                    if !is_core_process(sec, pid, ppid, path.as_deref(), root_exit_time_of(sec)) {
+                    if !is_core_process(sec, pid, ppid, path.as_deref(), root_exit) {
                         continue;
                     }
                     if pid == sec.root_pid {
@@ -1641,7 +1716,7 @@ fn remaining_pids(shared: &Shared) -> Vec<u32> {
                 }
                 let ppid = parent_map.get(pid).copied();
                 let path = cached_exe_path(sec, *pid);
-                if !is_core_process(sec, *pid, ppid, path.as_deref(), root_exit_time_of(sec)) {
+                if !is_core_process(sec, *pid, ppid, path.as_deref(), root_exit) {
                     continue;
                 }
                 if *pid == sec.root_pid {
@@ -1732,6 +1807,8 @@ fn force_kill_remaining(shared: &Shared) {
     for pid in &remaining {
         if !job_owned.contains(pid) {
             // 强杀前最后再比对一次创建时间：判断和强杀之间也可能发生复用。
+            // 这里不用 is_same_process（它走 1 秒缓存），必须现查，
+            // 否则缓存窗口里的 PID 复用会被误判为同一进程而错杀。
             let recorded = match shared.sections.lock() {
                 Ok(sections) => sections
                     .iter()
@@ -1739,9 +1816,14 @@ fn force_kill_remaining(shared: &Shared) {
                     .unwrap_or(0),
                 Err(_) => 0,
             };
-            if recorded != 0 && !is_same_process(*pid, recorded) {
-                log_msg(shared, &format!("跳过强杀 PID {}（创建时间对不上，疑似 PID 复用）", pid));
-                continue;
+            if recorded != 0 {
+                match process_creation_time_fresh(*pid) {
+                    Some(now) if now == recorded => {}
+                    _ => {
+                        log_msg(shared, &format!("跳过强杀 PID {}（创建时间对不上，疑似 PID 复用）", pid));
+                        continue;
+                    }
+                }
             }
         }
         unsafe {
