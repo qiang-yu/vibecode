@@ -1,6 +1,6 @@
 # DogTray
 
-Windows 托盘启动器，纯 Rust + Windows 自身 API，没有第三方 crate 依赖。【[编译好的程序下载](https://github.com/qiang-yu/vibecode/tree/DogTray/exe)】
+Windows 托盘启动器，纯 Rust + Windows 自身 API，没有第三方 crate 依赖。【[程序这里下载](https://github.com/qiang-yu/vibecode/tree/DogTray/exe)】
 
 - 启动时读当前目录下的 `start_config.ini`；找不到就弹对话框
   “缺少配置文件 start_config.ini”，点确定后退出。
@@ -20,7 +20,7 @@ set CurrentDir=%~dp0
 [main]
 main=chrome
 output_log=false
-title="学校穿梭"
+title="海大穿梭"
 ```
 
 - `main=chrome`：chrome 段是主程序。主程序及其全部子进程都退出后，
@@ -33,7 +33,7 @@ title="学校穿梭"
   每段输出在内存里只留最近 2MB，超了删前面、新信息追加到后面。
   输出窗口每 200ms 刷新：滚动条到底才跟随滚动，手动滚离则不跟随；
   关闭输出窗口不杀程序，再点主界面按钮可重新打开。
-- 退出时统一优雅关闭：先给有窗口的程序发 `WM_CLOSE` 等 5 秒（无窗口的程序一同等，因为它可能依赖窗口程序）；然后重新枚举所有还没退出的程序，给它们发关机通知（`WM_QUERYENDSESSION` + `WM_ENDSESSION`）再等 5 秒；还不退的才全部强行终止。
+- 退出时统一优雅关闭：先给有窗口的程序发 `WM_CLOSE` 等 5 秒（无窗口的程序一同等，因为它可能依赖窗口程序）；然后重新枚举所有还没退出的程序，给它们发关机通知（`WM_QUERYENDSESSION` + `WM_ENDSESSION`）再等 5 秒；还不退的才全部强行终止。托盘菜单返回后若关机已跑过，外层会补发退出消息，避免菜单内部循环吞掉退出消息导致 DogTray 本身不退。子进程按 PID + 创建时间跟踪，防止 PID 复用后误判活着或杀错进程。主段根进程已退、后代还活着时，每 30 秒写一条诊断日志（进程 PID + 进程名），即使 output_log=false 也写，只在这种反常情况下写。
   子程序用作业对象（Job Object）+ 进程快照双重跟踪，短命的中间
   launcher 退了、真正的浏览器还在时也不会误判为整段已退出。
 - 运行期间每段会生成一个 `__dogtray_*.bat` 临时文件（为了让脚本里的
@@ -52,7 +52,7 @@ src/main.rs         全部程序逻辑（托盘、启动、跟踪、关闭、输
 .cargo/config.toml  Linux 交叉编译时用的 mingw 链接器配置
 ```
 
-## 编译（推荐：Linux 交叉编译，Muse就是在Linux开发的这个程序）
+## 编译（推荐：Linux 交叉编译，和作者原来一样）
 
 ```bash
 rustup target add x86_64-pc-windows-gnu

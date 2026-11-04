@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type HWND = isize;
 type HINSTANCE = isize;
@@ -82,6 +82,7 @@ const JOB_OBJECT_BASIC_PROCESS_ID_LIST: i32 = 3;
 const STARTF_USESHOWWINDOW: DWORD = 0x00000001;
 const TH32CS_SNAPPROCESS: DWORD = 0x00000002;
 const PROCESS_TERMINATE: DWORD = 0x00000001;
+const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x00001000;
 const MB_ICONERROR: UINT = 0x00000010;
 const WS_CHILD: DWORD = 0x40000000;
 const WS_VISIBLE: DWORD = 0x10000000;
@@ -255,9 +256,19 @@ struct Section {
     root_handle: HANDLE,
     job_handle: HANDLE,
     pids: HashSet<u32>,
+    // PID -> 创建时间（FILETIME 合成 u64，0 = 未能拿到，退回纯 PID 判断）。
+    // PID 复用时创建时间一定不同，靠它区分“旧进程死了、新进程复用了 PID”。
+    pid_creation: HashMap<u32, u64>,
     exited: bool,
     output_text: String,
     output_truncated: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FILETIME {
+    dw_low_datetime: u32,
+    dw_high_datetime: u32,
 }
 
 struct OutputWindowState {
@@ -280,6 +291,8 @@ struct Shared {
     tray_tip: String,
     button_sections: Vec<String>,
     output_windows: Mutex<HashMap<HWND, OutputWindowState>>,
+    // 主段根进程已退、后代还活着时，上次写诊断日志的时间；首次为 None，立即写一次。
+    diag_last_main_blocker: Mutex<Option<Instant>>,
 }
 
 struct EnumCtx {
@@ -376,6 +389,13 @@ extern "system" {
     fn WaitForSingleObject(h_handle: HANDLE, dw_milliseconds: DWORD) -> DWORD;
     fn OpenProcess(dw_desired_access: DWORD, b_inherit_handle: BOOL, dw_process_id: DWORD) -> HANDLE;
     fn TerminateProcess(h_process: HANDLE, u_exit_code: UINT) -> BOOL;
+    fn GetProcessTimes(
+        h_process: HANDLE,
+        lp_creation_time: *mut FILETIME,
+        lp_exit_time: *mut FILETIME,
+        lp_kernel_time: *mut FILETIME,
+        lp_user_time: *mut FILETIME,
+    ) -> BOOL;
     fn CreateToolhelp32Snapshot(dw_flags: DWORD, th32_process_id: DWORD) -> HANDLE;
     fn Process32FirstW(h_snapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
     fn Process32NextW(h_snapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
@@ -550,14 +570,17 @@ fn append_output(shared: &Shared, section_name: &str, decoded_line: &str) {
     }
     if sec.output_text.len() + new_len > OUTPUT_CACHE_LIMIT {
         let excess = sec.output_text.len() + new_len - OUTPUT_CACHE_LIMIT;
-        let drain_to = if let Some(pos) = sec.output_text[excess..].find('\n') {
-            excess + pos + 1
+        // 先把 excess 对齐到下一个字符边界，再切片：直接按字节切片时，
+        // excess 正好落在中文等多字节字符中间就会 panic（本工程 panic=abort，
+        // 读线程一 panic 整个 DogTray 都会直接退出）。
+        let mut aligned = excess;
+        while aligned < sec.output_text.len() && !sec.output_text.is_char_boundary(aligned) {
+            aligned += 1;
+        }
+        let drain_to = if let Some(pos) = sec.output_text[aligned..].find('\n') {
+            aligned + pos + 1
         } else {
-            let mut s = excess;
-            while s < sec.output_text.len() && !sec.output_text.is_char_boundary(s) {
-                s += 1;
-            }
-            s
+            aligned
         };
         if drain_to > 0 && drain_to <= sec.output_text.len() {
             sec.output_text.drain(..drain_to);
@@ -736,6 +759,111 @@ fn log_msg(shared: &Shared, msg: &str) {
     }
 }
 
+/// 诊断日志：不看 output_log，只在主段根进程已退、后代还活着这种
+/// 反常情况下才写，正常使用（浏览器开着）不会写，避免把日志打爆。
+/// 这样即使平时 output_log=false，下次偶发问题时日志里也有诊断行。
+fn log_diag(shared: &Shared, msg: &str) {
+    let line = format!("[{}] 诊断: {}\r\n", timestamp(), msg);
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&shared.log_path) {
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
+    }
+}
+
+fn creation_time_from_handle(handle: HANDLE) -> Option<u64> {
+    if handle == 0 || handle == -1 {
+        return None;
+    }
+    unsafe {
+        let mut creation: FILETIME = FILETIME { dw_low_datetime: 0, dw_high_datetime: 0 };
+        let mut exit: FILETIME = FILETIME { dw_low_datetime: 0, dw_high_datetime: 0 };
+        let mut kernel: FILETIME = FILETIME { dw_low_datetime: 0, dw_high_datetime: 0 };
+        let mut user: FILETIME = FILETIME { dw_low_datetime: 0, dw_high_datetime: 0 };
+        if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+            return None;
+        }
+        Some(((creation.dw_high_datetime as u64) << 32) | (creation.dw_low_datetime as u64))
+    }
+}
+
+fn process_creation_time(pid: u32) -> Option<u64> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 || h == -1 {
+            return None;
+        }
+        let t = creation_time_from_handle(h);
+        CloseHandle(h);
+        t
+    }
+}
+
+/// 同一个 PID 现在是不是当初记录的那个进程。
+/// recorded==0 表示当初没拿到创建时间，退回纯 PID 判断；
+/// 当前打不开（已在快照和打开之间退了）按已死算；
+/// 创建时间对不上就是 PID 被复用了，按已死算，绝不操作它。
+fn is_same_process(pid: u32, recorded: u64) -> bool {
+    if recorded == 0 {
+        return true;
+    }
+    match process_creation_time(pid) {
+        Some(now) => now == recorded,
+        None => false,
+    }
+}
+
+/// 第一次发现 PID 时记下创建时间；已记录且创建时间变了，
+/// 说明是父进程/作业新起的、复用了旧 PID 的子进程，更新成新的。
+fn record_pid_creation(sec: &mut Section, pid: u32) {
+    if let Some(&recorded) = sec.pid_creation.get(&pid) {
+        if recorded != 0 {
+            if let Some(now) = process_creation_time(pid) {
+                if now != recorded {
+                    sec.pid_creation.insert(pid, now);
+                }
+            }
+        }
+        return;
+    }
+    sec.pid_creation.insert(pid, process_creation_time(pid).unwrap_or(0));
+}
+
+fn snapshot_pid_names() -> HashMap<u32, String> {
+    let mut map = HashMap::new();
+    unsafe {
+        let h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if h == -1 || h == 0 {
+            return map;
+        }
+        let mut entry: PROCESSENTRY32W = zeroed();
+        entry.dw_size = size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(h, &mut entry) != 0 {
+            loop {
+                let end = entry.sz_exe_file.iter().position(|c| *c == 0).unwrap_or(entry.sz_exe_file.len());
+                let name = String::from_utf16_lossy(&entry.sz_exe_file[..end]);
+                map.insert(entry.th32_process_id, name);
+                if Process32NextW(h, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(h);
+    }
+    map
+}
+
+fn fmt_pid_list(pids: &[u32], names: &HashMap<u32, String>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for pid in pids {
+        if let Some(name) = names.get(pid) {
+            parts.push(format!("{}:{}", pid, name));
+        } else {
+            parts.push(format!("{}", pid));
+        }
+    }
+    parts.join(", ")
+}
+
 fn exe_stem() -> String {
     unsafe {
         let mut buf = vec![0u16; 1024];
@@ -848,7 +976,12 @@ fn update_descendants(shared: &Shared) {
         // 它的子进程一创建就自动进作业，查作业列表就能直接拿到。
         if idx < job_lists.len() {
             for pid in &job_lists[idx] {
-                sec.pids.insert(*pid);
+                if sec.pids.insert(*pid) {
+                    record_pid_creation(sec, *pid);
+                } else {
+                    // 已在集合里：若创建时间变了，说明是新起的、复用旧 PID 的子进程。
+                    record_pid_creation(sec, *pid);
+                }
             }
         }
         let mut changed = true;
@@ -857,6 +990,7 @@ fn update_descendants(shared: &Shared) {
             for (pid, ppid) in &list {
                 if sec.pids.contains(ppid) && !sec.pids.contains(pid) {
                     sec.pids.insert(*pid);
+                    record_pid_creation(sec, *pid);
                     changed = true;
                 }
             }
@@ -894,11 +1028,28 @@ fn check_sections_exited(shared: &Shared) {
             if !job_pids.is_empty() {
                 continue;
             }
+            // 快照后代要按 PID+创建时间比对：创建时间对不上的就是
+            // 旧进程死了、新进程复用了 PID，直接从集合里清掉，不算活着。
+            let mut reused: Vec<u32> = Vec::new();
             let any_desc_alive = sec
                 .pids
                 .iter()
                 .filter(|pid| **pid != sec.root_pid)
-                .any(|pid| alive_set.contains(pid));
+                .any(|pid| {
+                    if !alive_set.contains(pid) {
+                        return false;
+                    }
+                    let recorded = sec.pid_creation.get(pid).copied().unwrap_or(0);
+                    if recorded != 0 && !is_same_process(*pid, recorded) {
+                        reused.push(*pid);
+                        return false;
+                    }
+                    true
+                });
+            for pid in reused {
+                sec.pids.remove(&pid);
+                sec.pid_creation.remove(&pid);
+            }
             if !any_desc_alive {
                 sec.exited = true;
                 newly.push(sec.name.clone());
@@ -908,6 +1059,84 @@ fn check_sections_exited(shared: &Shared) {
     for name in newly {
         log_msg(shared, &format!("退出: {}", name));
     }
+    maybe_log_main_blockers(shared);
+}
+
+/// 主段根进程已退、后代还活着时写诊断日志：首次立即写，之后每 30 秒写一次。
+/// 只在这种反常情况下写，正常使用（浏览器开着、根进程没退）不写。
+fn maybe_log_main_blockers(shared: &Shared) {
+    if shared.main_name.is_empty() {
+        return;
+    }
+    let (main_name, root_exited, job_pids, desc_alive) = {
+        let Ok(sections) = shared.sections.lock() else {
+            return;
+        };
+        let Some(sec) = sections
+            .iter()
+            .find(|s| s.name.to_ascii_lowercase() == shared.main_name && !s.exited)
+        else {
+            return;
+        };
+        let root_exited = if sec.root_handle == 0 {
+            true
+        } else {
+            unsafe { WaitForSingleObject(sec.root_handle, 0) == 0 }
+        };
+        if !root_exited {
+            return;
+        }
+        let job_pids = query_job_pids(sec.job_handle);
+        let (alive_set, _) = snapshot_processes();
+        let mut desc: Vec<u32> = Vec::new();
+        for pid in &sec.pids {
+            if *pid == sec.root_pid {
+                continue;
+            }
+            if !alive_set.contains(pid) {
+                continue;
+            }
+            let recorded = sec.pid_creation.get(pid).copied().unwrap_or(0);
+            if recorded != 0 && !is_same_process(*pid, recorded) {
+                continue;
+            }
+            desc.push(*pid);
+        }
+        (sec.name.clone(), root_exited, job_pids, desc)
+    };
+    let _ = root_exited;
+    if job_pids.is_empty() && desc_alive.is_empty() {
+        return;
+    }
+    let should_log = {
+        let Ok(mut last) = shared.diag_last_main_blocker.lock() else {
+            return;
+        };
+        match *last {
+            None => {
+                *last = Some(Instant::now());
+                true
+            }
+            Some(t) if t.elapsed() >= Duration::from_secs(30) => {
+                *last = Some(Instant::now());
+                true
+            }
+            Some(_) => false,
+        }
+    };
+    if !should_log {
+        return;
+    }
+    let names = snapshot_pid_names();
+    log_diag(
+        shared,
+        &format!(
+            "主程序 {} 根进程已退出，但后代还活着，段未判定退出：作业对象活进程 [{}]，后代活进程 [{}]",
+            main_name,
+            fmt_pid_list(&job_pids, &names),
+            fmt_pid_list(&desc_alive, &names)
+        ),
+    );
 }
 
 fn is_main_exited(shared: &Shared) -> bool {
@@ -964,6 +1193,11 @@ fn remaining_pids(shared: &Shared) -> Vec<u32> {
         for sec in sections.iter() {
             for pid in &sec.pids {
                 if !alive_set.contains(pid) {
+                    continue;
+                }
+                // 强杀前再比对创建时间：对不上就是 PID 被复用了，绝不杀它。
+                let recorded = sec.pid_creation.get(pid).copied().unwrap_or(0);
+                if recorded != 0 && !is_same_process(*pid, recorded) {
                     continue;
                 }
                 if *pid == sec.root_pid {
@@ -1041,6 +1275,18 @@ fn force_kill_remaining(shared: &Shared) {
     }
     log_msg(shared, &format!("优雅关闭后仍有 {} 个子程序未退出，强行终止", remaining.len()));
     for pid in &remaining {
+        // 强杀前最后再比对一次创建时间：判断和强杀之间也可能发生复用。
+        let recorded = match shared.sections.lock() {
+            Ok(sections) => sections
+                .iter()
+                .find_map(|s| s.pid_creation.get(pid).copied())
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        if recorded != 0 && !is_same_process(*pid, recorded) {
+            log_msg(shared, &format!("跳过强杀 PID {}（创建时间对不上，疑似 PID 复用）", pid));
+            continue;
+        }
         unsafe {
             let h = OpenProcess(PROCESS_TERMINATE, 0, *pid);
             if h != 0 && h != -1 {
@@ -1340,6 +1586,12 @@ fn launch_section(shared_arc: Arc<Shared>, name: &str, script: &str, current_dir
         }
         let mut pids = HashSet::new();
         pids.insert(pi.dw_process_id);
+        let mut pid_creation = HashMap::new();
+        // 根 cmd 的创建时间直接用它自己的句柄拿，最准，不用再打开一次。
+        pid_creation.insert(
+            pi.dw_process_id,
+            creation_time_from_handle(pi.h_process).unwrap_or(0),
+        );
         if let Ok(mut sections) = shared.sections.lock() {
             sections.push(Section {
                 name: name.to_string(),
@@ -1347,6 +1599,7 @@ fn launch_section(shared_arc: Arc<Shared>, name: &str, script: &str, current_dir
                 root_handle: pi.h_process,
                 job_handle,
                 pids,
+                pid_creation,
                 exited: false,
                 output_text: String::new(),
                 output_truncated: 0,
@@ -1579,7 +1832,11 @@ fn update_output_window(shared: &Shared, hwnd: HWND) {
         let Some(sec) = sections.iter().find(|s| s.name == section_name) else {
             return;
         };
-        if sec.output_truncated != last_trunc {
+        if sec.output_truncated != last_trunc
+            || last_len > sec.output_text.len()
+            || !sec.output_text.is_char_boundary(last_len)
+        {
+            // 截断、长度回缩或 last_len 不在字符边界时都全量刷新，绝不按字节切片。
             (Some(sec.output_text.clone()), None, sec.output_text.len(), sec.output_truncated)
         } else if sec.output_text.len() > last_len {
             (
@@ -1733,6 +1990,17 @@ unsafe fn show_exit_menu(hwnd: HWND) {
         }
         remove_tray(hwnd);
         PostQuitMessage(0);
+    } else if let Some(shared) = SHARED.get() {
+        // 菜单内部消息循环吞掉退出消息的口子：
+        // 菜单打开期间，工作线程若判定主程序退出，会发 WM_APP_SHUTDOWN，
+        // 它会被菜单内部循环先收到并处理（关机已跑、子程序已杀、已发退出消息），
+        // 但那个退出消息会被菜单内部循环消耗掉，菜单按取消返回，
+        // 外层若不再补发，主循环就会一直等消息，DogTray 活着、子程序已死。
+        // 所以菜单返回后不管结果如何，只要关机已经跑过了，就在外层再补发一次。
+        if shared.shutdown_done.load(Ordering::SeqCst) {
+            remove_tray(hwnd);
+            PostQuitMessage(0);
+        }
     }
 }
 
@@ -1820,6 +2088,7 @@ fn main() {
             tray_tip: tray_tip.clone(),
             button_sections,
             output_windows: Mutex::new(HashMap::new()),
+            diag_last_main_blocker: Mutex::new(None),
         });
         if shared.log_enabled {
             log_msg(&shared, "程序启动");
