@@ -263,6 +263,13 @@ struct Section {
     // 用于判断“父进程死后才出现的子进程”：父进程最后一次活着之后
     // 超过宽限还新出现的、父进程 PID 相同的进程，不可能是原父进程的子进程。
     pid_last_seen_unix: HashMap<u32, u64>,
+    // 锚点：本段根 cmd 的直接子进程的 exe 归属。
+    // 非 Windows 目录的 exe 记目录（小写、带末尾 \），比如 ...\virtualbrowser\；
+    // Windows 目录下的 exe 只记完整路径，不记目录，否则整个 System32 都会变成“自己人”。
+    // 作业里只有路径落在锚点目录、或等于锚点完整路径的进程才算核心进程；
+    // 其余（搜狗 SGTool、360 注入模块等外来进程）不阻塞退出、不被关闭/强杀。
+    anchor_dirs: HashSet<String>,
+    anchor_files: HashSet<String>,
     exited: bool,
     output_text: String,
     output_truncated: u64,
@@ -405,6 +412,13 @@ extern "system" {
     fn Process32NextW(h_snapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
     fn CreateJobObjectW(lp_job_attributes: *const c_void, lp_name: *const u16) -> HANDLE;
     fn AssignProcessToJobObject(h_job: HANDLE, h_process: HANDLE) -> BOOL;
+    fn GetWindowsDirectoryW(lp_buffer: *mut u16, u_size: UINT) -> UINT;
+    fn QueryFullProcessImageNameW(
+        h_process: HANDLE,
+        dw_flags: DWORD,
+        lp_exe_name: *mut u16,
+        lpdw_size: *mut DWORD,
+    ) -> BOOL;
     fn QueryInformationJobObject(
         h_job: HANDLE,
         job_object_information_class: i32,
@@ -884,6 +898,97 @@ fn can_add_via_parent(
     }
 }
 
+fn windows_dir_lower() -> String {
+    unsafe {
+        let mut buf = vec![0u16; 260];
+        let n = GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as UINT);
+        if n == 0 || n as usize >= buf.len() {
+            return "c:\\windows\\".to_string();
+        }
+        let mut s = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+        if !s.ends_with('\\') {
+            s.push('\\');
+        }
+        s
+    }
+}
+
+fn process_exe_path(pid: u32) -> Option<String> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h == 0 || h == -1 {
+            return None;
+        }
+        let mut buf = vec![0u16; 1024];
+        let mut size: DWORD = buf.len() as DWORD;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buf[..size as usize]))
+    }
+}
+
+fn record_anchor(sec: &mut Section, exe_path: &str) {
+    let lower = exe_path.to_lowercase();
+    let win = windows_dir_lower();
+    if lower.starts_with(&win) {
+        // Windows 目录下的 exe 只记完整路径，不记目录。
+        sec.anchor_files.insert(lower);
+    } else if let Some(pos) = lower.rfind('\\') {
+        let dir = lower[..=pos].to_string();
+        sec.anchor_dirs.insert(dir);
+    }
+}
+
+/// 作业/快照成员是不是本段的核心进程。
+/// - 父进程是根 cmd、且创建时间晚于根 cmd 的直接子进程，一定是核心
+///   （即使这时还拿不到它的 exe 路径，锚点还没记下来）；
+/// - exe 路径落在锚点目录、或等于锚点完整路径的，是核心；
+/// - exe 路径拿不到的，按核心算（保守：宁可多等一会，也不提前判定退出）；
+/// - 其余的都是外来进程：搜狗 SGTool、360 注入模块等，它们不在启动程序的目录里。
+/// parent_ppid 为 None 时表示快照里没找到该进程的父进程信息，按路径判断。
+fn is_core_process(
+    sec: &Section,
+    pid: u32,
+    parent_ppid: Option<u32>,
+    exe_path: Option<&str>,
+) -> bool {
+    if let Some(ppid) = parent_ppid {
+        if ppid == sec.root_pid {
+            let root_creation = sec.pid_creation.get(&sec.root_pid).copied().unwrap_or(0);
+            let child_creation = sec.pid_creation.get(&pid).copied().unwrap_or(0);
+            if root_creation != 0 && child_creation != 0 {
+                if filetime_to_unix(child_creation) > filetime_to_unix(root_creation) {
+                    return true;
+                }
+                // 创建时间对不上（PID 复用、直接子进程是假的），不按直接子进程算，继续按路径判断。
+            } else if root_creation == 0 {
+                // 根 cmd 创建时间没拿到，无法做创建时间校验，仍按直接子进程算核心，
+                // 因为父进程 PID 本身就是最直接的证据，且 PID 复用概率极低。
+                return true;
+            }
+        }
+    }
+    let Some(path) = exe_path else {
+        return true;
+    };
+    let lower = path.to_lowercase();
+    if sec.anchor_files.contains(&lower) {
+        return true;
+    }
+    if sec.anchor_dirs.iter().any(|d| lower.starts_with(d)) {
+        return true;
+    }
+    // 锚点还没记下来（主程序死得太快、还没来得及轮询）时，全部按核心算，
+    // 避免在没证据时提前判定退出；锚点一旦记下来，外来进程就会被正确排除。
+    if sec.anchor_dirs.is_empty() && sec.anchor_files.is_empty() {
+        return true;
+    }
+    false
+}
+
 fn snapshot_pid_names() -> HashMap<u32, String> {
     let mut map = HashMap::new();
     unsafe {
@@ -1051,6 +1156,32 @@ fn update_descendants(shared: &Shared) {
                 sec.pid_last_seen_unix.insert(*pid, now_unix);
             }
         }
+        // 锚点记录：轮询作业成员时，凡是父进程是本段根 cmd 的直接子进程，
+        // 就记下它的 exe 归属。判断父进程时沿用创建时间校验：
+        // 子进程创建时间必须晚于根 cmd，否则是 PID 复用造成的假直接子进程，不记。
+        // 根 cmd 死了以后，快照里孤儿的父进程 PID 仍然是根 cmd，所以即使
+        // 根 cmd 已退，主程序还活着时锚点仍能记下来。
+        {
+            let root_creation = sec.pid_creation.get(&sec.root_pid).copied().unwrap_or(0);
+            for (pid, ppid) in &list {
+                if *ppid != sec.root_pid || *pid == sec.root_pid {
+                    continue;
+                }
+                let in_job = idx < job_lists.len() && job_lists[idx].contains(pid);
+                if !in_job && !sec.pids.contains(pid) {
+                    continue;
+                }
+                let child_creation = sec.pid_creation.get(pid).copied().unwrap_or(0);
+                if root_creation != 0 && child_creation != 0 {
+                    if filetime_to_unix(child_creation) <= filetime_to_unix(root_creation) {
+                        continue;
+                    }
+                }
+                if let Some(path) = process_exe_path(*pid) {
+                    record_anchor(sec, &path);
+                }
+            }
+        }
         // 快照父子链：只作作业的兜底（脱离作业的进程），且加入时必须通过
         // 创建时间顺序检查。以前这里只看“父进程 PID 在集合里”，
         // 死父进程 PID 一直留着当标记，任何父进程 PID 等于它的无关进程
@@ -1102,7 +1233,8 @@ fn update_descendants(shared: &Shared) {
 
 fn check_sections_exited(shared: &Shared) {
     update_descendants(shared);
-    let (alive_set, _) = snapshot_processes();
+    let (alive_set, snap_list) = snapshot_processes();
+    let parent_map: HashMap<u32, u32> = snap_list.into_iter().collect();
     let mut newly: Vec<String> = Vec::new();
     {
         let mut sections = match shared.sections.lock() {
@@ -1121,16 +1253,25 @@ fn check_sections_exited(shared: &Shared) {
             if !root_exited {
                 continue;
             }
-            // 退出判定以作业对象为准，父进程 PID 不等于归属：
-            // 作业分配成功时，只看 1) 根 cmd 已退出；2) 作业对象里已无活进程。
-            // 快照后代不再决定退出，只留着做诊断。否则搜狗输入法 SGTool
-            // 这种按需拉起、父进程指向浏览器、但不在作业里的共享助手，
-            // 浏览器退了它还活着，就会让主段永远退不出去；v2rayN 那种
-            // 无关进程树被误吸进来时也是同理。
+            // 退出判定以作业对象为准，再以锚点目录区分核心/外来：
+            // 作业分配成功时，只看 1) 根 cmd 已退出；2) 作业对象里已无核心进程。
+            // 快照后代不再决定退出，只留着做诊断。作业成员关系是内核自动继承的，
+            // 搜狗 SGTool 这种从浏览器进程内部拉起来的共享助手也会进作业，
+            // 所以只看作业空不空还不够：它的 exe 在 SogouInput 目录，不在
+            // 锚点目录里，算外来进程，不阻塞退出、不被关闭/强杀。
             // 只有作业分配失败（job_handle 无效）时，才回退到快照判断，
             // 因为那时作业根本没有跟踪能力，快照是唯一的来源。
             let job_pids = query_job_pids(sec.job_handle);
-            if !job_pids.is_empty() {
+            let job_core: Vec<u32> = job_pids
+                .iter()
+                .copied()
+                .filter(|pid| {
+                    let ppid = parent_map.get(pid).copied();
+                    let path = process_exe_path(*pid);
+                    is_core_process(sec, *pid, ppid, path.as_deref())
+                })
+                .collect();
+            if !job_core.is_empty() {
                 continue;
             }
             let job_valid = sec.job_handle != 0 && sec.job_handle != -1;
@@ -1156,7 +1297,10 @@ fn check_sections_exited(shared: &Shared) {
                         reused.push(*pid);
                         return false;
                     }
-                    true
+                    // 回退时同样按锚点区分核心/外来，外来进程不阻塞退出。
+                    let ppid = parent_map.get(pid).copied();
+                    let path = process_exe_path(*pid);
+                    is_core_process(sec, *pid, ppid, path.as_deref())
                 });
             for pid in reused {
                 sec.pids.remove(&pid);
@@ -1181,7 +1325,7 @@ fn maybe_log_main_blockers(shared: &Shared) {
     if shared.main_name.is_empty() {
         return;
     }
-    let (main_name, root_exited, job_pids, desc_alive, job_valid) = {
+    let (main_name, root_exited, job_core, job_foreign, desc_alive, job_valid) = {
         let Ok(sections) = shared.sections.lock() else {
             return;
         };
@@ -1201,7 +1345,19 @@ fn maybe_log_main_blockers(shared: &Shared) {
             return;
         }
         let job_pids = query_job_pids(sec.job_handle);
-        let (alive_set, _) = snapshot_processes();
+        let (alive_set, snap_list) = snapshot_processes();
+        let parent_map: HashMap<u32, u32> = snap_list.into_iter().collect();
+        let mut core = Vec::new();
+        let mut foreign = Vec::new();
+        for pid in &job_pids {
+            let ppid = parent_map.get(pid).copied();
+            let path = process_exe_path(*pid);
+            if is_core_process(sec, *pid, ppid, path.as_deref()) {
+                core.push(*pid);
+            } else {
+                foreign.push(*pid);
+            }
+        }
         let mut desc: Vec<u32> = Vec::new();
         for pid in &sec.pids {
             if *pid == sec.root_pid {
@@ -1216,17 +1372,17 @@ fn maybe_log_main_blockers(shared: &Shared) {
             }
             desc.push(*pid);
         }
-        (sec.name.clone(), root_exited, job_pids, desc, job_valid)
+        (sec.name.clone(), root_exited, core, foreign, desc, job_valid)
     };
     let _ = root_exited;
-    // 作业为准时，快照后代再多也不算阻塞，不写“段未判定退出”：
-    // 否则 SGTool 还活着时日志会一直刷，好像主段还卡着，其实它已经
-    // 按作业规则退出了。作业无效回退时，快照后代才算阻塞。
+    // 只在核心进程还活着时报“段未判定退出”；只有外来进程时，
+    // 主段按锚点规则已经退出了，不写这条日志，避免 SGTool 还活着时
+    // 日志一直刷、好像还卡着的误导。外来进程单独列一行，方便排查。
     if job_valid {
-        if job_pids.is_empty() {
+        if job_core.is_empty() {
             return;
         }
-    } else if job_pids.is_empty() && desc_alive.is_empty() {
+    } else if job_core.is_empty() && desc_alive.is_empty() {
         return;
     }
     let should_log = {
@@ -1251,16 +1407,18 @@ fn maybe_log_main_blockers(shared: &Shared) {
     let names = snapshot_pid_names();
     let msg = if job_valid {
         format!(
-            "主程序 {} 根进程已退出，但作业后代还活着，段未判定退出：作业对象活进程 [{}]，快照后代（仅诊断，不阻塞退出） [{}]",
+            "主程序 {} 根进程已退出，但作业核心进程还活着，段未判定退出：作业核心进程 [{}]，已忽略的外来进程 [{}]，快照后代（仅诊断，不阻塞退出） [{}]",
             main_name,
-            fmt_pid_list(&job_pids, &names),
+            fmt_pid_list(&job_core, &names),
+            fmt_pid_list(&job_foreign, &names),
             fmt_pid_list(&desc_alive, &names)
         )
     } else {
         format!(
-            "主程序 {} 根进程已退出，但后代还活着，段未判定退出（作业无效，回退快照判断）：作业对象活进程 [{}]，后代活进程 [{}]",
+            "主程序 {} 根进程已退出，但后代还活着，段未判定退出（作业无效，回退快照判断）：作业核心进程 [{}]，已忽略的外来进程 [{}]，后代活进程 [{}]",
             main_name,
-            fmt_pid_list(&job_pids, &names),
+            fmt_pid_list(&job_core, &names),
+            fmt_pid_list(&job_foreign, &names),
             fmt_pid_list(&desc_alive, &names)
         )
     };
@@ -1286,17 +1444,27 @@ fn is_main_exited(shared: &Shared) -> bool {
 /// 作业无效时回退到跟踪集合（快照），因为那时没有别的归属证据。
 fn tracked_pids(shared: &Shared) -> HashSet<u32> {
     let mut set = HashSet::new();
+    let (_, snap_list) = snapshot_processes();
+    let parent_map: HashMap<u32, u32> = snap_list.into_iter().collect();
     if let Ok(sections) = shared.sections.lock() {
         for sec in sections.iter() {
             if sec.job_handle != 0 && sec.job_handle != -1 {
                 for pid in query_job_pids(sec.job_handle) {
-                    set.insert(pid);
+                    let ppid = parent_map.get(&pid).copied();
+                    let path = process_exe_path(pid);
+                    if is_core_process(sec, pid, ppid, path.as_deref()) {
+                        set.insert(pid);
+                    }
                 }
                 // 根 cmd 活着时一定在作业里，上面已含；根已退时不在作业里，
                 // 也不用再把它加回来（退出判定里根已退就不再等它）。
             } else {
                 for pid in &sec.pids {
-                    set.insert(*pid);
+                    let ppid = parent_map.get(pid).copied();
+                    let path = process_exe_path(*pid);
+                    if is_core_process(sec, *pid, ppid, path.as_deref()) {
+                        set.insert(*pid);
+                    }
                 }
             }
         }
@@ -1327,16 +1495,22 @@ fn enum_windows_for_pids(pids: &HashSet<u32>) -> Vec<HWND> {
 }
 
 fn remaining_pids(shared: &Shared) -> Vec<u32> {
-    let (alive_set, _) = snapshot_processes();
+    let (alive_set, snap_list) = snapshot_processes();
+    let parent_map: HashMap<u32, u32> = snap_list.into_iter().collect();
     let mut remaining: Vec<u32> = Vec::new();
     if let Ok(sections) = shared.sections.lock() {
         for sec in sections.iter() {
             if sec.job_handle != 0 && sec.job_handle != -1 {
-                // 作业为准：作业成员就是内核证明的归属，创建时间比对
-                // 在这里不再用来排除它（作业成员复用 PID 也是作业成员，
-                // 杀它仍然是对的；快照-only 的进程根本不会出现在这里）。
+                // 作业为准、锚点区分核心/外来：作业成员里只有核心进程才进
+                // 关闭/强杀名单，外来进程（SGTool 等）即使在作业里也不杀。
+                // 作业成员复用 PID 也是作业成员，创建时间比对不再用来排除核心进程。
                 for pid in query_job_pids(sec.job_handle) {
                     if !alive_set.contains(&pid) {
+                        continue;
+                    }
+                    let ppid = parent_map.get(&pid).copied();
+                    let path = process_exe_path(pid);
+                    if !is_core_process(sec, pid, ppid, path.as_deref()) {
                         continue;
                     }
                     if pid == sec.root_pid {
@@ -1356,13 +1530,18 @@ fn remaining_pids(shared: &Shared) -> Vec<u32> {
                 continue;
             }
             // 回退：作业无效时用跟踪集合（快照），且强杀前比对创建时间：
-            // 对不上就是 PID 被复用了，绝不杀它。
+            // 对不上就是 PID 被复用了，绝不杀它；外来进程同样不杀。
             for pid in &sec.pids {
                 if !alive_set.contains(pid) {
                     continue;
                 }
                 let recorded = sec.pid_creation.get(pid).copied().unwrap_or(0);
                 if recorded != 0 && !is_same_process(*pid, recorded) {
+                    continue;
+                }
+                let ppid = parent_map.get(pid).copied();
+                let path = process_exe_path(*pid);
+                if !is_core_process(sec, *pid, ppid, path.as_deref()) {
                     continue;
                 }
                 if *pid == sec.root_pid {
@@ -1781,6 +1960,8 @@ fn launch_section(shared_arc: Arc<Shared>, name: &str, script: &str, current_dir
                 pids,
                 pid_creation,
                 pid_last_seen_unix,
+                anchor_dirs: HashSet::new(),
+                anchor_files: HashSet::new(),
                 exited: false,
                 output_text: String::new(),
                 output_truncated: 0,
