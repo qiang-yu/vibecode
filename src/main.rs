@@ -259,6 +259,10 @@ struct Section {
     // PID -> 创建时间（FILETIME 合成 u64，0 = 未能拿到，退回纯 PID 判断）。
     // PID 复用时创建时间一定不同，靠它区分“旧进程死了、新进程复用了 PID”。
     pid_creation: HashMap<u32, u64>,
+    // PID -> 最后一次在快照里看到它还活着的 Unix 秒。
+    // 用于判断“父进程死后才出现的子进程”：父进程最后一次活着之后
+    // 超过宽限还新出现的、父进程 PID 相同的进程，不可能是原父进程的子进程。
+    pid_last_seen_unix: HashMap<u32, u64>,
     exited: bool,
     output_text: String,
     output_truncated: u64,
@@ -814,6 +818,10 @@ fn is_same_process(pid: u32, recorded: u64) -> bool {
 
 /// 第一次发现 PID 时记下创建时间；已记录且创建时间变了，
 /// 说明是父进程/作业新起的、复用了旧 PID 的子进程，更新成新的。
+/// 注意：这个“更新”只对作业列表里的 PID 安全（作业是内核成员关系），
+/// 快照父子链里已在集合里的 PID 绝不能靠它来“合法化”，
+/// 否则误加的进程会在这里把创建时间改成它自己的，之后就再也查不出来了。
+/// 所以下面快照加入时另有独立的创建时间顺序检查，不走这条更新路径。
 fn record_pid_creation(sec: &mut Section, pid: u32) {
     if let Some(&recorded) = sec.pid_creation.get(&pid) {
         if recorded != 0 {
@@ -826,6 +834,54 @@ fn record_pid_creation(sec: &mut Section, pid: u32) {
         return;
     }
     sec.pid_creation.insert(pid, process_creation_time(pid).unwrap_or(0));
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn filetime_to_unix(ft: u64) -> u64 {
+    // FILETIME 是 100 纳秒，自 1601 年起；Unix 纪元差 11644473600 秒。
+    const EPOCH_DIFF_100NS: u64 = 116444736000000000;
+    if ft < EPOCH_DIFF_100NS {
+        0
+    } else {
+        (ft - EPOCH_DIFF_100NS) / 10_000_000
+    }
+}
+
+/// 快照父子链加入检查：子进程能不能是父进程的子进程。
+/// 必须同时满足：
+/// 1) 子进程创建时间晚于父进程创建时间（子进程比父进程早出生就不可能是它的子进程，
+///    典型就是 v2rayN 那种：无关进程创建时间早于后来复用其父进程 PID 的浏览器子进程）；
+/// 2) 父进程还活着时自动满足；父进程已死时，子进程创建时间
+///    不能晚于父进程最后一次被看到还活着的时间 + 5 秒宽限
+///    （宽限是轮询间隔和秒级截断的误差，父进程死后几分钟、几小时才出现的新进程一定不满足）。
+/// 任一条件不满足就不加入，宁可漏掉一个极罕见的脱离作业孤儿，
+/// 也不把一整棵无关进程树吸进来、让主段永远退不出去、甚至强杀错进程。
+/// 作业列表加入不走这个检查，因为作业是内核成员关系，不是靠父进程 PID 猜的。
+fn can_add_via_parent(
+    parent_creation: u64,
+    parent_alive: bool,
+    parent_last_seen_unix: Option<u64>,
+    child_creation: u64,
+) -> bool {
+    if parent_creation == 0 || child_creation == 0 {
+        return false;
+    }
+    if filetime_to_unix(child_creation) <= filetime_to_unix(parent_creation) {
+        return false;
+    }
+    if parent_alive {
+        return true;
+    }
+    match parent_last_seen_unix {
+        Some(last) => filetime_to_unix(child_creation) <= last.saturating_add(5),
+        None => false,
+    }
 }
 
 fn snapshot_pid_names() -> HashMap<u32, String> {
@@ -959,7 +1015,7 @@ fn snapshot_processes() -> (HashSet<u32>, Vec<(u32, u32)>) {
 }
 
 fn update_descendants(shared: &Shared) {
-    let (_set, list) = snapshot_processes();
+    let (alive_set, list) = snapshot_processes();
     // 先把每段作业对象的进程列表取出来，避免在锁里调内核查询时
     // 借用问题：job 句柄是整数，复制出来即可。
     let job_handles: Vec<HANDLE> = match shared.sections.lock() {
@@ -971,28 +1027,74 @@ fn update_descendants(shared: &Shared) {
         Ok(g) => g,
         Err(_) => return,
     };
+    let now_unix = unix_now();
     for (idx, sec) in sections.iter_mut().enumerate() {
+        // 本次快照里还活着的已跟踪进程，更新最后一次活着的时间。
+        // 死进程不更新，last_seen 就停在它最后一次活着的那次轮询。
+        for pid in sec.pids.clone().iter() {
+            if alive_set.contains(pid) {
+                sec.pid_last_seen_unix.insert(*pid, now_unix);
+            }
+        }
         // 作业对象是内核级跟踪：中间进程活多久都不影响，
         // 它的子进程一创建就自动进作业，查作业列表就能直接拿到。
+        // 作业成员关系是内核保证的，不用、也不走快照父子链的创建时间检查。
         if idx < job_lists.len() {
             for pid in &job_lists[idx] {
                 if sec.pids.insert(*pid) {
                     record_pid_creation(sec, *pid);
                 } else {
                     // 已在集合里：若创建时间变了，说明是新起的、复用旧 PID 的子进程。
+                    // 只有作业列表能这样更新，因为作业成员关系本身就是证据。
                     record_pid_creation(sec, *pid);
                 }
+                sec.pid_last_seen_unix.insert(*pid, now_unix);
             }
         }
+        // 快照父子链：只作作业的兜底（脱离作业的进程），且加入时必须通过
+        // 创建时间顺序检查。以前这里只看“父进程 PID 在集合里”，
+        // 死父进程 PID 一直留着当标记，任何父进程 PID 等于它的无关进程
+        // （比如 v2rayN，它的父进程 PID 后来被浏览器子进程复用了）
+        // 都会被吸进来，再带进它整棵子树，导致主段永远退不出去。
         let mut changed = true;
         while changed {
             changed = false;
             for (pid, ppid) in &list {
-                if sec.pids.contains(ppid) && !sec.pids.contains(pid) {
-                    sec.pids.insert(*pid);
-                    record_pid_creation(sec, *pid);
-                    changed = true;
+                if !sec.pids.contains(ppid) || sec.pids.contains(pid) {
+                    continue;
                 }
+                // 父进程创建时间：已记录的直接用；没记录、但父进程现在还活着的，
+                // 现在打开一次拿到（父进程活着，现在拿到的就是它自己的时间）；
+                // 没记录、父进程现在也死了的，无法验证，直接不加。
+                let parent_creation = match sec.pid_creation.get(ppid).copied() {
+                    Some(t) if t != 0 => t,
+                    _ => {
+                        if !alive_set.contains(ppid) {
+                            continue;
+                        }
+                        match process_creation_time(*ppid) {
+                            Some(t) => {
+                                sec.pid_creation.insert(*ppid, t);
+                                t
+                            }
+                            None => continue,
+                        }
+                    }
+                };
+                let Some(child_creation) = process_creation_time(*pid) else {
+                    // 子进程打不开（已在快照和打开之间退了，或权限不够），
+                    // 这次不加，下次轮询如果还在、能打开再加，不会漏掉活进程。
+                    continue;
+                };
+                let parent_alive = alive_set.contains(ppid);
+                let parent_last_seen = sec.pid_last_seen_unix.get(ppid).copied();
+                if !can_add_via_parent(parent_creation, parent_alive, parent_last_seen, child_creation) {
+                    continue;
+                }
+                sec.pids.insert(*pid);
+                sec.pid_creation.insert(*pid, child_creation);
+                sec.pid_last_seen_unix.insert(*pid, now_unix);
+                changed = true;
             }
         }
     }
@@ -1049,6 +1151,7 @@ fn check_sections_exited(shared: &Shared) {
             for pid in reused {
                 sec.pids.remove(&pid);
                 sec.pid_creation.remove(&pid);
+                sec.pid_last_seen_unix.remove(&pid);
             }
             if !any_desc_alive {
                 sec.exited = true;
@@ -1592,6 +1695,8 @@ fn launch_section(shared_arc: Arc<Shared>, name: &str, script: &str, current_dir
             pi.dw_process_id,
             creation_time_from_handle(pi.h_process).unwrap_or(0),
         );
+        let mut pid_last_seen_unix = HashMap::new();
+        pid_last_seen_unix.insert(pi.dw_process_id, unix_now());
         if let Ok(mut sections) = shared.sections.lock() {
             sections.push(Section {
                 name: name.to_string(),
@@ -1600,6 +1705,7 @@ fn launch_section(shared_arc: Arc<Shared>, name: &str, script: &str, current_dir
                 job_handle,
                 pids,
                 pid_creation,
+                pid_last_seen_unix,
                 exited: false,
                 output_text: String::new(),
                 output_truncated: 0,
