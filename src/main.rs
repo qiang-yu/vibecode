@@ -270,6 +270,9 @@ struct Section {
     // 其余（搜狗 SGTool、360 注入模块等外来进程）不阻塞退出、不被关闭/强杀。
     anchor_dirs: HashSet<String>,
     anchor_files: HashSet<String>,
+    // 已经记过锚点的直接子进程：PID -> 记锚点时的创建时间。
+    // 同一进程实例每轮不再重复查 exe 路径；PID 被复用、创建时间变了时重新记。
+    anchor_recorded: HashMap<u32, u64>,
     exited: bool,
     output_text: String,
     output_truncated: u64,
@@ -804,6 +807,27 @@ fn creation_time_from_handle(handle: HANDLE) -> Option<u64> {
     }
 }
 
+fn exit_time_from_handle(handle: HANDLE) -> Option<u64> {
+    if handle == 0 || handle == -1 {
+        return None;
+    }
+    unsafe {
+        let mut creation: FILETIME = FILETIME { dw_low_datetime: 0, dw_high_datetime: 0 };
+        let mut exit: FILETIME = FILETIME { dw_low_datetime: 0, dw_high_datetime: 0 };
+        let mut kernel: FILETIME = FILETIME { dw_low_datetime: 0, dw_high_datetime: 0 };
+        let mut user: FILETIME = FILETIME { dw_low_datetime: 0, dw_high_datetime: 0 };
+        if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+            return None;
+        }
+        let t = ((exit.dw_high_datetime as u64) << 32) | (exit.dw_low_datetime as u64);
+        if t == 0 {
+            None
+        } else {
+            Some(t)
+        }
+    }
+}
+
 fn process_creation_time(pid: u32) -> Option<u64> {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -886,7 +910,9 @@ fn can_add_via_parent(
     if parent_creation == 0 || child_creation == 0 {
         return false;
     }
-    if filetime_to_unix(child_creation) <= filetime_to_unix(parent_creation) {
+    // 同样用原始 FILETIME 比较，不转秒：同一秒内创建的父子进程很常见，
+    // 转秒会把它们误判为复用而漏加。
+    if child_creation <= parent_creation {
         return false;
     }
     if parent_alive {
@@ -899,18 +925,21 @@ fn can_add_via_parent(
 }
 
 fn windows_dir_lower() -> String {
-    unsafe {
-        let mut buf = vec![0u16; 260];
-        let n = GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as UINT);
-        if n == 0 || n as usize >= buf.len() {
-            return "c:\\windows\\".to_string();
-        }
-        let mut s = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
-        if !s.ends_with('\\') {
-            s.push('\\');
-        }
-        s
-    }
+    static WIN_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    WIN_DIR
+        .get_or_init(|| unsafe {
+            let mut buf = vec![0u16; 260];
+            let n = GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as UINT);
+            if n == 0 || n as usize >= buf.len() {
+                return "c:\\windows\\".to_string();
+            }
+            let mut s = String::from_utf16_lossy(&buf[..n as usize]).to_lowercase();
+            if !s.ends_with('\\') {
+                s.push('\\');
+            }
+            s
+        })
+        .clone()
 }
 
 fn process_exe_path(pid: u32) -> Option<String> {
@@ -930,6 +959,38 @@ fn process_exe_path(pid: u32) -> Option<String> {
     }
 }
 
+/// exe 路径缓存：键是 PID + 创建时间，进程实例不变就不再 OpenProcess。
+/// 创建时间从 sec.pid_creation 里取（跟踪时已经拿到过），查缓存本身不需要
+/// 再打开进程；创建时间未知（0）时不缓存，每次现查。
+/// 缓存是全局的，因为 PID + 创建时间在系统范围内唯一标识一个进程实例，
+/// 不同段查到同一进程时路径一定相同。
+fn cached_exe_path(sec: &Section, pid: u32) -> Option<String> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<(u32, u64), Option<String>>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let creation = sec.pid_creation.get(&pid).copied().unwrap_or(0);
+    if creation != 0 {
+        if let Ok(map) = cache.lock() {
+            if let Some(cached) = map.get(&(pid, creation)) {
+                return cached.clone();
+            }
+        }
+    }
+    let path = process_exe_path(pid);
+    if creation != 0 {
+        if let Ok(mut map) = cache.lock() {
+            // 缓存条数只跟本轮遇到过的进程实例数相当，不会无限增长到失控，
+            // DogTray 一轮通常只有几十个进程；超过 10000 条时清空重建，
+            // 避免长期运行后旧 PID 复用条目越积越多。
+            if map.len() > 10000 {
+                map.clear();
+            }
+            map.insert((pid, creation), path.clone());
+        }
+    }
+    path
+}
+
 fn record_anchor(sec: &mut Section, exe_path: &str) {
     let lower = exe_path.to_lowercase();
     let win = windows_dir_lower();
@@ -943,27 +1004,38 @@ fn record_anchor(sec: &mut Section, exe_path: &str) {
 }
 
 /// 作业/快照成员是不是本段的核心进程。
-/// - 父进程是根 cmd、且创建时间晚于根 cmd 的直接子进程，一定是核心
-///   （即使这时还拿不到它的 exe 路径，锚点还没记下来）；
+/// - 父进程是根 cmd 的直接子进程，一定是核心，但必须同时满足：
+///   1) 创建时间用原始 FILETIME（100 纳秒精度）比较，子进程晚于根 cmd；
+///      转成秒再比较会把同一秒内创建的 cmd 和子进程误判为复用，锚点记不上；
+///   2) 根 cmd 已退出时，子进程创建时间必须早于根 cmd 退出时间；
+///      否则根 cmd 退出后 PID 被复用、新进程拉起的 SGTool 也会被误判为核心。
+///      root_exit_time == 0 表示根 cmd 还没退、或拿不到退出时间，此时不设上限。
 /// - exe 路径落在锚点目录、或等于锚点完整路径的，是核心；
 /// - exe 路径拿不到的，按核心算（保守：宁可多等一会，也不提前判定退出）；
 /// - 其余的都是外来进程：搜狗 SGTool、360 注入模块等，它们不在启动程序的目录里。
 /// parent_ppid 为 None 时表示快照里没找到该进程的父进程信息，按路径判断。
+/// 兜底：只有 anchor_dirs 为空时才全部按核心算。Windows 目录下的完整路径
+/// 锚点（xcopy、timeout 之类）不能代表主程序，不能让兜底失效，
+/// 否则启动器早死、主程序目录还没记下来时，真正的浏览器会被判成外来。
 fn is_core_process(
     sec: &Section,
     pid: u32,
     parent_ppid: Option<u32>,
     exe_path: Option<&str>,
+    root_exit_time: u64,
 ) -> bool {
     if let Some(ppid) = parent_ppid {
         if ppid == sec.root_pid {
             let root_creation = sec.pid_creation.get(&sec.root_pid).copied().unwrap_or(0);
             let child_creation = sec.pid_creation.get(&pid).copied().unwrap_or(0);
             if root_creation != 0 && child_creation != 0 {
-                if filetime_to_unix(child_creation) > filetime_to_unix(root_creation) {
+                if child_creation > root_creation
+                    && (root_exit_time == 0 || child_creation < root_exit_time)
+                {
                     return true;
                 }
-                // 创建时间对不上（PID 复用、直接子进程是假的），不按直接子进程算，继续按路径判断。
+                // 创建时间对不上（PID 复用、直接子进程是假的，或子进程
+                // 在根 cmd 退出后才出现），不按直接子进程算，继续按路径判断。
             } else if root_creation == 0 {
                 // 根 cmd 创建时间没拿到，无法做创建时间校验，仍按直接子进程算核心，
                 // 因为父进程 PID 本身就是最直接的证据，且 PID 复用概率极低。
@@ -981,12 +1053,14 @@ fn is_core_process(
     if sec.anchor_dirs.iter().any(|d| lower.starts_with(d)) {
         return true;
     }
-    // 锚点还没记下来（主程序死得太快、还没来得及轮询）时，全部按核心算，
-    // 避免在没证据时提前判定退出；锚点一旦记下来，外来进程就会被正确排除。
-    if sec.anchor_dirs.is_empty() && sec.anchor_files.is_empty() {
+    if sec.anchor_dirs.is_empty() {
         return true;
     }
     false
+}
+
+fn root_exit_time_of(sec: &Section) -> u64 {
+    exit_time_from_handle(sec.root_handle).unwrap_or(0)
 }
 
 fn snapshot_pid_names() -> HashMap<u32, String> {
@@ -1156,29 +1230,55 @@ fn update_descendants(shared: &Shared) {
                 sec.pid_last_seen_unix.insert(*pid, now_unix);
             }
         }
-        // 锚点记录：轮询作业成员时，凡是父进程是本段根 cmd 的直接子进程，
-        // 就记下它的 exe 归属。判断父进程时沿用创建时间校验：
-        // 子进程创建时间必须晚于根 cmd，否则是 PID 复用造成的假直接子进程，不记。
-        // 根 cmd 死了以后，快照里孤儿的父进程 PID 仍然是根 cmd，所以即使
-        // 根 cmd 已退，主程序还活着时锚点仍能记下来。
+        // 锚点记录：轮询作业成员时记两种锚点。
+        // 1) 父进程是本段根 cmd 的直接子进程，就记下它的 exe 归属。
+        //    判断时用原始 FILETIME 比较，子进程必须晚于根 cmd，
+        //    且根 cmd 已退出时必须早于根 cmd 退出时间，否则是 PID 复用
+        //    造成的假直接子进程，不记。同一秒内创建很常见，转秒比较会
+        //    把 xray、VirtualBrowser 这种几乎和 cmd 同时启动的程序漏掉。
+        //    根 cmd 死了以后，快照里孤儿的父进程 PID 仍然是根 cmd，所以即使
+        //    根 cmd 已退，主程序还活着时锚点仍能记下来。
+        // 2) 父进程已经不在了、而且从未出现在 sec.pids 里（说明父进程是个
+        //    没来得及观察到的短命中间进程，比如 Chrome launcher），
+        //    就把这个作业成员本身也当作锚点，记下它的目录。
+        //    SGTool 不会命中这条，因为它的父进程是浏览器，浏览器早已被观察到、
+        //    一定在 sec.pids 里。
+        // 已经记过锚点的直接子进程（同一 PID + 创建时间）本轮跳过，不再查路径。
         {
             let root_creation = sec.pid_creation.get(&sec.root_pid).copied().unwrap_or(0);
+            let root_exit = root_exit_time_of(sec);
             for (pid, ppid) in &list {
-                if *ppid != sec.root_pid || *pid == sec.root_pid {
+                if *pid == sec.root_pid {
                     continue;
                 }
                 let in_job = idx < job_lists.len() && job_lists[idx].contains(pid);
                 if !in_job && !sec.pids.contains(pid) {
                     continue;
                 }
+                let is_direct_child = *ppid == sec.root_pid;
+                let is_orphan_from_unseen_parent = *ppid != 0
+                    && !alive_set.contains(ppid)
+                    && !sec.pids.contains(ppid);
+                if !is_direct_child && !is_orphan_from_unseen_parent {
+                    continue;
+                }
                 let child_creation = sec.pid_creation.get(pid).copied().unwrap_or(0);
-                if root_creation != 0 && child_creation != 0 {
-                    if filetime_to_unix(child_creation) <= filetime_to_unix(root_creation) {
+                if is_direct_child && root_creation != 0 && child_creation != 0 {
+                    if child_creation <= root_creation {
+                        continue;
+                    }
+                    if root_exit != 0 && child_creation >= root_exit {
                         continue;
                     }
                 }
-                if let Some(path) = process_exe_path(*pid) {
+                if sec.anchor_recorded.get(pid).copied().unwrap_or(0) == child_creation
+                    && child_creation != 0
+                {
+                    continue;
+                }
+                if let Some(path) = cached_exe_path(sec, *pid) {
                     record_anchor(sec, &path);
+                    sec.anchor_recorded.insert(*pid, child_creation);
                 }
             }
         }
@@ -1267,8 +1367,8 @@ fn check_sections_exited(shared: &Shared) {
                 .copied()
                 .filter(|pid| {
                     let ppid = parent_map.get(pid).copied();
-                    let path = process_exe_path(*pid);
-                    is_core_process(sec, *pid, ppid, path.as_deref())
+                    let path = cached_exe_path(sec, *pid);
+                    is_core_process(sec, *pid, ppid, path.as_deref(), root_exit_time_of(sec))
                 })
                 .collect();
             if !job_core.is_empty() {
@@ -1299,8 +1399,8 @@ fn check_sections_exited(shared: &Shared) {
                     }
                     // 回退时同样按锚点区分核心/外来，外来进程不阻塞退出。
                     let ppid = parent_map.get(pid).copied();
-                    let path = process_exe_path(*pid);
-                    is_core_process(sec, *pid, ppid, path.as_deref())
+                    let path = cached_exe_path(sec, *pid);
+                    is_core_process(sec, *pid, ppid, path.as_deref(), root_exit_time_of(sec))
                 });
             for pid in reused {
                 sec.pids.remove(&pid);
@@ -1351,8 +1451,8 @@ fn maybe_log_main_blockers(shared: &Shared) {
         let mut foreign = Vec::new();
         for pid in &job_pids {
             let ppid = parent_map.get(pid).copied();
-            let path = process_exe_path(*pid);
-            if is_core_process(sec, *pid, ppid, path.as_deref()) {
+            let path = cached_exe_path(sec, *pid);
+            if is_core_process(sec, *pid, ppid, path.as_deref(), root_exit_time_of(sec)) {
                 core.push(*pid);
             } else {
                 foreign.push(*pid);
@@ -1451,8 +1551,8 @@ fn tracked_pids(shared: &Shared) -> HashSet<u32> {
             if sec.job_handle != 0 && sec.job_handle != -1 {
                 for pid in query_job_pids(sec.job_handle) {
                     let ppid = parent_map.get(&pid).copied();
-                    let path = process_exe_path(pid);
-                    if is_core_process(sec, pid, ppid, path.as_deref()) {
+                    let path = cached_exe_path(sec, pid);
+                    if is_core_process(sec, pid, ppid, path.as_deref(), root_exit_time_of(sec)) {
                         set.insert(pid);
                     }
                 }
@@ -1461,8 +1561,8 @@ fn tracked_pids(shared: &Shared) -> HashSet<u32> {
             } else {
                 for pid in &sec.pids {
                     let ppid = parent_map.get(pid).copied();
-                    let path = process_exe_path(*pid);
-                    if is_core_process(sec, *pid, ppid, path.as_deref()) {
+                    let path = cached_exe_path(sec, *pid);
+                    if is_core_process(sec, *pid, ppid, path.as_deref(), root_exit_time_of(sec)) {
                         set.insert(*pid);
                     }
                 }
@@ -1509,8 +1609,8 @@ fn remaining_pids(shared: &Shared) -> Vec<u32> {
                         continue;
                     }
                     let ppid = parent_map.get(&pid).copied();
-                    let path = process_exe_path(pid);
-                    if !is_core_process(sec, pid, ppid, path.as_deref()) {
+                    let path = cached_exe_path(sec, pid);
+                    if !is_core_process(sec, pid, ppid, path.as_deref(), root_exit_time_of(sec)) {
                         continue;
                     }
                     if pid == sec.root_pid {
@@ -1540,8 +1640,8 @@ fn remaining_pids(shared: &Shared) -> Vec<u32> {
                     continue;
                 }
                 let ppid = parent_map.get(pid).copied();
-                let path = process_exe_path(*pid);
-                if !is_core_process(sec, *pid, ppid, path.as_deref()) {
+                let path = cached_exe_path(sec, *pid);
+                if !is_core_process(sec, *pid, ppid, path.as_deref(), root_exit_time_of(sec)) {
                     continue;
                 }
                 if *pid == sec.root_pid {
@@ -1962,6 +2062,7 @@ fn launch_section(shared_arc: Arc<Shared>, name: &str, script: &str, current_dir
                 pid_last_seen_unix,
                 anchor_dirs: HashSet::new(),
                 anchor_files: HashSet::new(),
+                anchor_recorded: HashMap::new(),
                 exited: false,
                 output_text: String::new(),
                 output_truncated: 0,
