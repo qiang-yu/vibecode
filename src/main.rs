@@ -263,13 +263,20 @@ struct Section {
     // 用于判断“父进程死后才出现的子进程”：父进程最后一次活着之后
     // 超过宽限还新出现的、父进程 PID 相同的进程，不可能是原父进程的子进程。
     pid_last_seen_unix: HashMap<u32, u64>,
-    // 锚点：本段根 cmd 的直接子进程的 exe 归属。
+    // 自动锚点：本段根 cmd 的直接子进程的 exe 归属。
     // 非 Windows 目录的 exe 记目录（小写、带末尾 \），比如 ...\virtualbrowser\；
     // Windows 目录下的 exe 只记完整路径，不记目录，否则整个 System32 都会变成“自己人”。
     // 作业里只有路径落在锚点目录、或等于锚点完整路径的进程才算核心进程；
     // 其余（搜狗 SGTool、360 注入模块等外来进程）不阻塞退出、不被关闭/强杀。
+    // 注意：自动锚点和手工锚点必须分开存。anchor_dirs.is_empty() 在三处
+    // 表示“还没自动找到主程序目录”（核心兜底、孤儿锚点启用、路径兜底），
+    // 如果手工锚点混进来，一配手工锚点这三处兜底就全部从一开始失效。
     anchor_dirs: HashSet<String>,
     anchor_files: HashSet<String>,
+    // 手工锚点：[main] 或本段里 anchor_dirs= 配的目录，段创建时就存在。
+    // 判断核心时同时查自动和手工两个集合，但“是否为空”的判断只看自动的
+    // anchor_dirs，手工锚点只负责“多认几个自己人”，不改变自动机制行为。
+    manual_anchor_dirs: HashSet<String>,
     // 已经记过锚点的直接子进程：PID -> 记锚点时的创建时间。
     // 同一进程实例每轮不再重复查 exe 路径；PID 被复用、创建时间变了时重新记。
     anchor_recorded: HashMap<u32, u64>,
@@ -304,7 +311,7 @@ struct Shared {
     exe_stem: String,
     tray_tip: String,
     button_sections: Vec<String>,
-    // [main] 里配的全局手工锚点目录，作用于所有段，启动时就写进各段的 anchor_dirs。
+    // [main] 里配的全局手工锚点目录，作用于所有段，启动时就写进各段的 manual_anchor_dirs。
     global_anchor_dirs: Vec<String>,
     output_windows: Mutex<HashMap<HWND, OutputWindowState>>,
     // 主段根进程已退、后代还活着时，上次写诊断日志的时间；首次为 None，立即写一次。
@@ -419,6 +426,13 @@ extern "system" {
     fn AssignProcessToJobObject(h_job: HANDLE, h_process: HANDLE) -> BOOL;
     fn GetWindowsDirectoryW(lp_buffer: *mut u16, u_size: UINT) -> UINT;
     fn GetEnvironmentVariableW(lp_name: *const u16, lp_buffer: *mut u16, n_size: DWORD) -> DWORD;
+    fn ExpandEnvironmentStringsW(lp_src: *const u16, lp_dst: *mut u16, n_size: DWORD) -> DWORD;
+    fn GetFullPathNameW(
+        lp_file_name: *const u16,
+        n_buffer_length: DWORD,
+        lp_buffer: *mut u16,
+        lp_file_part: *mut *mut u16,
+    ) -> DWORD;
     fn QueryFullProcessImageNameW(
         h_process: HANDLE,
         dw_flags: DWORD,
@@ -1034,27 +1048,51 @@ fn is_broad_root_dir(dir: &str) -> bool {
 /// 手工锚点目录规范化：去引号、/ 转 \、小写、补末尾 \、相对路径按当前目录展开。
 /// 返回 None 表示这行写了空值，调用方直接跳过。
 fn normalize_anchor_dir(raw: &str) -> Option<String> {
-    let mut s = strip_quotes(raw.trim()).trim().to_string();
+    let s = strip_quotes(raw.trim()).trim().to_string();
     if s.is_empty() {
         return None;
     }
-    s = s.replace('/', "\\");
-    let is_absolute = (s.len() >= 3 && s.as_bytes()[1] == b':' && s.as_bytes()[2] == b'\\')
-        || s.starts_with("\\\\");
-    if !is_absolute {
-        if let Ok(cur) = std::env::current_dir() {
-            let mut cur_s = cur.to_string_lossy().replace('/', "\\").to_lowercase();
-            if !cur_s.ends_with('\\') {
-                cur_s.push('\\');
+    unsafe {
+        // 1) 展开环境变量：%LOCALAPPDATA%\VirtualBrowser 这种批处理里
+        //    常见的写法，不展开就永远匹配不上规范化后的 exe 路径。
+        let expanded = {
+            let src = wide(&s);
+            let mut buf = vec![0u16; 4096];
+            let n = ExpandEnvironmentStringsW(src.as_ptr(), buf.as_mut_ptr(), buf.len() as DWORD);
+            if n == 0 || n as usize >= buf.len() {
+                s.clone()
+            } else {
+                String::from_utf16_lossy(&buf[..n as usize - 1])
             }
-            s = format!("{}{}", cur_s, s);
+        };
+        // 2) GetFullPathNameW 规范化：处理相对路径、. 和 ..、
+        //    以及 D:foo 这种不带反斜杠的盘符相对写法。
+        //    它按当前目录解析相对路径，不要求路径真实存在。
+        //    注意：..\tools 手工拼当前目录会得到 d:\dog\..\tools\，
+        //    而 QueryFullProcessImageNameW 返回的是 d:\tools\...，
+        //    前缀匹配永远失败，必须在这里规范化掉 ..。
+        let full = {
+            let src = wide(&expanded);
+            let mut buf = vec![0u16; 4096];
+            let mut part: *mut u16 = std::ptr::null_mut();
+            let n = GetFullPathNameW(
+                src.as_ptr(),
+                buf.len() as DWORD,
+                buf.as_mut_ptr(),
+                &mut part,
+            );
+            if n == 0 || n as usize >= buf.len() {
+                expanded.clone()
+            } else {
+                String::from_utf16_lossy(&buf[..n as usize])
+            }
+        };
+        let mut lower = full.replace('/', "\\").to_lowercase();
+        if !lower.ends_with('\\') {
+            lower.push('\\');
         }
+        Some(lower)
     }
-    let mut lower = s.to_lowercase();
-    if !lower.ends_with('\\') {
-        lower.push('\\');
-    }
-    Some(lower)
 }
 
 fn process_exe_path(pid: u32) -> Option<String> {
@@ -1135,9 +1173,12 @@ fn record_anchor(sec: &mut Section, exe_path: &str) {
 /// - exe 路径拿不到的，按核心算（保守：宁可多等一会，也不提前判定退出）；
 /// - 其余的都是外来进程：搜狗 SGTool、360 注入模块等，它们不在启动程序的目录里。
 /// parent_ppid 为 None 时表示快照里没找到该进程的父进程信息，按路径判断。
-/// 兜底：只有 anchor_dirs 为空时才全部按核心算。Windows 目录下的完整路径
+/// 兜底：只有自动的 anchor_dirs 为空时才全部按核心算。Windows 目录下的完整路径
 /// 锚点（xcopy、timeout 之类）不能代表主程序，不能让兜底失效，
 /// 否则启动器早死、主程序目录还没记下来时，真正的浏览器会被判成外来。
+/// 手工锚点不参与这个判断：即使配了手工锚点，自动锚点还没记上时兜底仍生效，
+/// 否则 [main] 里为某个 python 程序配了手工锚点，chrome 段遇到启动器早死
+/// 时孤儿规则和兜底都会失效，真正的浏览器会被判成外来而提前退出。
 fn is_core_process(
     sec: &Section,
     pid: u32,
@@ -1172,6 +1213,9 @@ fn is_core_process(
         return true;
     }
     if sec.anchor_dirs.iter().any(|d| lower.starts_with(d)) {
+        return true;
+    }
+    if sec.manual_anchor_dirs.iter().any(|d| lower.starts_with(d)) {
         return true;
     }
     if sec.anchor_dirs.is_empty() {
@@ -1773,7 +1817,8 @@ fn process_exe_path_from_handle(handle: HANDLE) -> Option<String> {
 
 /// 只按 exe 路径判断核心：用于句柄复核，不含直接子进程判断。
 /// 路径拿不到时按核心算（保守，和 is_core_process 一致）；
-/// 锚点目录为空时也按核心算（兜底，和 is_core_process 一致）。
+/// 自动锚点目录为空时也按核心算（兜底，和 is_core_process 一致，
+/// 手工锚点不参与这个空判断）。
 fn is_core_by_path(sec: &Section, exe_path: Option<&str>) -> bool {
     let Some(path) = exe_path else {
         return true;
@@ -1785,15 +1830,25 @@ fn is_core_by_path(sec: &Section, exe_path: Option<&str>) -> bool {
     if sec.anchor_dirs.iter().any(|d| lower.starts_with(d)) {
         return true;
     }
+    if sec.manual_anchor_dirs.iter().any(|d| lower.starts_with(d)) {
+        return true;
+    }
     sec.anchor_dirs.is_empty()
 }
 
-fn remaining_pids(shared: &Shared) -> Vec<u32> {
+/// 剩余进程列表：(PID, 所属段在 sections 里的下标, 判定当时记录的创建时间)。
+/// 段下标和创建时间必须在这里一起返回，不能让调用方事后再按 PID 反查：
+/// pids / pid_creation 里的旧条目基本不会被清理，A 段很早以前用过的 PID
+/// 现在被 B 段的核心进程复用时，反查会拿到 A 段的旧时间和旧锚点，
+/// 时间对不上、路径又不在 A 段锚点里，就会被判成外来而漏杀。
+/// 这里返回的段下标就是判定核心时用的那一段，创建时间也是那一段里
+/// 当时记录的那一个，和判定时的锚点一一对应。
+fn remaining_pids(shared: &Shared) -> Vec<(u32, usize, u64)> {
     let (alive_set, snap_list) = snapshot_processes();
     let parent_map: HashMap<u32, u32> = snap_list.into_iter().collect();
-    let mut remaining: Vec<u32> = Vec::new();
+    let mut remaining: Vec<(u32, usize, u64)> = Vec::new();
     if let Ok(sections) = shared.sections.lock() {
-        for sec in sections.iter() {
+        for (sec_idx, sec) in sections.iter().enumerate() {
             let root_exit = root_exit_time_of(sec);
             if sec.job_handle != 0 && sec.job_handle != -1 {
                 // 作业为准、锚点区分核心/外来：作业成员里只有核心进程才进
@@ -1818,8 +1873,9 @@ fn remaining_pids(shared: &Shared) -> Vec<u32> {
                             continue;
                         }
                     }
-                    if !remaining.contains(&pid) {
-                        remaining.push(pid);
+                    if !remaining.iter().any(|(p, _, _)| *p == pid) {
+                        let recorded = sec.pid_creation.get(&pid).copied().unwrap_or(0);
+                        remaining.push((pid, sec_idx, recorded));
                     }
                 }
                 continue;
@@ -1849,8 +1905,8 @@ fn remaining_pids(shared: &Shared) -> Vec<u32> {
                         continue;
                     }
                 }
-                if !remaining.contains(pid) {
-                    remaining.push(*pid);
+                if !remaining.iter().any(|(p, _, _)| *p == *pid) {
+                    remaining.push((*pid, sec_idx, recorded));
                 }
             }
         }
@@ -1869,15 +1925,15 @@ fn remaining_pids(shared: &Shared) -> Vec<u32> {
 /// 句柄打不开时返回 0，强杀时走旧的按 PID 打开、创建时间校验的老路，
 /// 不会因为打不开句柄就漏杀。
 /// 调用方必须在强杀后关掉所有非 0 句柄，否则句柄泄漏、PID 一直占着。
-fn remaining_pids_with_handles(shared: &Shared) -> Vec<(u32, HANDLE)> {
-    let pids = remaining_pids(shared);
-    let mut out: Vec<(u32, HANDLE)> = Vec::new();
-    if pids.is_empty() {
+fn remaining_pids_with_handles(shared: &Shared) -> Vec<(u32, HANDLE, u64)> {
+    let entries = remaining_pids(shared);
+    let mut out: Vec<(u32, HANDLE, u64)> = Vec::new();
+    if entries.is_empty() {
         return out;
     }
     if let Ok(sections) = shared.sections.lock() {
-        for pid in pids {
-            if out.iter().any(|(p, _)| *p == pid) {
+        for (pid, sec_idx, recorded) in entries {
+            if out.iter().any(|(p, _, _)| *p == pid) {
                 continue;
             }
             let handle = unsafe {
@@ -1888,26 +1944,19 @@ fn remaining_pids_with_handles(shared: &Shared) -> Vec<(u32, HANDLE)> {
                 )
             };
             if handle == 0 || handle == -1 {
-                out.push((pid, 0));
+                out.push((pid, 0, recorded));
                 continue;
             }
-            let recorded = sections
-                .iter()
-                .find_map(|s| s.pid_creation.get(&pid).copied())
-                .unwrap_or(0);
             let mut keep = true;
             if recorded != 0 {
                 let now = creation_time_from_handle(handle).unwrap_or(0);
                 if now != recorded {
-                    // 快照和打开之间发生了复用：按句柄进程自己的路径再判一次。
-                    let sec_for_path = sections.iter().find(|s| {
-                        s.pids.contains(&pid)
-                            || (s.job_handle != 0
-                                && s.job_handle != -1
-                                && query_job_pids(s.job_handle).contains(&pid))
-                    });
+                    // 快照和打开之间发生了复用：按句柄进程自己的路径再判一次，
+                    // 用 remaining_pids 返回的那个段的锚点，不按 PID 反查：
+                    // 反查会拿到别的段很早以前用过这个 PID 的旧条目，
+                    // 用旧段的锚点判新段的程序，会把该杀的判成外来而漏杀。
                     let path = process_exe_path_from_handle(handle);
-                    let core = match sec_for_path {
+                    let core = match sections.get(sec_idx) {
                         Some(sec) => is_core_by_path(sec, path.as_deref()),
                         None => true,
                     };
@@ -1924,7 +1973,7 @@ fn remaining_pids_with_handles(shared: &Shared) -> Vec<(u32, HANDLE)> {
                 }
             }
             if keep {
-                out.push((pid, handle));
+                out.push((pid, handle, recorded));
             } else {
                 unsafe {
                     CloseHandle(handle);
@@ -1932,9 +1981,10 @@ fn remaining_pids_with_handles(shared: &Shared) -> Vec<(u32, HANDLE)> {
             }
         }
     } else {
-        // 拿不到段锁时无法复核，退回按 PID 的老路，句柄都记 0。
-        for pid in pids {
-            out.push((pid, 0));
+        // 拿不到段锁时无法复核，退回按 PID 的老路，句柄都记 0，
+        // 但创建时间仍用 remaining_pids 返回的那一个，不反查。
+        for (pid, _, recorded) in entries {
+            out.push((pid, 0, recorded));
         }
     }
     out
@@ -2006,7 +2056,7 @@ fn force_kill_remaining(shared: &Shared) {
             .collect(),
         Err(_) => HashSet::new(),
     };
-    for (pid, handle) in &remaining {
+    for (pid, handle, recorded) in &remaining {
         if *handle != 0 && *handle != -1 {
             // 句柄就是判定核心时拿到的那一个，直接杀它，绝不按 PID 重开。
             // 只要句柄还开着，PID 就不可能被复用，杀的永远是原进程。
@@ -2020,14 +2070,9 @@ fn force_kill_remaining(shared: &Shared) {
         if !job_owned.contains(pid) {
             // 句柄打不开时的老路：强杀前最后再比对一次创建时间，
             // 判断和强杀之间也可能发生复用。
-            let recorded = match shared.sections.lock() {
-                Ok(sections) => sections
-                    .iter()
-                    .find_map(|s| s.pid_creation.get(pid).copied())
-                    .unwrap_or(0),
-                Err(_) => 0,
-            };
-            if recorded != 0 && !is_same_process(*pid, recorded) {
+            // 创建时间用 remaining_pids 返回的那一个，不按 PID 反查，
+            // 否则会拿到别的段很早以前用过这个 PID 的旧条目。
+            if *recorded != 0 && !is_same_process(*pid, *recorded) {
                 log_msg(shared, &format!("跳过强杀 PID {}（创建时间对不上，疑似 PID 复用）", pid));
                 continue;
             }
@@ -2041,7 +2086,7 @@ fn force_kill_remaining(shared: &Shared) {
         }
         log_msg(shared, &format!("强行终止 PID {}", pid));
     }
-    let pids: Vec<u32> = remaining.iter().map(|(pid, _)| *pid).collect();
+    let pids: Vec<u32> = remaining.iter().map(|(pid, _, _)| *pid).collect();
     for _ in 0..10 {
         std::thread::sleep(Duration::from_millis(200));
         let (alive_set2, _) = snapshot_processes();
@@ -2073,7 +2118,10 @@ fn graceful_shutdown(shared: &Shared) {
         //   真正完全无窗口的程序，关机通知同样无窗口可收，
         //   这第 2 个 5 秒是给它因依赖程序退出而自行退出的时间。
         // 最后：还没退出的，全部强行终止。
-        let alive_set: HashSet<u32> = remaining_pids(shared).into_iter().collect();
+        let alive_set: HashSet<u32> = remaining_pids(shared)
+            .into_iter()
+            .map(|(pid, _, _)| pid)
+            .collect();
         let hwnds = enum_windows_for_pids(&alive_set);
         let windowed = pids_of_windows(&hwnds);
         let windowless_count = alive_set.iter().filter(|p| !windowed.contains(p)).count();
@@ -2091,7 +2139,10 @@ fn graceful_shutdown(shared: &Shared) {
             log_msg(shared, "所有子程序已退出");
         } else {
             update_descendants(shared);
-            let remaining_set: HashSet<u32> = remaining_pids(shared).into_iter().collect();
+            let remaining_set: HashSet<u32> = remaining_pids(shared)
+                .into_iter()
+                .map(|(pid, _, _)| pid)
+                .collect();
             let hwnds2 = enum_windows_for_pids(&remaining_set);
             send_shutdown(&hwnds2);
             let windowed2 = pids_of_windows(&hwnds2);
@@ -2355,13 +2406,16 @@ fn launch_section(
                 pids,
                 pid_creation,
                 pid_last_seen_unix,
-                // 手工锚点从段创建时就存在，不依赖轮询：
+                // 手工锚点从段创建时就存在，单独存，不混进自动锚点：
                 // 启动器活得久、真正的程序在别的目录时，真正的程序
                 // 从一开始就是核心，不会被判成外来而提前退出。
                 // 手工目录是用户显式配的，即使是盘符根也不降级，
                 // 降级只针对自动记录的锚点（防止无意中记宽）。
-                anchor_dirs: manual_anchor_dirs.iter().cloned().collect(),
+                // 自动 anchor_dirs 仍从空开始，所以核心兜底、孤儿锚点
+                // 的“自动锚点为空”判断不受手工锚点影响。
+                anchor_dirs: HashSet::new(),
                 anchor_files: HashSet::new(),
+                manual_anchor_dirs: manual_anchor_dirs.iter().cloned().collect(),
                 anchor_recorded: HashMap::new(),
                 exited: false,
                 output_text: String::new(),
