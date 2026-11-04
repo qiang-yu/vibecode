@@ -829,47 +829,11 @@ fn exit_time_from_handle(handle: HANDLE) -> Option<u64> {
 }
 
 fn process_creation_time(pid: u32) -> Option<u64> {
-    // 创建时间缓存：同一 PID 在 1 秒内重复查时不再 OpenProcess。
-    // 一轮轮询里 update_descendants、check_sections_exited、tracked/remaining、
-    // 诊断日志都会对同一个作业成员查创建时间，不缓存就是每轮好几次 OpenProcess，
-    // exe 路径缓存省掉的只是 QueryFullProcessImageNameW 那一半。
-    // 只缓存成功拿到的创建时间，不缓存 None：进程已死、PID 又被复用时，
-    // 缓存的 None 会把新进程误判为已死。成功值的复用误判窗口最多 1 秒，
-    // 远小于 5 秒的优雅关闭等待，且强杀前还会再查（缓存已过期或重新查）。
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<u32, (u64, std::time::Instant)>>> =
-        std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    if let Ok(map) = cache.lock() {
-        if let Some((t, at)) = map.get(&pid) {
-            if at.elapsed() < std::time::Duration::from_secs(1) {
-                return Some(*t);
-            }
-        }
-    }
-    let t = unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if h == 0 || h == -1 {
-            return None;
-        }
-        let t = creation_time_from_handle(h);
-        CloseHandle(h);
-        t
-    };
-    if let Some(t) = t {
-        if let Ok(mut map) = cache.lock() {
-            if map.len() > 10000 {
-                map.clear();
-            }
-            map.insert(pid, (t, std::time::Instant::now()));
-        }
-    }
-    t
-}
-
-/// 不走缓存的创建时间查询，专供强杀前最后一次校验：
-/// 强杀是不可逆操作，不能接受 1 秒缓存带来的复用误判窗口，
-/// 这里必须现打开进程、现取时间。
-fn process_creation_time_fresh(pid: u32) -> Option<u64> {
+    // 每次现查，不缓存：只按 PID 做键的缓存会在 PID 1 秒内被复用时
+    // 返回旧进程的创建时间，is_same_process 就会把新进程误认为旧进程。
+    // 虽然强杀前可以绕过缓存现查，但 remaining_pids 作业无效回退分支
+    // 的结果决定给谁发 WM_CLOSE 和关机通知，同样可能误发给复用 PID 的
+    // 无关程序窗口。省下的只是每轮几十次 OpenProcess，不值得冒这个险。
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h == 0 || h == -1 {
@@ -1336,6 +1300,11 @@ fn update_descendants(shared: &Shared) {
                 record_one(sec, *pid);
             }
             // 阶段二：孤儿锚点，只在直接子进程记完后 anchor_dirs 仍为空时。
+            // 每记一个就重新判断：孤儿本来就是“主程序目录还没记上”才用的
+            // 兜底，一轮里只需要一个，记上一个目录锚点就立即停，
+            // 避免同一轮多个孤儿把多个外来目录都记进来。
+            // 注意：Windows 目录孤儿只记完整路径锚点，不记目录，
+            // anchor_dirs 仍为空时继续循环是符合这条判断的。
             if sec.anchor_dirs.is_empty() {
                 for (pid, ppid) in &list {
                     if *pid == sec.root_pid || *ppid == 0 {
@@ -1349,6 +1318,9 @@ fn update_descendants(shared: &Shared) {
                         continue;
                     }
                     record_one(sec, *pid);
+                    if !sec.anchor_dirs.is_empty() {
+                        break;
+                    }
                 }
             }
         }
@@ -1807,8 +1779,8 @@ fn force_kill_remaining(shared: &Shared) {
     for pid in &remaining {
         if !job_owned.contains(pid) {
             // 强杀前最后再比对一次创建时间：判断和强杀之间也可能发生复用。
-            // 这里不用 is_same_process（它走 1 秒缓存），必须现查，
-            // 否则缓存窗口里的 PID 复用会被误判为同一进程而错杀。
+            // process_creation_time 本身就是每次现查，不走缓存，
+            // 所以 is_same_process 在这里就是现查，不存在缓存误判窗口。
             let recorded = match shared.sections.lock() {
                 Ok(sections) => sections
                     .iter()
@@ -1816,14 +1788,9 @@ fn force_kill_remaining(shared: &Shared) {
                     .unwrap_or(0),
                 Err(_) => 0,
             };
-            if recorded != 0 {
-                match process_creation_time_fresh(*pid) {
-                    Some(now) if now == recorded => {}
-                    _ => {
-                        log_msg(shared, &format!("跳过强杀 PID {}（创建时间对不上，疑似 PID 复用）", pid));
-                        continue;
-                    }
-                }
+            if recorded != 0 && !is_same_process(*pid, recorded) {
+                log_msg(shared, &format!("跳过强杀 PID {}（创建时间对不上，疑似 PID 复用）", pid));
+                continue;
             }
         }
         unsafe {
