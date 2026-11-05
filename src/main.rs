@@ -74,6 +74,7 @@ const TPM_RETURNCMD: UINT = 0x00000100;
 const IDI_APPLICATION: usize = 32512;
 const IDC_ARROW: usize = 32512;
 const COLOR_WINDOW: isize = 5;
+const COLOR_WINDOWTEXT: i32 = 8;
 const ID_EXIT: u32 = 1001;
 const CREATE_NO_WINDOW: DWORD = 0x08000000;
 const CREATE_UNICODE_ENVIRONMENT: DWORD = 0x00000400;
@@ -94,7 +95,8 @@ const SM_CXSCREEN: i32 = 0;
 const SM_CYSCREEN: i32 = 1;
 const ERROR_ALREADY_EXISTS: DWORD = 183;
 const STARTUP_LABEL_ID_BASE: u32 = 3000;
-const STARTUP_SPINNER_ID_BASE: u32 = 4000;
+const STARTUP_SYMBOL_ID_BASE: u32 = 4000;
+const SS_ENDELLIPSIS: DWORD = 0x00004000;
 const WS_CHILD: DWORD = 0x40000000;
 const WS_VISIBLE: DWORD = 0x10000000;
 const WS_VSCROLL: DWORD = 0x00200000;
@@ -333,9 +335,11 @@ struct Shared {
     // 工作线程写，主线程的进度窗口用定时器读出来刷新。
     startup_states: Mutex<Vec<u8>>,
     startup_labels: Mutex<Vec<HWND>>,
-    // 每行转圈符号单独放一个固定宽度的标签，和文字标签分开，
-    // 这样 | / - \ 宽度不同也不会让后面的段名左右抖。
-    startup_spinner_labels: Mutex<Vec<HWND>>,
+    // 每行左边 20 像素的标签统一放状态符号（○、转圈、√、×），
+    // 和文字标签分开，符号和段名各是一列，状态切换时段名不左右跳。
+    // 转圈符号 | / - \ 宽度不同，放同一个标签里会让段名抖，
+    // 放固定宽的独立标签里就不会。
+    startup_symbol_labels: Mutex<Vec<HWND>>,
     startup_hwnd: AtomicIsize,
     startup_spinner: std::sync::atomic::AtomicUsize,
     // 进度窗口用的字体句柄（Microsoft YaHei UI），窗口销毁时 DeleteObject。
@@ -3014,12 +3018,12 @@ unsafe extern "system" fn startup_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
         WM_TIMER => {
             if w_param == 1 {
                 if let Some(shared) = SHARED.get() {
-                    let (names, states, labels, spinner_labels) = (
+                    let (names, states, labels, symbol_labels) = (
                         shared.button_sections.clone(),
                         shared.startup_states.lock().map(|g| g.clone()).unwrap_or_default(),
                         shared.startup_labels.lock().map(|g| g.clone()).unwrap_or_default(),
                         shared
-                            .startup_spinner_labels
+                            .startup_symbol_labels
                             .lock()
                             .map(|g| g.clone())
                             .unwrap_or_default(),
@@ -3035,9 +3039,11 @@ unsafe extern "system" fn startup_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
                     // 转圈用 ASCII "| / - \"，不用 ◐◑◒◓：那些字形在部分
                     // 系统字体里没有，会显示成方框；ASCII 在哪都有。
                     // 已启动用 √（U+221A），中文字体基本都有，不用 ✓（U+2713）。
-                    // 转圈符号单独放在固定宽度（20 像素）的小标签里，
-                    // YaHei 是比例字体，| / - \ 宽度各不相同，
-                    // 和段名放同一个标签里会让段名左右抖。
+                    // 左边 20 像素的标签统一放状态符号（○、转圈、√、×），
+                    // 右边文字标签只放“段名 状态”，符号和段名各是一列：
+                    // 之前符号只在非启动中时写在文字标签里、启动中时
+                    // 写在左边标签里，启动中变已启动时段名会向右挪
+                    // 一个“√ ”的宽度。现在符号永远在左边，段名不动。
                     let frame = shared.startup_spinner.fetch_add(1, Ordering::SeqCst);
                     let spinner = ["|", "/", "-", "\\"][frame % 4];
                     let mut done = 0usize;
@@ -3051,33 +3057,28 @@ unsafe extern "system" fn startup_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
                             done += 1;
                         }
                         let last = last_render.get(i).copied().unwrap_or(255);
-                        let spinner_label = spinner_labels.get(i).copied().unwrap_or(0);
-                        if state == 1 {
-                            // 启动中：转圈标签每帧更新，文字标签只在
-                            // 刚进入启动中时写一次（文字本身不变）。
-                            if spinner_label != 0 {
-                                let w = wide(spinner);
-                                SetWindowTextW(spinner_label, w.as_ptr());
-                            }
-                            if last != 1 {
-                                let w = wide(&format!("{}  启动中…", name));
-                                SetWindowTextW(*label, w.as_ptr());
-                            }
-                        } else {
-                            // 离开启动中时把转圈标签清空，文字只在状态变了时写。
-                            if last == 1 && spinner_label != 0 {
-                                let w = wide("");
-                                SetWindowTextW(spinner_label, w.as_ptr());
-                            }
-                            if last != state {
-                                let text = match state {
-                                    2 => format!("√ {}  已启动", name),
-                                    3 => format!("× {}  启动失败", name),
-                                    _ => format!("○ {}  待启动", name),
-                                };
-                                let w = wide(&text);
-                                SetWindowTextW(*label, w.as_ptr());
-                            }
+                        let symbol_label = symbol_labels.get(i).copied().unwrap_or(0);
+                        // 符号标签：启动中每帧更新转圈，其余状态只在
+                        // 状态变了时写一次；文字标签只在状态变了时写。
+                        if symbol_label != 0 && (state == 1 || last != state) {
+                            let symbol = match state {
+                                1 => spinner,
+                                2 => "√",
+                                3 => "×",
+                                _ => "○",
+                            };
+                            let w = wide(symbol);
+                            SetWindowTextW(symbol_label, w.as_ptr());
+                        }
+                        if last != state {
+                            let text = match state {
+                                1 => format!("{}  启动中…", name),
+                                2 => format!("{}  已启动", name),
+                                3 => format!("{}  启动失败", name),
+                                _ => format!("{}  待启动", name),
+                            };
+                            let w = wide(&text);
+                            SetWindowTextW(*label, w.as_ptr());
                         }
                         if i < last_render.len() {
                             last_render[i] = state;
@@ -3101,13 +3102,16 @@ unsafe extern "system" fn startup_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
             let ctrl = l_param as HWND;
             let id = GetDlgCtrlID(ctrl);
             // 顶部说明标签（2999）之前走 DefWindowProc，在白色窗口上
-            // 会显示成灰底色块；这里同样按窗口背景色不透明地画，文字黑色。
-            // 每行的文字标签（3000+）和转圈标签（4000+）按行状态着色。
+            // 会显示成灰底色块；这里同样按窗口背景色不透明地画。
+            // 文字色不能写死黑色：背景色取的是系统 COLOR_WINDOW，
+            // 高对比度主题下窗口背景可能是黑色，黑字就看不见了，
+            // 所以用系统 COLOR_WINDOWTEXT，和背景成对取。
+            // 每行的文字标签（3000+）和符号标签（4000+）按行状态着色。
             let color: Option<DWORD> = if id == 2999 {
-                Some(0x00000000)
+                Some(GetSysColor(COLOR_WINDOWTEXT))
             } else if id >= STARTUP_LABEL_ID_BASE as i32 {
-                let base = if id >= STARTUP_SPINNER_ID_BASE as i32 {
-                    STARTUP_SPINNER_ID_BASE
+                let base = if id >= STARTUP_SYMBOL_ID_BASE as i32 {
+                    STARTUP_SYMBOL_ID_BASE
                 } else {
                     STARTUP_LABEL_ID_BASE
                 };
@@ -3342,38 +3346,42 @@ unsafe fn create_startup_window(shared: &Shared, h_instance: HINSTANCE, names: &
     // 背景色和窗口一样，看不出来。
     let label_h = row_h;
     let mut labels = Vec::new();
-    let mut spinner_labels = Vec::new();
+    let mut symbol_labels = Vec::new();
     for (i, name) in names.iter().enumerate() {
         // 按列排：先排满第一列再排第二列，行数 = rows_per_col。
         let col = (i as i32) / rows_per_col;
         let row = (i as i32) % rows_per_col;
         let x = 20 + col * (col_w + col_gap);
         let y = 40 + row * row_h;
-        // 转圈标签：固定宽 20 像素，只放 | / - \，文字标签在它右边。
-        let spinner_label = CreateWindowExW(
+        // 符号标签：固定宽 20 像素，初始是待启动的 ○，
+        // 启动中变转圈、启动完变 √、失败变 ×，文字标签在它右边。
+        let symbol_label = CreateWindowExW(
             0,
             label_class.as_ptr(),
-            wide("").as_ptr(),
+            wide("○").as_ptr(),
             WS_CHILD | WS_VISIBLE,
             x,
             y,
             20,
             label_h,
             hwnd,
-            (STARTUP_SPINNER_ID_BASE as usize + i) as HMENU,
+            (STARTUP_SYMBOL_ID_BASE as usize + i) as HMENU,
             h_instance,
             null(),
         );
-        if font != 0 && spinner_label != 0 {
-            SendMessageW(spinner_label, WM_SETFONT, font as WPARAM, 1);
+        if font != 0 && symbol_label != 0 {
+            SendMessageW(symbol_label, WM_SETFONT, font as WPARAM, 1);
         }
-        spinner_labels.push(spinner_label);
-        let text = wide(&format!("○ {}  待启动", name));
+        symbol_labels.push(symbol_label);
+        // 文字标签只放“段名 状态”，不放符号，状态切换时段名不动。
+        // SS_ENDELLIPSIS：段名太长放不下时末尾显示成 …，
+        // 用户能看出名字没显示完，而不是被直接截断。
+        let text = wide(&format!("{}  待启动", name));
         let label = CreateWindowExW(
             0,
             label_class.as_ptr(),
             text.as_ptr(),
-            WS_CHILD | WS_VISIBLE,
+            WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS,
             x + 24,
             y,
             col_w - 24,
@@ -3391,8 +3399,8 @@ unsafe fn create_startup_window(shared: &Shared, h_instance: HINSTANCE, names: &
     if let Ok(mut g) = shared.startup_labels.lock() {
         *g = labels;
     }
-    if let Ok(mut g) = shared.startup_spinner_labels.lock() {
-        *g = spinner_labels;
+    if let Ok(mut g) = shared.startup_symbol_labels.lock() {
+        *g = symbol_labels;
     }
     let _ = client_h;
     SetTimer(hwnd, 1, 120, null());
@@ -3507,9 +3515,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARAM, l_par
         }
         WM_CTLCOLORSTATIC => {
             // 主界面说明标签（1999）之前走 DefWindowProc，在白色窗口上
-            // 会显示成灰底色块；这里同样按窗口背景色不透明地画，文字黑色。
+            // 会显示成灰底色块；这里同样按窗口背景色不透明地画。
+            // 文字色用系统 COLOR_WINDOWTEXT，不写死黑色，
+            // 否则高对比度主题下窗口背景是黑色时会黑字黑底。
             // 按钮发的是 WM_CTLCOLORBTN，不走这里，不受影响。
-            SetTextColor(w_param as isize, 0x00000000);
+            SetTextColor(w_param as isize, GetSysColor(COLOR_WINDOWTEXT));
             SetBkColor(w_param as isize, GetSysColor(COLOR_WINDOW as i32));
             GetSysColorBrush(COLOR_WINDOW as i32) as LRESULT
         }
@@ -3573,7 +3583,7 @@ fn main() {
             diag_last_main_blocker: Mutex::new(None),
             startup_states: Mutex::new(vec![0u8; section_count]),
             startup_labels: Mutex::new(Vec::new()),
-            startup_spinner_labels: Mutex::new(Vec::new()),
+            startup_symbol_labels: Mutex::new(Vec::new()),
             startup_hwnd: AtomicIsize::new(0),
             startup_spinner: std::sync::atomic::AtomicUsize::new(0),
             startup_font: AtomicIsize::new(0),
