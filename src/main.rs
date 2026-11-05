@@ -94,6 +94,7 @@ const SM_CXSCREEN: i32 = 0;
 const SM_CYSCREEN: i32 = 1;
 const ERROR_ALREADY_EXISTS: DWORD = 183;
 const STARTUP_LABEL_ID_BASE: u32 = 3000;
+const STARTUP_SPINNER_ID_BASE: u32 = 4000;
 const WS_CHILD: DWORD = 0x40000000;
 const WS_VISIBLE: DWORD = 0x10000000;
 const WS_VSCROLL: DWORD = 0x00200000;
@@ -118,6 +119,7 @@ const GENERIC_READ: DWORD = 0x80000000;
 const FILE_SHARE_READ: DWORD = 0x00000001;
 const FILE_SHARE_WRITE: DWORD = 0x00000002;
 const FILE_SHARE_DELETE: DWORD = 0x00000004;
+const FILE_FLAG_BACKUP_SEMANTICS: DWORD = 0x02000000;
 const OPEN_EXISTING: DWORD = 3;
 const FILE_ATTRIBUTE_NORMAL: DWORD = 0x00000080;
 const HANDLE_FLAG_INHERIT: DWORD = 0x00000001;
@@ -331,6 +333,9 @@ struct Shared {
     // 工作线程写，主线程的进度窗口用定时器读出来刷新。
     startup_states: Mutex<Vec<u8>>,
     startup_labels: Mutex<Vec<HWND>>,
+    // 每行转圈符号单独放一个固定宽度的标签，和文字标签分开，
+    // 这样 | / - \ 宽度不同也不会让后面的段名左右抖。
+    startup_spinner_labels: Mutex<Vec<HWND>>,
     startup_hwnd: AtomicIsize,
     startup_spinner: std::sync::atomic::AtomicUsize,
     // 进度窗口用的字体句柄（Microsoft YaHei UI），窗口销毁时 DeleteObject。
@@ -1363,64 +1368,10 @@ fn show_missing_config(stem: &str) {
     }
 }
 
-fn exe_full_path() -> String {
-    unsafe {
-        let mut buf = vec![0u16; 4096];
-        let len = GetModuleFileNameW(0, buf.as_mut_ptr(), buf.len() as DWORD);
-        if len == 0 {
-            return String::new();
-        }
-        String::from_utf16_lossy(&buf[..len as usize])
-    }
-}
-
-/// 把 exe 全路径规范化：打开自身 exe 文件，用 GetFinalPathNameByHandleW
-/// 拿最终路径，再去掉 "\\?\" 前缀（"\\?\UNC\server\share" 还原成 "\\server\share"）。
-/// 这样映射盘符和 UNC、subst 盘、符号链接/目录联接、8.3 短文件名
-/// 启动的同一个 exe，都会得到同一条路径，不会被当成不同实例。
-/// 任一步失败就退回 GetModuleFileNameW 的原始路径，不阻塞启动。
-fn exe_canonical_path() -> String {
-    let path = exe_full_path();
-    if path.is_empty() {
-        return path;
-    }
-    unsafe {
-        let path_w = wide(&path);
-        let h = CreateFileW(
-            path_w.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            0,
-        );
-        if h == 0 || h == -1 {
-            return path;
-        }
-        let mut buf = vec![0u16; 4096];
-        let len = GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), buf.len() as DWORD, 0);
-        CloseHandle(h);
-        if len == 0 || (len as usize) >= buf.len() {
-            return path;
-        }
-        let mut s = String::from_utf16_lossy(&buf[..len as usize]);
-        if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
-            s = format!("\\\\{}", rest);
-        } else if let Some(rest) = s.strip_prefix("\\\\?\\") {
-            s = rest.to_string();
-        }
-        if s.is_empty() {
-            path
-        } else {
-            s
-        }
-    }
-}
-
-/// 把一个路径做语法上的全路径规范化（展开 . / ..、盘符相对路径等），
-/// 用于配置文件路径：配置文件可能还不存在，没法像 exe 那样打开它
-/// 再拿最终路径，GetFullPathNameW 是能做的最好的一步。
+/// 把一个路径做语法上的全路径规范化（展开 . / ..、盘符相对路径等）。
+/// 只是兜底：配置文件本身可能还不存在，GetFullPathNameW 是
+/// 不打开文件就能做的最好的一步；能打开目录时优先用下面的
+/// config_canonical_path 拿最终路径。
 fn full_path_normalized(p: &PathBuf) -> String {
     let s = p.to_string_lossy().to_string();
     unsafe {
@@ -1439,27 +1390,87 @@ fn full_path_normalized(p: &PathBuf) -> String {
     }
 }
 
-/// 单实例：标识 = 规范化后的 exe 全路径 + 配置文件全路径。
-/// 只用 exe 路径会有个矛盾：start_config.ini 是从当前工作目录读的，
-/// 不是 exe 所在目录。同一份 exe 从两个工作目录启动，读的是两份
-/// 不同的配置、要启动的是两组不同的程序，本就不该算重复；
-/// 反过来，不同目录下的两份 exe 从同一个工作目录启动，读的是同一份
-/// 配置，启动同一组程序，算重复。所以标识里同时放 exe 路径和配置路径，
-/// 两者都一样才算重复启动。
+/// 去掉 GetFinalPathNameByHandleW 返回的 "\\?\" 前缀，
+/// "\\?\UNC\server\share" 还原成 "\\server\share"。
+fn strip_extended_prefix(s: String) -> String {
+    if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{}", rest)
+    } else if let Some(rest) = s.strip_prefix("\\\\?\\") {
+        rest.to_string()
+    } else {
+        s
+    }
+}
+
+/// 把配置文件路径规范化到最终路径。
+/// 配置文件本身可能还不存在，没法直接打开它取最终路径，
+/// 但它所在的目录（当前工作目录）一定存在：用 CreateFileW
+/// 加 FILE_FLAG_BACKUP_SEMANTICS 打开这个目录，再用
+/// GetFinalPathNameByHandleW 拿目录的最终路径，最后拼上文件名。
+/// 这样同一个目录通过映射盘符和 UNC 两种方式访问，
+/// 也会得到同一条路径，不会被当成两份配置。
+/// 任一步失败就退回 GetFullPathNameW 的语法规范化，不阻塞启动。
+fn config_canonical_path(config_path: &PathBuf) -> String {
+    let fallback = full_path_normalized(config_path);
+    let dir = match config_path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let file_name = config_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "start_config.ini".to_string());
+    unsafe {
+        let dir_w = wide(&dir.to_string_lossy());
+        let h = CreateFileW(
+            dir_w.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            0,
+        );
+        if h == 0 || h == -1 {
+            return fallback;
+        }
+        let mut buf = vec![0u16; 4096];
+        let len = GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), buf.len() as DWORD, 0);
+        CloseHandle(h);
+        if len == 0 || (len as usize) >= buf.len() {
+            return fallback;
+        }
+        let dir_final = strip_extended_prefix(String::from_utf16_lossy(&buf[..len as usize]));
+        if dir_final.is_empty() {
+            return fallback;
+        }
+        format!("{}\\{}", dir_final.trim_end_matches('\\'), file_name)
+    }
+}
+
+/// 单实例：标识只用配置文件全路径，不用 exe 路径。
+/// 判重的本意是“防止重复启动同一批程序”，而要启动哪批程序
+/// 由 start_config.ini 决定，不是由哪个 exe 决定的：
+/// 同一份配置无论用哪个 exe 启动都会被拦；同一份 exe 从两个
+/// 工作目录启动，读的是两份不同的配置、要启动两组不同的程序，
+/// 不算重复。上一版把 exe 路径和配置路径拼起来哈希是错的：
+/// 两条都相同才算重复，等于只会让判重更宽松——不同目录的两份
+/// exe 从同一个工作目录启动，exe 路径不同、哈希不同，会同时运行，
+/// 两个实例启动的是同一组程序。注释和 README 里那句
+/// “不同目录的两份 exe 从同一个工作目录启动……算重复”也是错的，
+/// 与代码实际行为相反，这一版一并改过来了。
 /// 全路径可能含非 ANSI 字符（中文、空格等），所以不用 ANSI 互斥名，
-/// 而是先把两条路径转小写（Windows 路径不区分大小写）、按 UTF-16 编码
+/// 而是先把路径转小写（Windows 路径不区分大小写）、按 UTF-16 编码
 /// 做 FNV-1a 64 位哈希，只把 16 位十六进制哈希放进互斥名。
-/// 这样互斥名全是 ASCII，不怕长路径、非法字符、非 ANSI 字符，
-/// 而不同目录下的同名 exe（全路径不同）哈希不同，可以同时运行。
+/// 这样互斥名全是 ASCII，不怕长路径、非法字符、非 ANSI 字符。
 /// 返回 Some(句柄) 表示第一个实例，句柄必须一直持有到程序退出，
 /// 关掉它互斥就没了；返回 None 表示已有一个实例在跑。
 fn acquire_single_instance(config_path: &PathBuf) -> Option<HANDLE> {
-    let exe = exe_canonical_path();
-    if exe.is_empty() {
+    let config = config_canonical_path(config_path);
+    if config.is_empty() {
         return Some(0);
     }
-    let config = full_path_normalized(config_path);
-    let identity = format!("{}\n{}", exe.to_lowercase(), config.to_lowercase());
+    let identity = config.to_lowercase();
     // FNV-1a 64：无第三方依赖，够用来区分不同全路径。
     let mut hash: u64 = 14695981039346656037;
     for unit in identity.encode_utf16() {
@@ -2584,6 +2595,12 @@ fn launch_section(
                 if job_handle != 0 {
                     CloseHandle(job_handle);
                 }
+                // cmd 没跑起来，临时文件没人用，参照 CreateProcess
+                // 失败那段当场删掉，别留在 temp_bats 里等退出时兜底删。
+                let _ = std::fs::remove_file(&temp_path);
+                if let Ok(mut temps) = shared.temp_bats.lock() {
+                    temps.retain(|p| p != &temp_path);
+                }
                 return None;
             }
             CloseHandle(pi.h_thread);
@@ -2997,10 +3014,15 @@ unsafe extern "system" fn startup_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
         WM_TIMER => {
             if w_param == 1 {
                 if let Some(shared) = SHARED.get() {
-                    let (names, states, labels) = (
+                    let (names, states, labels, spinner_labels) = (
                         shared.button_sections.clone(),
                         shared.startup_states.lock().map(|g| g.clone()).unwrap_or_default(),
                         shared.startup_labels.lock().map(|g| g.clone()).unwrap_or_default(),
+                        shared
+                            .startup_spinner_labels
+                            .lock()
+                            .map(|g| g.clone())
+                            .unwrap_or_default(),
                     );
                     // 防闪烁：只有启动中的行需要每帧更新（转圈在动），
                     // 其余行只在状态变了时才 SetWindowTextW，
@@ -3013,6 +3035,9 @@ unsafe extern "system" fn startup_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
                     // 转圈用 ASCII "| / - \"，不用 ◐◑◒◓：那些字形在部分
                     // 系统字体里没有，会显示成方框；ASCII 在哪都有。
                     // 已启动用 √（U+221A），中文字体基本都有，不用 ✓（U+2713）。
+                    // 转圈符号单独放在固定宽度（20 像素）的小标签里，
+                    // YaHei 是比例字体，| / - \ 宽度各不相同，
+                    // 和段名放同一个标签里会让段名左右抖。
                     let frame = shared.startup_spinner.fetch_add(1, Ordering::SeqCst);
                     let spinner = ["|", "/", "-", "\\"][frame % 4];
                     let mut done = 0usize;
@@ -3026,17 +3051,34 @@ unsafe extern "system" fn startup_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
                             done += 1;
                         }
                         let last = last_render.get(i).copied().unwrap_or(255);
-                        if state != 1 && last == state {
-                            continue;
+                        let spinner_label = spinner_labels.get(i).copied().unwrap_or(0);
+                        if state == 1 {
+                            // 启动中：转圈标签每帧更新，文字标签只在
+                            // 刚进入启动中时写一次（文字本身不变）。
+                            if spinner_label != 0 {
+                                let w = wide(spinner);
+                                SetWindowTextW(spinner_label, w.as_ptr());
+                            }
+                            if last != 1 {
+                                let w = wide(&format!("{}  启动中…", name));
+                                SetWindowTextW(*label, w.as_ptr());
+                            }
+                        } else {
+                            // 离开启动中时把转圈标签清空，文字只在状态变了时写。
+                            if last == 1 && spinner_label != 0 {
+                                let w = wide("");
+                                SetWindowTextW(spinner_label, w.as_ptr());
+                            }
+                            if last != state {
+                                let text = match state {
+                                    2 => format!("√ {}  已启动", name),
+                                    3 => format!("× {}  启动失败", name),
+                                    _ => format!("○ {}  待启动", name),
+                                };
+                                let w = wide(&text);
+                                SetWindowTextW(*label, w.as_ptr());
+                            }
                         }
-                        let text = match state {
-                            1 => format!("{} {}  启动中…", spinner, name),
-                            2 => format!("√ {}  已启动", name),
-                            3 => format!("× {}  启动失败", name),
-                            _ => format!("○ {}  待启动", name),
-                        };
-                        let w = wide(&text);
-                        SetWindowTextW(*label, w.as_ptr());
                         if i < last_render.len() {
                             last_render[i] = state;
                         }
@@ -3046,7 +3088,7 @@ unsafe extern "system" fn startup_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
                     }
                     if shared.startup_last_done.load(Ordering::SeqCst) != done {
                         shared.startup_last_done.store(done, Ordering::SeqCst);
-                        let title = format!("正在启动…（已完成 {}/{})", done, names.len());
+                        let title = format!("正在启动…（已完成 {}/{}）", done, names.len());
                         let w = wide(&title);
                         SetWindowTextW(hwnd, w.as_ptr());
                     }
@@ -3058,8 +3100,18 @@ unsafe extern "system" fn startup_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
             // l_param 是发来这条消息的 STATIC 控件句柄，w_param 是它的 HDC。
             let ctrl = l_param as HWND;
             let id = GetDlgCtrlID(ctrl);
-            if id >= STARTUP_LABEL_ID_BASE as i32 {
-                let idx = (id - STARTUP_LABEL_ID_BASE as i32) as usize;
+            // 顶部说明标签（2999）之前走 DefWindowProc，在白色窗口上
+            // 会显示成灰底色块；这里同样按窗口背景色不透明地画，文字黑色。
+            // 每行的文字标签（3000+）和转圈标签（4000+）按行状态着色。
+            let color: Option<DWORD> = if id == 2999 {
+                Some(0x00000000)
+            } else if id >= STARTUP_LABEL_ID_BASE as i32 {
+                let base = if id >= STARTUP_SPINNER_ID_BASE as i32 {
+                    STARTUP_SPINNER_ID_BASE
+                } else {
+                    STARTUP_LABEL_ID_BASE
+                };
+                let idx = (id - base as i32) as usize;
                 if let Some(shared) = SHARED.get() {
                     let state = shared
                         .startup_states
@@ -3068,22 +3120,28 @@ unsafe extern "system" fn startup_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARA
                         .unwrap_or(0);
                     // COLORREF 是 0x00BBGGRR：绿 0,128,0；蓝 0,0,255；
                     // 红 255,0,0；灰 128,128,128。
-                    let color: DWORD = match state {
+                    Some(match state {
                         1 => 0x00FF0000,
                         2 => 0x00008000,
                         3 => 0x000000FF,
                         _ => 0x00808080,
-                    };
-                    // 关键：必须用不透明背景色绘制。之前用
-                    // SetBkMode(TRANSPARENT) 又返回 NULL_BRUSH，
-                    // STATIC 重绘时不擦背景，新文字直接叠在旧文字上，
-                    // 转圈和状态切换都会留残影。现在按窗口背景色
-                    // 不透明地画，返回同色的系统画刷（系统画刷不用释放），
-                    // 每次重绘都先擦干净再写新文字。
-                    SetTextColor(w_param as isize, color);
-                    SetBkColor(w_param as isize, GetSysColor(COLOR_WINDOW as i32));
-                    return GetSysColorBrush(COLOR_WINDOW as i32) as LRESULT;
+                    })
+                } else {
+                    None
                 }
+            } else {
+                None
+            };
+            if let Some(color) = color {
+                // 关键：必须用不透明背景色绘制。之前用
+                // SetBkMode(TRANSPARENT) 又返回 NULL_BRUSH，
+                // STATIC 重绘时不擦背景，新文字直接叠在旧文字上，
+                // 转圈和状态切换都会留残影。现在按窗口背景色
+                // 不透明地画，返回同色的系统画刷（系统画刷不用释放），
+                // 每次重绘都先擦干净再写新文字。
+                SetTextColor(w_param as isize, color);
+                SetBkColor(w_param as isize, GetSysColor(COLOR_WINDOW as i32));
+                return GetSysColorBrush(COLOR_WINDOW as i32) as LRESULT;
             }
             DefWindowProcW(hwnd, msg, w_param, l_param)
         }
@@ -3138,6 +3196,13 @@ unsafe fn create_startup_window(shared: &Shared, h_instance: HINSTANCE, names: &
     // 屏幕的 80%，再多就压缩行距（30 -> 24 -> 20）。窗口尺寸
     // 用 AdjustWindowRectEx 由客户区反算，不再直接拿“55 + n*30 + 15”
     // 当窗口高——那里面含标题栏和边框，高 DPI / 换主题会把最后一行截掉。
+    // 列数分两步算，不能像之前那样 1..=4 每轮先赋值、能放下才 break：
+    // 那样 1 到 4 列都放不下时，最后留下的就是 4 列的尺寸，
+    // 比如 1366×768、40 个段，2 列时高度超了，3、4 列宽度超了，
+    // 结果停在 4 列（约 1640 像素），窗口右边伸出屏幕外。
+    // 正确做法：先算宽度能容纳的最大列数，再在这个范围内找
+    // 高度能放下的最小列数；都放不下时，用宽度允许的最大列数，
+    // 再压缩行距。
     let style: DWORD = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     let ex_style: DWORD = 0;
     // 不置顶、不抢焦点：之前 WS_EX_TOPMOST + SetForegroundWindow，
@@ -3150,24 +3215,36 @@ unsafe fn create_startup_window(shared: &Shared, h_instance: HINSTANCE, names: &
     let max_window_h = screen_h * 80 / 100;
     let col_w: i32 = 380;
     let col_gap: i32 = 20;
-    let mut rows_per_col: i32 = names.len() as i32;
-    let mut row_h: i32 = 30;
-    let mut client_w: i32 = 0;
-    let mut client_h: i32 = 0;
-    let mut win_w: i32 = 0;
-    let mut win_h: i32 = 0;
+    let n = names.len() as i32;
+    // 第一步：宽度能容纳的最大列数（列宽单调递增，超了就停）。
+    let mut max_cols_by_width: i32 = 1;
     for c in 1..=4 {
-        let rows = ((names.len() as i32) + c - 1) / c;
+        let cw = 40 + c * col_w + (c - 1) * col_gap;
+        let (ww, _) = window_size_for_client(cw, 85, style, ex_style);
+        if ww <= max_window_w {
+            max_cols_by_width = c;
+        } else {
+            break;
+        }
+    }
+    // 兜底先按最大列数算，再在 1..=最大列数里找高度能放下的最小列数。
+    let mut rows_per_col: i32 = (n + max_cols_by_width - 1) / max_cols_by_width;
+    let mut row_h: i32 = 30;
+    let mut client_w: i32 =
+        40 + max_cols_by_width * col_w + (max_cols_by_width - 1) * col_gap;
+    let mut client_h: i32 = 55 + rows_per_col * 30;
+    let (mut win_w, mut win_h) = window_size_for_client(client_w, client_h, style, ex_style);
+    for c in 1..=max_cols_by_width {
+        let rows = (n + c - 1) / c;
         let cw = 40 + c * col_w + (c - 1) * col_gap;
         let ch = 55 + rows * 30;
         let (ww, wh) = window_size_for_client(cw, ch, style, ex_style);
-        rows_per_col = rows;
-        row_h = 30;
-        client_w = cw;
-        client_h = ch;
-        win_w = ww;
-        win_h = wh;
-        if ww <= max_window_w && wh <= max_window_h {
+        if wh <= max_window_h {
+            rows_per_col = rows;
+            client_w = cw;
+            client_h = ch;
+            win_w = ww;
+            win_h = wh;
             break;
         }
     }
@@ -3209,10 +3286,33 @@ unsafe fn create_startup_window(shared: &Shared, h_instance: HINSTANCE, names: &
     }
     shared.startup_hwnd.store(hwnd, Ordering::SeqCst);
     // 字体：STATIC 不发 WM_SETFONT 会用默认 System 字体（老式粗体）。
-    // 这里建一个 Microsoft YaHei UI（16 像素），发给每个标签，
+    // 这里建一个 Microsoft YaHei UI，发给每个标签，
     // 窗口销毁时在 WM_DESTROY 里 DeleteObject。
+    // 字号跟着行距走：16 像素的 YaHei 一行实际要 21 像素左右，
+    // 行距压到 24、20 时还用 16 像素的字，汉字下半截会被截掉，
+    // 所以行距 24 用 14 像素，行距 20 用 13 像素。
+    let font_height: i32 = match row_h {
+        30 => -16,
+        24 => -14,
+        _ => -13,
+    };
     let face = wide("Microsoft YaHei UI");
-    let font = CreateFontW(-16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr());
+    let font = CreateFontW(
+        font_height,
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        face.as_ptr(),
+    );
     if font != 0 {
         shared.startup_font.store(font, Ordering::SeqCst);
     }
@@ -3236,21 +3336,47 @@ unsafe fn create_startup_window(shared: &Shared, h_instance: HINSTANCE, names: &
     if font != 0 && top_label != 0 {
         SendMessageW(top_label, WM_SETFONT, font as WPARAM, 1);
     }
-    let label_h = if row_h >= 24 { row_h - 6 } else { 18 };
+    // 标签高度等于行距，不能再像之前那样行距 24、20 时只给 18 像素：
+    // 16 像素的 YaHei 一行要 21 像素左右，18 像素的标签会把汉字
+    // 下半部分截掉。行距 30 时标签 30 像素只是下面多留白，
+    // 背景色和窗口一样，看不出来。
+    let label_h = row_h;
     let mut labels = Vec::new();
+    let mut spinner_labels = Vec::new();
     for (i, name) in names.iter().enumerate() {
         // 按列排：先排满第一列再排第二列，行数 = rows_per_col。
         let col = (i as i32) / rows_per_col;
         let row = (i as i32) % rows_per_col;
+        let x = 20 + col * (col_w + col_gap);
+        let y = 40 + row * row_h;
+        // 转圈标签：固定宽 20 像素，只放 | / - \，文字标签在它右边。
+        let spinner_label = CreateWindowExW(
+            0,
+            label_class.as_ptr(),
+            wide("").as_ptr(),
+            WS_CHILD | WS_VISIBLE,
+            x,
+            y,
+            20,
+            label_h,
+            hwnd,
+            (STARTUP_SPINNER_ID_BASE as usize + i) as HMENU,
+            h_instance,
+            null(),
+        );
+        if font != 0 && spinner_label != 0 {
+            SendMessageW(spinner_label, WM_SETFONT, font as WPARAM, 1);
+        }
+        spinner_labels.push(spinner_label);
         let text = wide(&format!("○ {}  待启动", name));
         let label = CreateWindowExW(
             0,
             label_class.as_ptr(),
             text.as_ptr(),
             WS_CHILD | WS_VISIBLE,
-            20 + col * (col_w + col_gap),
-            40 + row * row_h,
-            col_w,
+            x + 24,
+            y,
+            col_w - 24,
             label_h,
             hwnd,
             (STARTUP_LABEL_ID_BASE as usize + i) as HMENU,
@@ -3264,6 +3390,9 @@ unsafe fn create_startup_window(shared: &Shared, h_instance: HINSTANCE, names: &
     }
     if let Ok(mut g) = shared.startup_labels.lock() {
         *g = labels;
+    }
+    if let Ok(mut g) = shared.startup_spinner_labels.lock() {
+        *g = spinner_labels;
     }
     let _ = client_h;
     SetTimer(hwnd, 1, 120, null());
@@ -3376,6 +3505,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARAM, l_par
             }
             0
         }
+        WM_CTLCOLORSTATIC => {
+            // 主界面说明标签（1999）之前走 DefWindowProc，在白色窗口上
+            // 会显示成灰底色块；这里同样按窗口背景色不透明地画，文字黑色。
+            // 按钮发的是 WM_CTLCOLORBTN，不走这里，不受影响。
+            SetTextColor(w_param as isize, 0x00000000);
+            SetBkColor(w_param as isize, GetSysColor(COLOR_WINDOW as i32));
+            GetSysColorBrush(COLOR_WINDOW as i32) as LRESULT
+        }
         WM_CLOSE => {
             ShowWindow(hwnd, SW_HIDE);
             0
@@ -3436,6 +3573,7 @@ fn main() {
             diag_last_main_blocker: Mutex::new(None),
             startup_states: Mutex::new(vec![0u8; section_count]),
             startup_labels: Mutex::new(Vec::new()),
+            startup_spinner_labels: Mutex::new(Vec::new()),
             startup_hwnd: AtomicIsize::new(0),
             startup_spinner: std::sync::atomic::AtomicUsize::new(0),
             startup_font: AtomicIsize::new(0),
