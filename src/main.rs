@@ -84,6 +84,17 @@ const TH32CS_SNAPPROCESS: DWORD = 0x00000002;
 const PROCESS_TERMINATE: DWORD = 0x00000001;
 const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x00001000;
 const MB_ICONERROR: UINT = 0x00000010;
+const MB_OK: UINT = 0x00000000;
+const MB_ICONWARNING: UINT = 0x00000030;
+const WM_CTLCOLORSTATIC: UINT = 0x0138;
+const WS_EX_TOPMOST: DWORD = 0x00000008;
+const WS_OVERLAPPED: DWORD = 0x00000000;
+const WS_CAPTION: DWORD = 0x00C00000;
+const WS_SYSMENU: DWORD = 0x00080000;
+const SM_CXSCREEN: i32 = 0;
+const SM_CYSCREEN: i32 = 1;
+const ERROR_ALREADY_EXISTS: DWORD = 183;
+const STARTUP_LABEL_ID_BASE: u32 = 3000;
 const WS_CHILD: DWORD = 0x40000000;
 const WS_VISIBLE: DWORD = 0x10000000;
 const WS_VSCROLL: DWORD = 0x00200000;
@@ -316,6 +327,12 @@ struct Shared {
     output_windows: Mutex<HashMap<HWND, OutputWindowState>>,
     // 主段根进程已退、后代还活着时，上次写诊断日志的时间；首次为 None，立即写一次。
     diag_last_main_blocker: Mutex<Option<Instant>>,
+    // 启动进度：每段一个状态，0 待启动、1 启动中、2 已启动。
+    // 工作线程写，主线程的进度窗口用定时器读出来刷新。
+    startup_states: Mutex<Vec<u8>>,
+    startup_labels: Mutex<Vec<HWND>>,
+    startup_hwnd: AtomicIsize,
+    startup_spinner: std::sync::atomic::AtomicUsize,
 }
 
 struct EnumCtx {
@@ -379,11 +396,16 @@ extern "system" {
     fn KillTimer(h_wnd: HWND, u_id_event: usize) -> BOOL;
     fn GetScrollInfo(h_wnd: HWND, n_bar: i32, lp_scroll_info: *mut SCROLLINFO) -> BOOL;
     fn IsWindow(h_wnd: HWND) -> BOOL;
+    fn GetSystemMetrics(n_index: i32) -> i32;
+    fn UpdateWindow(h_wnd: HWND) -> BOOL;
+    fn GetDlgCtrlID(h_wnd: HWND) -> i32;
 }
 
 #[link(name = "gdi32")]
 extern "system" {
     fn GetStockObject(fn_object: i32) -> isize;
+    fn SetTextColor(hdc: isize, color: DWORD) -> DWORD;
+    fn SetBkMode(hdc: isize, mode: i32) -> i32;
 }
 
 #[link(name = "shell32")]
@@ -394,6 +416,12 @@ extern "system" {
 #[link(name = "kernel32")]
 extern "system" {
     fn GetModuleFileNameW(h_module: HINSTANCE, lp_filename: *mut u16, n_size: DWORD) -> DWORD;
+    fn CreateMutexW(
+        lp_mutex_attributes: *const c_void,
+        b_initial_owner: BOOL,
+        lp_name: *const u16,
+    ) -> HANDLE;
+    fn GetLastError() -> DWORD;
     fn GetSystemDirectoryW(lp_buffer: *mut u16, u_size: UINT) -> UINT;
     fn GetLocalTime(lp_system_time: *mut SYSTEMTIME);
     fn CreateProcessW(
@@ -1299,6 +1327,77 @@ fn show_missing_config(stem: &str) {
     let title = wide(stem);
     unsafe {
         MessageBoxW(0, text.as_ptr(), title.as_ptr(), MB_ICONERROR);
+    }
+}
+
+fn exe_full_path() -> String {
+    unsafe {
+        let mut buf = vec![0u16; 4096];
+        let len = GetModuleFileNameW(0, buf.as_mut_ptr(), buf.len() as DWORD);
+        if len == 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..len as usize])
+    }
+}
+
+/// 单实例：以程序自身的全路径为标识。
+/// 全路径可能含非 ANSI 字符（中文、空格等），所以不用 ANSI 互斥名，
+/// 而是先把全路径转小写（Windows 路径不区分大小写）、按 UTF-16 编码
+/// 做 FNV-1a 64 位哈希，只把 16 位十六进制哈希放进互斥名。
+/// 这样互斥名全是 ASCII，不怕长路径、非法字符、非 ANSI 字符，
+/// 而不同目录下的同名 exe（全路径不同）哈希不同，可以同时运行。
+/// 返回 Some(句柄) 表示第一个实例，句柄必须一直持有到程序退出，
+/// 关掉它互斥就没了；返回 None 表示已有一个实例在跑。
+fn acquire_single_instance() -> Option<HANDLE> {
+    let path = exe_full_path();
+    if path.is_empty() {
+        return Some(0);
+    }
+    // FNV-1a 64：无第三方依赖，够用来区分不同全路径。
+    let mut hash: u64 = 14695981039346656037;
+    for unit in path.to_lowercase().encode_utf16() {
+        hash ^= unit as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    let name = wide(&format!("DogTray-{:016x}", hash));
+    unsafe {
+        let h = CreateMutexW(null(), 0, name.as_ptr());
+        if h == 0 || h == -1 {
+            return Some(0);
+        }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            CloseHandle(h);
+            return None;
+        }
+        Some(h)
+    }
+}
+
+fn show_already_running(stem: &str) {
+    let text = wide("程序已经启动，请不要重复运行");
+    let title = wide(stem);
+    unsafe {
+        MessageBoxW(0, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+    }
+}
+
+fn close_startup_window(shared: &Shared) {
+    let hwnd = shared.startup_hwnd.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        // 进度窗口属于主线程，工作线程只能 PostMessage 让主线程关它，
+        // 不能直接 DestroyWindow。
+        unsafe {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+    }
+}
+
+fn set_startup_state(shared: &Shared, idx: usize, state: u8) {
+    if let Ok(mut states) = shared.startup_states.lock() {
+        if idx < states.len() {
+            states[idx] = state;
+        }
     }
 }
 
@@ -2478,8 +2577,13 @@ fn worker_thread(shared: Arc<Shared>, launches: Vec<(String, String, Vec<String>
         }
         if script.trim().is_empty() {
             log_msg(&shared, &format!("跳过空程序: {}", name));
+            // 空段没有程序可启动，立刻算已启动，进度不卡在这一行。
+            set_startup_state(&shared, idx, 2);
             continue;
         }
+        // 启动中：从拉起这段开始，到它那 5 秒间隔走完为止，
+        // 进度窗口里这一行一直是蓝色转圈，用户能看到现在轮到谁。
+        set_startup_state(&shared, idx, 1);
         // 手工锚点：全局（[main]）+ 本段，启动时就合并进段，
         // 这样启动器活得久、真正的程序在别的目录时，真正的程序从一开始就是核心，
         // 不用等自动锚点、也不依赖孤儿规则（孤儿只覆盖启动器早死的情况）。
@@ -2494,14 +2598,18 @@ fn worker_thread(shared: Arc<Shared>, launches: Vec<(String, String, Vec<String>
         // 这 5 秒足够 cmd 打开文件、读完脚本、把目标程序拉起来，
         // 又不会把临时文件留到 DogTray 退出（可能要跑很久）才删。
         // 最后一段也一样：等 5 秒、删掉，再进监控循环。
-        let _ = idx;
         if wait_5_seconds_or_abort(&shared) {
+            close_startup_window(&shared);
             return;
         }
         if let Some(p) = temp {
             delete_temp_bat(&shared, &p);
         }
+        set_startup_state(&shared, idx, 2);
     }
+    // 全部段都启动完（包括最后一段的 5 秒间隔走完），进度窗口消失，
+    // 之后只留托盘图标，主界面要左键点托盘才打开。
+    close_startup_window(&shared);
     while !shared.shutdown.load(Ordering::SeqCst) {
         check_sections_exited(&shared);
         if is_main_exited(&shared) {
@@ -2767,6 +2875,168 @@ extern "system" {
     fn DestroyWindow(h_wnd: HWND) -> BOOL;
 }
 
+unsafe extern "system" fn startup_wnd_proc(hwnd: HWND, msg: UINT, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
+    match msg {
+        WM_TIMER => {
+            if w_param == 1 {
+                if let Some(shared) = SHARED.get() {
+                    // 转圈帧：每 120ms 换一帧，启动中的行看起来在转。
+                    let frame = shared
+                        .startup_spinner
+                        .fetch_add(1, Ordering::SeqCst);
+                    let spinner = ["◐", "◑", "◒", "◓"][frame % 4];
+                    let (names, states, labels) = (
+                        shared.button_sections.clone(),
+                        shared.startup_states.lock().map(|g| g.clone()).unwrap_or_default(),
+                        shared.startup_labels.lock().map(|g| g.clone()).unwrap_or_default(),
+                    );
+                    let mut done = 0usize;
+                    for (i, label) in labels.iter().enumerate() {
+                        if *label == 0 {
+                            continue;
+                        }
+                        let name = names.get(i).cloned().unwrap_or_default();
+                        let state = states.get(i).copied().unwrap_or(0);
+                        if state == 2 {
+                            done += 1;
+                        }
+                        let text = match state {
+                            1 => format!("{} {}  启动中…", spinner, name),
+                            2 => format!("✓ {}  已启动", name),
+                            _ => format!("○ {}  待启动", name),
+                        };
+                        let w = wide(&text);
+                        SetWindowTextW(*label, w.as_ptr());
+                    }
+                    let title = format!(
+                        "正在启动…（已启动 {}/{}）",
+                        done,
+                        names.len()
+                    );
+                    let w = wide(&title);
+                    SetWindowTextW(hwnd, w.as_ptr());
+                }
+            }
+            0
+        }
+        WM_CTLCOLORSTATIC => {
+            // l_param 是发来这条消息的 STATIC 控件句柄，w_param 是它的 HDC。
+            let ctrl = l_param as HWND;
+            let id = GetDlgCtrlID(ctrl);
+            if id >= STARTUP_LABEL_ID_BASE as i32 {
+                let idx = (id - STARTUP_LABEL_ID_BASE as i32) as usize;
+                if let Some(shared) = SHARED.get() {
+                    let state = shared
+                        .startup_states
+                        .lock()
+                        .map(|g| g.get(idx).copied().unwrap_or(0))
+                        .unwrap_or(0);
+                    // COLORREF 是 0x00BBGGRR：绿 0,128,0；蓝 0,0,255；灰 128,128,128。
+                    let color: DWORD = match state {
+                        1 => 0x00FF0000,
+                        2 => 0x00008000,
+                        _ => 0x00808080,
+                    };
+                    SetBkMode(w_param as isize, 1);
+                    SetTextColor(w_param as isize, color);
+                    return GetStockObject(5);
+                }
+            }
+            DefWindowProcW(hwnd, msg, w_param, l_param)
+        }
+        WM_CLOSE => {
+            DestroyWindow(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            KillTimer(hwnd, 1);
+            if let Some(shared) = SHARED.get() {
+                if shared.startup_hwnd.load(Ordering::SeqCst) == hwnd {
+                    shared.startup_hwnd.store(0, Ordering::SeqCst);
+                }
+            }
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, w_param, l_param),
+    }
+}
+
+unsafe fn create_startup_window(shared: &Shared, h_instance: HINSTANCE, names: &[String]) -> HWND {
+    if names.is_empty() {
+        return 0;
+    }
+    let width: i32 = 460;
+    let height: i32 = 55 + (names.len() as i32) * 30 + 15;
+    let screen_w = GetSystemMetrics(SM_CXSCREEN);
+    let screen_h = GetSystemMetrics(SM_CYSCREEN);
+    let x = if screen_w > width { (screen_w - width) / 2 } else { 0 };
+    let y = if screen_h > height { (screen_h - height) / 2 } else { 0 };
+    let class_name = wide("DogTrayStartupWindow");
+    let title = wide("正在启动…");
+    let hwnd = CreateWindowExW(
+        WS_EX_TOPMOST,
+        class_name.as_ptr(),
+        title.as_ptr(),
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        x,
+        y,
+        width,
+        height,
+        0,
+        0,
+        h_instance,
+        null(),
+    );
+    if hwnd == 0 {
+        return 0;
+    }
+    shared.startup_hwnd.store(hwnd, Ordering::SeqCst);
+    // 顶部说明。
+    let label_class = wide("STATIC");
+    let top_text = wide("正在启动程序，请稍候…");
+    let _ = CreateWindowExW(
+        0,
+        label_class.as_ptr(),
+        top_text.as_ptr(),
+        WS_CHILD | WS_VISIBLE,
+        20,
+        10,
+        420,
+        20,
+        hwnd,
+        2999,
+        h_instance,
+        null(),
+    );
+    let mut labels = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let text = wide(&format!("○ {}  待启动", name));
+        let label = CreateWindowExW(
+            0,
+            label_class.as_ptr(),
+            text.as_ptr(),
+            WS_CHILD | WS_VISIBLE,
+            20,
+            40 + (i as i32) * 30,
+            420,
+            24,
+            hwnd,
+            (STARTUP_LABEL_ID_BASE as usize + i) as HMENU,
+            h_instance,
+            null(),
+        );
+        labels.push(label);
+    }
+    if let Ok(mut g) = shared.startup_labels.lock() {
+        *g = labels;
+    }
+    SetTimer(hwnd, 1, 120, null());
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+    hwnd
+}
+
 unsafe fn tray_data(hwnd: HWND, icon: HICON, tip: &str) -> NOTIFYICONDATAW {
     let mut data: NOTIFYICONDATAW = zeroed();
     data.cb_size = size_of::<NOTIFYICONDATAW>() as u32;
@@ -2891,6 +3161,13 @@ fn main() {
             return;
         }
         let stem = exe_stem();
+        // 单实例检查放最前面、读配置之前：已经有一个实例在跑时，
+        // 不管配置在不在、读不读得到，都只弹重复提示，不再启动第二个。
+        let single_handle = acquire_single_instance();
+        let Some(single_handle) = single_handle else {
+            show_already_running(&stem);
+            return;
+        };
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config_path = current_dir.join("start_config.ini");
         let config_bytes = match std::fs::read(&config_path) {
@@ -2905,6 +3182,7 @@ fn main() {
         let tray_tip = cfg.title.clone().unwrap_or_else(|| stem.clone());
         let log_path = current_dir.join(format!("{}.log", stem));
         let button_sections: Vec<String> = cfg.sections.iter().map(|(n, _, _)| n.clone()).collect();
+        let section_count = button_sections.len();
         let shared = Arc::new(Shared {
             sections: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
@@ -2920,6 +3198,10 @@ fn main() {
             global_anchor_dirs: cfg.global_anchor_dirs.clone(),
             output_windows: Mutex::new(HashMap::new()),
             diag_last_main_blocker: Mutex::new(None),
+            startup_states: Mutex::new(vec![0u8; section_count]),
+            startup_labels: Mutex::new(Vec::new()),
+            startup_hwnd: AtomicIsize::new(0),
+            startup_spinner: std::sync::atomic::AtomicUsize::new(0),
         });
         if shared.log_enabled {
             log_msg(&shared, "程序启动");
@@ -2967,6 +3249,24 @@ fn main() {
             h_icon_sm: icon,
         };
         let _ = RegisterClassExW(&wc_out);
+        // 启动进度窗口类：和主界面、输出窗口都分开，关它只销毁它自己，
+        // 不退出 DogTray、不影响正在启动的程序。
+        let startup_class_name = wide("DogTrayStartupWindow");
+        let wc_startup = WNDCLASSEXW {
+            cb_size: size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfn_wnd_proc: Some(startup_wnd_proc),
+            cb_cls_extra: 0,
+            cb_wnd_extra: 0,
+            h_instance,
+            h_icon: icon,
+            h_cursor: cursor,
+            hbr_background: (COLOR_WINDOW + 1) as HBRUSH,
+            lpsz_menu_name: null(),
+            lpsz_class_name: startup_class_name.as_ptr(),
+            h_icon_sm: icon,
+        };
+        let _ = RegisterClassExW(&wc_startup);
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
@@ -3025,6 +3325,11 @@ fn main() {
         let mut data = tray_data(hwnd, icon, &tray_tip);
         Shell_NotifyIconW(NIM_ADD, &mut data);
 
+        // 启动进度窗口：主线程创建，列出所有 [XXX]，
+        // 工作线程每段启动时更新状态，全部启动完工作线程负责关掉它。
+        let startup_names: Vec<String> = cfg.sections.iter().map(|(n, _, _)| n.clone()).collect();
+        create_startup_window(&shared, h_instance, &startup_names);
+
         // 启动器在后台线程跑，主线程留给托盘消息循环。
         let worker_shared = shared.clone();
         let launches = cfg.sections.clone();
@@ -3042,6 +3347,10 @@ fn main() {
             graceful_shutdown(&shared);
         }
         remove_tray(hwnd);
+        // 互斥句柄一直持有到这里才关：程序退出后，下一次启动才不再算重复。
+        if single_handle != 0 && single_handle != -1 {
+            CloseHandle(single_handle);
+        }
         let _ = shared.exe_stem;
         let _ = shared.tray_tip;
     }
