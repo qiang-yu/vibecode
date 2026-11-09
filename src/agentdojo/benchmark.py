@@ -85,17 +85,17 @@ def run_task_with_injection_tasks(
         task_injections = attack.attack(user_task, injection_task)
 
         if logdir is not None and agent_pipeline.name is not None:
-            try:
-                task_result = load_task_results(
-                    agent_pipeline.name.replace("/", "_"),
-                    suite.name,
-                    user_task.ID,
-                    attack_name=attack.name,
-                    injection_task=injection_task.ID,
-                    logdir=logdir,
-                )
-            except (ValidationError, FileNotFoundError):
-                task_result = None
+            # Modified by qiangyu: use the helper instead of calling load_task_results directly,
+            # so an empty/corrupted result JSON no longer crashes the whole benchmark on resume;
+            # the file is deleted and this task is re-run. Checked only once, before the task runs.
+            task_result = _load_task_results_or_none(
+                agent_pipeline.name.replace("/", "_"),
+                suite.name,
+                user_task.ID,
+                attack_name=attack.name,
+                injection_task=injection_task.ID,
+                logdir=logdir,
+            )
         else:
             task_result = None
 
@@ -267,17 +267,18 @@ def run_task_without_injection_tasks(
         A tuple with the utility and security of the task. The security is always True.
     """
     if logdir is not None and agent_pipeline.name is not None:
-        try:
-            task_result = load_task_results(
-                agent_pipeline.name.replace("/", "_"),
-                suite.name,
-                task.ID,
-                attack_name="none",
-                injection_task="none",
-                logdir=logdir,
-            )
-        except (ValidationError, FileNotFoundError):
-            task_result = None
+        # Modified by qiangyu: use the helper instead of calling load_task_results directly,
+        # so an empty/corrupted result JSON no longer crashes the whole benchmark on resume
+        # (this is where the travel suite crashed with JSONDecodeError); the file is deleted
+        # and this task is re-run. Checked only once, before the task runs.
+        task_result = _load_task_results_or_none(
+            agent_pipeline.name.replace("/", "_"),
+            suite.name,
+            task.ID,
+            attack_name="none",
+            injection_task="none",
+            logdir=logdir,
+        )
     else:
         task_result = None
 
@@ -448,6 +449,38 @@ def load_task_results(
         res_dict["messages"] = convert_old_messages_format(res_dict["messages"])
 
     return TaskResults(**res_dict)
+
+
+def _load_task_results_or_none(
+    pipeline_name: str,
+    suite_name: str,
+    user_task: str,
+    attack_name: str,
+    injection_task: str,
+    logdir: Path,
+) -> TaskResults | None:
+    """Load a previous task result for resuming, or return None if the task must be (re-)run.
+
+    Modified by qiangyu: added this helper.
+    Why: TraceLogger.save() truncates the result file before writing it, so if the process is
+    killed (Ctrl+C, the cleanup() kill in run_vllm_*.sh, OOM) or json.dumps fails mid-save, an
+    empty or partial JSON file is left behind. Previously only ValidationError/FileNotFoundError
+    were caught, so the next resumed run crashed with JSONDecodeError.
+    Now an empty or malformed JSON file is deleted, so that the task is re-run and its result
+    written again. This is checked only once per task, before it runs; the result written after
+    the run is never re-checked in the same process, so there is no delete/re-run loop.
+    """
+    try:
+        return load_task_results(pipeline_name, suite_name, user_task, attack_name, injection_task, logdir)
+    except (ValidationError, FileNotFoundError):
+        # Same behavior as the original code: missing or invalid-schema result -> re-run the task.
+        return None
+    except (JSONDecodeError, UnicodeDecodeError) as e:
+        # Modified by qiangyu: empty, truncated or non-UTF-8 file -> delete it and re-run the task.
+        path = logdir / pipeline_name / suite_name / user_task / attack_name / f"{injection_task}.json"
+        logging.warning(f"Corrupted result file '{path}' ({e}), deleting it and re-running the task.")
+        path.unlink(missing_ok=True)
+        return None
 
 
 def load_suite_results(
