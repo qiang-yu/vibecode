@@ -58,7 +58,7 @@ SECURITY_DEFENCE_LEVEL="neutral"       # safe | neutral | suspicious | unsafe
 SECURITY_DEFENCE_DEBUG=false           # true: keep <tool_call_security> in response; false: strip it
 SECURITY_DEFENCE_MAX_RETRIES=10        # max base-model retries after a defence block
 # Defence methods applied in order until one succeeds; if none does, the turn passes through
-# undefended. Available: remove_trigger_words | fake_tool_response
+# undefended. Available: remove_trigger_words | fake_tool_response | fake_user_refuse  (each method is independent)
 DEFENCE_METHOD_LIST="remove_trigger_words,fake_tool_response"
 # remove_trigger_words parameters for the DEFENCE_METHOD_LIST (blocked-call) path.
 DEFENCE_REMOVE_TRIGGER_WORDS_MATCH_TOOL_CALL=true  # true: treat trigger words that belong to a tool call (name/args) as a false positive

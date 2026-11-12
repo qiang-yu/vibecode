@@ -40,6 +40,7 @@ Startup requires `BASE_MODEL_PATH` to hold a Qwen3 tokenizer, and (when `PHASE2_
 4. **Defence methods**, tried in list order until one succeeds; if none does, the turn passes through undefended (intentionally visible, not masked):
    - `remove_trigger_words` — locate the trigger words inside tool responses (exact, then punctuation-insensitive, optionally fuzzy via `difflib`) and excise them (`_excise_trigger_words`), then re-run phase 1 on the repaired history. Trigger words that match the tool call's own name/args can be treated as a false positive (`*_MATCH_TOOL_CALL`).
    - `fake_tool_response` — append the blocked call plus a fabricated tool response (`FAKE_TOOL_RESPONSE_CONTENT`, placeholders substituted via `str.replace`, not `str.format`) and re-run phase 1.
+   - `fake_user_refuse` — independent of `fake_tool_response`: for phase 1, append the blocked call + a rejection tool response (`FAKE_USER_REFUSE_TOOL_RESPONSE`) + a fabricated user refusal (`FAKE_USER_REFUSE_CONTENT`), then re-run phase 1. `_build_heads` renders the phase-2 head from `_strip_fake_user_refuse(msgs)`, so the lora never sees that group and judges the next call as if it directly followed the original history. The fabricated user messages are also excluded from the safe-verdict user-message check.
    The outer loop re-runs phase 1 up to `SECURITY_DEFENCE_MAX_RETRIES` times. To add a method, add its name to the list constants and a matching branch in the defence dispatch loop in `_handle_request`.
 
 ### Key invariants
