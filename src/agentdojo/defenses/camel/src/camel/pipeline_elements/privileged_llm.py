@@ -14,9 +14,13 @@
 
 """Module containing the implementation for the PrivilegedLLM."""
 
+import contextlib
 import dataclasses
+import os
+import signal
+import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import Any, TypeVar
 
 import pydantic
@@ -52,6 +56,68 @@ def custom_yaml_dump(obj: dict | list) -> str:
 
 _T = TypeVar("_T", bound=str | int | float | pydantic.BaseModel)
 _E = TypeVar("_E", bound=functions_runtime.TaskEnvironment)
+
+
+# [Modified by qiangyu]: wall-clock timeout for interpreting one generated code block.
+# The CaMeL interpreter has no time limit, so a pathological case (e.g. the exponential
+# `CaMeLValue.__eq__` comparison) could hang a whole benchmark run for days. The limit is read
+# from the env var CAMEL_CODE_TIMEOUT (seconds, default 300 = 5 minutes; <= 0 disables it).
+# [Modified by qiangyu]: default lowered from 10 to 5 minutes as requested.
+_DEFAULT_CAMEL_CODE_TIMEOUT = 300.0
+
+
+def _get_camel_code_timeout() -> float:
+    raw = os.environ.get("CAMEL_CODE_TIMEOUT", "").strip()
+    if not raw:
+        return _DEFAULT_CAMEL_CODE_TIMEOUT
+    try:
+        return float(raw)
+    except ValueError:
+        return _DEFAULT_CAMEL_CODE_TIMEOUT
+
+
+class _CaMeLCodeTimeoutSignal(BaseException):
+    """[Modified by qiangyu]: raised from the SIGALRM handler.
+
+    It derives from BaseException on purpose: the interpreter wraps tool/builtin calls in
+    `except Exception` and would otherwise turn the timeout into a normal CaMeL error that the
+    P-LLM keeps retrying on. It is converted to CaMeLCodeTimeoutError in `_camel_code_timeout`.
+    """
+
+
+class CaMeLCodeTimeoutError(TimeoutError):
+    """[Modified by qiangyu]: interpreting the generated code exceeded CAMEL_CODE_TIMEOUT.
+
+    It is a normal Exception so the benchmark's `except Exception` records the task as an error
+    (non-empty "error" in the result JSON), which `move_error_results.py` can then re-run.
+    The task is aborted instead of retried, because the interrupted run may have executed tool
+    calls that are not tracked anymore, leaving the namespace/environment inconsistent.
+    """
+
+
+@contextlib.contextmanager
+def _camel_code_timeout(seconds: float) -> Iterator[None]:
+    # [Modified by qiangyu]: SIGALRM only works in the main thread on Unix; the benchmark runs
+    # tasks in the main thread, otherwise silently run without a timeout.
+    if seconds <= 0 or not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _handler(signum, frame):
+        raise _CaMeLCodeTimeoutSignal()
+
+    previous_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    except _CaMeLCodeTimeoutSignal:
+        raise CaMeLCodeTimeoutError(
+            f"CaMeL code interpretation exceeded {seconds:.0f}s (CAMEL_CODE_TIMEOUT), task aborted."
+        ) from None
+    finally:
+        # Cancel the timer before restoring the handler so it cannot fire in between.
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def extract_print_output(tool_calls: Sequence[interpreter.FunctionCall]) -> str:
@@ -263,9 +329,11 @@ class PrivilegedLLM(agent_pipeline.BasePipelineElement):
 
         print(code)
 
-        interpreter_res, updated_namespace, tool_calls, dependencies = interpreter.parse_and_interpret_code(
-            code, namespace, [], dependencies, eval_args
-        )
+        # [Modified by qiangyu]: bound the interpretation time, see `_camel_code_timeout`.
+        with _camel_code_timeout(_get_camel_code_timeout()):
+            interpreter_res, updated_namespace, tool_calls, dependencies = interpreter.parse_and_interpret_code(
+                code, namespace, [], dependencies, eval_args
+            )
 
         printed_output = extract_print_output(tool_calls)
         ad_tool_calls = make_ad_tool_calls(tool_calls)

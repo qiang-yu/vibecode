@@ -1664,6 +1664,25 @@ def _eval_compare(
     return EvalResult(result.Ok(r), namespace, tool_calls_chain, dependencies)
 
 
+# [Modified by qiangyu]: helper to drop a control-flow dependency by object identity.
+# The original code used `list.remove(x)`, which compares elements with `==`, i.e. it calls
+# `CaMeLValue.__eq__`. That method recursively compares `_python_value` and `_dependencies`
+# without memoization, so comparing two structurally equal but distinct dependency graphs
+# (e.g. a stale `iterable` left over from a failed attempt vs. the new one built from the same
+# tool output) takes exponential time and hangs the benchmark forever (observed with py-spy in
+# `_eval_for` on the travel suite). `list.remove` could also remove the wrong (merely equal)
+# element. Searching from the end by identity removes exactly the object that was appended.
+def _remove_dependency_by_identity(
+    dependencies: Iterable[value.CaMeLValue], dependency: value.CaMeLValue
+) -> list[value.CaMeLValue]:
+    dependencies = list(dependencies)
+    for i in range(len(dependencies) - 1, -1, -1):
+        if dependencies[i] is dependency:
+            del dependencies[i]
+            break
+    return dependencies
+
+
 def _eval_if(
     node: ast.If,
     namespace: ns.Namespace,
@@ -1697,8 +1716,8 @@ def _eval_if(
             result.Ok(value.CaMeLNone(Capabilities.default(), ())), namespace, tool_calls_chain, dependencies
         )
 
-    dependencies = list(dependencies)
-    dependencies.remove(test)
+    # [Modified by qiangyu]: remove by identity instead of `list.remove` (exponential `__eq__`).
+    dependencies = _remove_dependency_by_identity(dependencies, test)
 
     if isinstance(body_res, result.Error):
         return EvalResult(body_res, namespace, tool_calls_chain, dependencies)
@@ -1736,8 +1755,8 @@ def _eval_if_exp(
             node.orelse, namespace, tool_calls_chain, inner_dependencies, eval_args
         )
 
-    dependencies = list(dependencies)
-    dependencies.remove(test)
+    # [Modified by qiangyu]: remove by identity instead of `list.remove` (exponential `__eq__`).
+    dependencies = _remove_dependency_by_identity(dependencies, test)
 
     if isinstance(body_res, result.Error):
         return EvalResult(body_res, namespace, tool_calls_chain, dependencies)
@@ -1805,6 +1824,10 @@ def _eval_for(
             eval_args,
         )
         if isinstance(assign_res, result.Error):
+            # [Modified by qiangyu]: drop `iterable` before returning the error. Otherwise it leaks
+            # into the dependencies that PrivilegedLLM carries over to the next attempt, where it
+            # later triggers the exponential `__eq__` comparison and pollutes control-flow deps.
+            dependencies = _remove_dependency_by_identity(dependencies, iterable)
             return EvalResult(assign_res, namespace, tool_calls_chain, dependencies)
 
         final_val_res, namespace, tool_calls_chain, dependencies = _eval_stmt_list(
@@ -1819,10 +1842,12 @@ def _eval_for(
             eval_args,
         )
         if isinstance(final_val_res, result.Error):
+            # [Modified by qiangyu]: same as above, do not leak `iterable` on the error path.
+            dependencies = _remove_dependency_by_identity(dependencies, iterable)
             return EvalResult(final_val_res, namespace, tool_calls_chain, dependencies)
 
-    dependencies = list(dependencies)
-    dependencies.remove(iterable)
+    # [Modified by qiangyu]: remove by identity instead of `list.remove` (exponential `__eq__`).
+    dependencies = _remove_dependency_by_identity(dependencies, iterable)
 
     return EvalResult(result.Ok(value.CaMeLNone(Capabilities.default(), ())), namespace, tool_calls_chain, dependencies)
 
