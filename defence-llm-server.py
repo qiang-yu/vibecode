@@ -385,6 +385,15 @@ FAKE_USER_REFUSE_CONTENT = (
 # instruction of its own; the user message after it does the steering.
 FAKE_USER_REFUSE_TOOL_RESPONSE = "Tool call rejected by the user. It was not executed."
 
+# [Modified by qiangyu]: whether the extra "messages" field of the response keeps the messages
+# fabricated by the defence methods. False (default): every fabricated group is removed before the
+# conversation is returned — the fake_tool_response group (blocked call + fake tool response) and
+# the fake_user_refuse group (blocked call + rejection + fake user refusal) — so the client never
+# sees or replays them. True: return them unchanged, so the client can inspect what the defence
+# injected (debugging). choices[0].message is never affected; it is always the final assistant turn.
+# Repairs made by remove_trigger_words are edits of real messages, not fabrications, and are kept.
+RESPONSE_KEEP_FAKE_MESSAGES = False
+
 # Behaviour of the "remove_trigger_words" method. There are TWO independent parameter sets so the
 # method can be tuned differently on its two callers: the DEFENCE_* pair drives the blocked-call
 # path (DEFENCE_METHOD_LIST), the DEFENCE_SAFE_* pair drives the safe-verdict path
@@ -1386,6 +1395,45 @@ def _strip_fake_user_refuse(messages: List[Dict[str, Any]]) -> List[Dict[str, An
         if out and out[-1].get("role") == "assistant" and out[-1].get("tool_calls"):
             out.pop()
     return out
+
+
+def _strip_fake_tool_response(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """[Modified by qiangyu]: remove every fake_tool_response group from the conversation.
+
+    A group is the assistant turn carrying the blocked call(s) plus the fabricated tool response(s)
+    answering them (recognised by _FAKE_TOOL_RESPONSE_LITERAL). The fake tool messages are dropped,
+    and an assistant turn is dropped only when ALL of its tool_calls were answered by fake responses,
+    so a genuine call is never removed. Returns the input list itself when nothing was removed.
+    """
+    if not _FAKE_TOOL_RESPONSE_LITERAL:
+        return messages
+    fake_ids = set()
+    fake_idx = set()
+    for i, m in enumerate(messages):
+        if m.get("role") != "tool":
+            continue
+        text = _tool_response_text(m)
+        if text is not None and _FAKE_TOOL_RESPONSE_LITERAL in text:
+            fake_idx.add(i)
+            if m.get("tool_call_id"):
+                fake_ids.add(m["tool_call_id"])
+    if not fake_idx:
+        return messages
+    out: List[Dict[str, Any]] = []
+    for i, m in enumerate(messages):
+        if i in fake_idx:
+            continue
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            ids = [tc.get("id") for tc in m["tool_calls"] if isinstance(tc, dict)]
+            if ids and all(cid in fake_ids for cid in ids):
+                continue
+        out.append(m)
+    return out
+
+
+def _strip_fake_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """[Modified by qiangyu]: remove all defence-fabricated messages (both fake methods)."""
+    return _strip_fake_tool_response(_strip_fake_user_refuse(messages))
 
 
 def _find_trigger_in_tool_calls(
@@ -2394,7 +2442,9 @@ async def chat_completions(request: Request):
 
     try:
         result, out_messages = await _handle_request(cid, messages, tools, client_max_tokens, client_stop, fwd)
-        result["messages"] = out_messages
+        # [Modified by qiangyu]: hide defence-fabricated messages from the client unless
+        # RESPONSE_KEEP_FAKE_MESSAGES is on (debugging).
+        result["messages"] = out_messages if RESPONSE_KEEP_FAKE_MESSAGES else _strip_fake_messages(out_messages)
         return JSONResponse(result)
     except HTTPException:
         raise
@@ -2657,6 +2707,8 @@ def main():
     log.info("  fake_tool_resp   : %r", FAKE_TOOL_RESPONSE_CONTENT)
     # [Modified by qiangyu]: log the fake_user_refuse template alongside the fake tool response.
     log.info("  fake_user_refuse : %r", FAKE_USER_REFUSE_CONTENT)
+    # [Modified by qiangyu]: log whether fabricated messages are returned to the client.
+    log.info("  keep_fake_msgs   : %s", RESPONSE_KEEP_FAKE_MESSAGES)
     log.info("  request timeout  : %ds", REQUEST_TIMEOUT)
     log.info("  context window   : fetched from vllm at startup")
 
