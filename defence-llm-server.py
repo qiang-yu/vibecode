@@ -22,6 +22,8 @@ import argparse
 import asyncio
 import difflib
 from datetime import datetime
+# [Modified by qiangyu]: functools.wraps keeps the names of the CPU-timed helper functions.
+import functools
 import json
 import logging
 import os
@@ -31,6 +33,9 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+# [Modified by qiangyu]: contextvars carries the per-request id into every log record, so the
+# lines of concurrent requests can be told apart.
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -478,13 +483,131 @@ _HOP_BY_HOP = frozenset({
 # Logging
 # ---------------------------------------------------------------------------
 
+# [Modified by qiangyu]: concurrent requests interleave their log lines, and without an id there
+# was no way to tell which line belonged to which request. Each request sets _request_id_var
+# (an asyncio-task-local ContextVar) in chat_completions, and _RequestIdFilter copies it onto every
+# record as %(request_id)s. Lines logged outside a request (startup, shutdown) show "-".
+_request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+
+LOG_FORMAT  = "%(asctime)s %(levelname)s [%(request_id)s] %(message)s"
+LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+
+class _RequestIdFilter(logging.Filter):
+    """Attach the current request id to each record (attached to handlers, never drops a record)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = _request_id_var.get()
+        return True
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format=LOG_FORMAT,
+    datefmt=LOG_DATEFMT,
     stream=sys.stdout,
 )
+# [Modified by qiangyu]: the filter goes on the handler (not a logger) so records propagated from
+# any logger get request_id before the formatter reads it; otherwise formatting would fail.
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_RequestIdFilter())
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# CPU timing and event-loop lag diagnostics
+# ---------------------------------------------------------------------------
+# [Modified by qiangyu]: the server is single-process asyncio, so synchronous CPU work (chat
+# template rendering, tokenizer.encode, trigger-word matching) blocks every concurrent request
+# while it runs. These diagnostics measure that cost, to decide on data whether that work needs
+# to move off the event loop (e.g. asyncio.to_thread) instead of guessing.
+#
+#   Layer 1 — per-request CPU timing: each instrumented call adds its elapsed time to the current
+#             request's accumulator; one "[cpu]" line is logged when the request ends.
+#   Layer 3 — event-loop lag monitor: a background task sleeps LOOP_LAG_CHECK_INTERVAL seconds and
+#             measures how late it wakes up. Lateness means something held the loop. Stalls of at
+#             least LOOP_LAG_WARN_MS are logged at once; a "[loop_lag]" summary is logged every
+#             LOOP_LAG_REPORT_INTERVAL seconds, only if requests ran in that window.
+
+LOOP_LAG_CHECK_INTERVAL = 0.1     # seconds between event-loop lag probes
+LOOP_LAG_WARN_MS        = 200     # a single stall at least this long is logged as a warning
+LOOP_LAG_REPORT_INTERVAL = 60     # seconds between "[loop_lag]" summaries (skipped when idle)
+
+# Display order of the per-request CPU sections in the "[cpu]" line.
+_CPU_SECTIONS = ("render", "encode", "excise", "match_call")
+
+# Per-request accumulator {section: [total_seconds, call_count]}. None outside a request (startup,
+# passthrough), in which case timing is skipped. A ContextVar is per asyncio task, so concurrent
+# requests each fill their own dict.
+_cpu_stats_var: ContextVar[Optional[Dict[str, List[float]]]] = ContextVar("cpu_stats", default=None)
+
+# Request counters read by the lag monitor to skip summaries for idle windows.
+_active_requests: int = 0
+_requests_started: int = 0
+
+
+def _timed_cpu(section: str):
+    """Decorator: add the wrapped synchronous function's run time to the request's accumulator."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            stats = _cpu_stats_var.get()
+            if stats is None:
+                return func(*args, **kwargs)
+            t0 = time.perf_counter()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                entry = stats.setdefault(section, [0.0, 0])
+                entry[0] += time.perf_counter() - t0
+                entry[1] += 1
+        return wrapper
+    return decorator
+
+
+def _format_cpu_stats(stats: Dict[str, List[float]], wall_s: float) -> str:
+    """Render the accumulator as 'render=35ms(x3) encode=120ms(x6) ... total=157ms  wall=18.4s'."""
+    parts = []
+    total = 0.0
+    for section in _CPU_SECTIONS:
+        if section in stats:
+            secs, count = stats[section]
+            total += secs
+            parts.append(f"{section}={secs * 1000:.0f}ms(x{int(count)})")
+    parts.append(f"total={total * 1000:.0f}ms")
+    return " ".join(parts) + f"  wall={wall_s:.1f}s"
+
+
+async def _loop_lag_monitor() -> None:
+    """Background task: measure event-loop stalls (Layer 3)."""
+    window_start = time.monotonic()
+    window_max_ms = 0.0
+    window_stalls = 0
+    window_requests_base = _requests_started
+    while True:
+        t0 = time.monotonic()
+        await asyncio.sleep(LOOP_LAG_CHECK_INTERVAL)
+        now = time.monotonic()
+        lag_ms = (now - t0 - LOOP_LAG_CHECK_INTERVAL) * 1000
+        if lag_ms > window_max_ms:
+            window_max_ms = lag_ms
+        if lag_ms >= LOOP_LAG_WARN_MS:
+            window_stalls += 1
+            log.warning("[loop_lag] event loop stalled %.0fms  active_requests=%d",
+                        lag_ms, _active_requests)
+        if now - window_start >= LOOP_LAG_REPORT_INTERVAL:
+            started = _requests_started - window_requests_base
+            # Skip idle windows: nothing ran, so there is nothing to report.
+            if started > 0 or _active_requests > 0:
+                log.info(
+                    "[loop_lag] last %.0fs: max_stall=%.0fms  stalls(>=%dms)=%d  "
+                    "requests_started=%d  active_requests=%d",
+                    now - window_start, window_max_ms, LOOP_LAG_WARN_MS, window_stalls,
+                    started, _active_requests,
+                )
+            window_start = now
+            window_max_ms = 0.0
+            window_stalls = 0
+            window_requests_base = _requests_started
 
 # ---------------------------------------------------------------------------
 # Global state — set in main() / lifespan()
@@ -514,6 +637,10 @@ _llm_elapsed_ms: float = 0.0                      # cumulative client-side laten
 _llm_error_counts: Dict[str, int] = {}
 _llm_error_input_tokens: Dict[str, int] = {}
 _llm_error_output_tokens: Dict[str, int] = {}
+# [Modified by qiangyu]: phase-1 stats get their own lock. They used to share _llm_call_lock,
+# which is held across the rate-limit sleep, so a request whose LLM call had already returned
+# could not record its stats (and return) until every queued request finished sleeping.
+_llm_stats_lock: Optional[asyncio.Lock] = None
 
 # SEC model usage statistics (phase 2 only)
 _sec_call_count: int = 0
@@ -536,8 +663,11 @@ _sec_stats_lock: Optional[asyncio.Lock] = None
 async def lifespan(app: FastAPI):
     global _http, _http_llm, _context_window, _llm_call_lock, _sec_stats_lock
     global _token_list, _token_index, _token_usage_counts
+    # [Modified by qiangyu]: create the dedicated phase-1 stats lock (see _llm_stats_lock).
+    global _llm_stats_lock
 
     _llm_call_lock = asyncio.Lock()
+    _llm_stats_lock = asyncio.Lock()
     _sec_stats_lock = asyncio.Lock()
 
     # Parse token list; pick a random start position so load is spread from the first call.
@@ -590,7 +720,18 @@ async def lifespan(app: FastAPI):
     else:
         log.info("Phase 2 disabled — skipping secure server validation")
 
+    # [Modified by qiangyu]: start the event-loop lag monitor (Layer 3) only after startup
+    # validation succeeded, and stop it first on shutdown so it never outlives the loop.
+    lag_task = asyncio.create_task(_loop_lag_monitor())
+    log.info("Event-loop lag monitor started (probe=%.2fs, warn>=%dms, report every %ds)",
+             LOOP_LAG_CHECK_INTERVAL, LOOP_LAG_WARN_MS, LOOP_LAG_REPORT_INTERVAL)
+
     yield
+    lag_task.cancel()
+    try:
+        await lag_task
+    except asyncio.CancelledError:
+        pass
     log.info("Server shutting down — final LLM Model statistics:")
     _log_llm_stats()
     log.info("Server shutting down — final SEC Model statistics:")
@@ -679,6 +820,8 @@ def _normalize_messages(messages: List[Dict]) -> List[Dict]:
     return out
 
 
+# [Modified by qiangyu]: chat-template rendering is synchronous Jinja work on the event loop; time it.
+@_timed_cpu("render")
 def _render_prompt(messages: List[Dict], tools: Optional[List[Dict]]) -> str:
     msgs = _normalize_messages(messages)
     return tokenizer.apply_chat_template(
@@ -688,6 +831,13 @@ def _render_prompt(messages: List[Dict], tools: Optional[List[Dict]]) -> str:
         tokenize=False,
         enable_thinking=ENABLE_THINKING,
     )
+
+
+# [Modified by qiangyu]: single entry point for prompt-size estimation so tokenizer.encode, which
+# runs synchronously on the event loop, is timed in one place.
+@_timed_cpu("encode")
+def _count_tokens(text: str) -> int:
+    return len(tokenizer.encode(text, add_special_tokens=False))
 
 # ---------------------------------------------------------------------------
 # Tool-call output parsing
@@ -991,8 +1141,12 @@ async def _call_chat_completions(
                 resp_body = json.dumps(resp_json, ensure_ascii=False)
             except Exception:
                 resp_body = exc.response.text
-        async with _llm_call_lock:
-            _llm_call_error = True
+        # [Modified by qiangyu]: set the error flag immediately (a plain assignment on the single
+        # event-loop thread, no lock needed) so requests still queued for the rate limiter pick
+        # up the longer interval; record stats under _llm_stats_lock instead of _llm_call_lock so
+        # this request does not wait behind other requests' rate-limit sleeps.
+        _llm_call_error = True
+        async with _llm_stats_lock:
             _llm_error_counts[err_type] = _llm_error_counts.get(err_type, 0) + 1
             _llm_error_input_tokens[err_type] = _llm_error_input_tokens.get(err_type, 0) + err_in
             _llm_error_output_tokens[err_type] = _llm_error_output_tokens.get(err_type, 0) + err_out
@@ -1011,8 +1165,10 @@ async def _call_chat_completions(
     in_tok = usage.get("prompt_tokens", 0)
     out_tok = usage.get("completion_tokens", 0)
     finish_reason = (result.get("choices") or [{}])[0].get("finish_reason") or ""
-    async with _llm_call_lock:
-        _llm_call_error = False
+    # [Modified by qiangyu]: clear the error flag without the rate-limit lock and record stats under
+    # _llm_stats_lock, so a finished call returns without waiting for other requests' sleeps.
+    _llm_call_error = False
+    async with _llm_stats_lock:
         _llm_call_count += 1
         _llm_input_tokens += in_tok
         _llm_output_tokens += out_tok
@@ -1236,6 +1392,9 @@ def _trigger_words_in_user_message(
     return None
 
 
+# [Modified by qiangyu]: trigger-word search (difflib when fuzzy) can be slow on long tool
+# responses and runs on the event loop; time it.
+@_timed_cpu("excise")
 def _excise_trigger_words(
     messages: List[Dict[str, Any]], trigger_words: str, allow_fuzzy: bool = False,
 ) -> Optional[Tuple[List[Dict[str, Any]], int, str, str]]:
@@ -1436,6 +1595,8 @@ def _strip_fake_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return _strip_fake_tool_response(_strip_fake_user_refuse(messages))
 
 
+# [Modified by qiangyu]: trigger-word search over tool-call arguments runs on the event loop; time it.
+@_timed_cpu("match_call")
 def _find_trigger_in_tool_calls(
     messages: List[Dict[str, Any]],
     current_calls: List[Tuple[str, str]],
@@ -1826,7 +1987,8 @@ async def _handle_request(
         # ── Phase 1: base model ──────────────────────────────────────────────
         # _context_window is the configured context length (LLM_CONTEXT_WINDOW); the
         # generation budget is window minus the estimated prompt length.
-        prompt_token_count = len(tokenizer.encode(current_prompt, add_special_tokens=False))
+        # [Modified by qiangyu]: go through _count_tokens so the encode time is measured.
+        prompt_token_count = _count_tokens(current_prompt)
         p1_available = _context_window - prompt_token_count - 64   # 64-token safety buffer
         if p1_available <= 0:
             raise HTTPException(
@@ -1972,7 +2134,8 @@ async def _handle_request(
                 + TOOL_CALL_SECURITY_START + security_prefill
             )
 
-            p2_prompt_tokens_est = len(tokenizer.encode(p2_prompt, add_special_tokens=False))
+            # [Modified by qiangyu]: go through _count_tokens so the encode time is measured.
+            p2_prompt_tokens_est = _count_tokens(p2_prompt)
             p2_available = _context_window - p2_prompt_tokens_est - 64
 
             if p2_available < 64:
@@ -2440,6 +2603,20 @@ async def chat_completions(request: Request):
     fwd = {k: v for k, v in body.items() if k in _FORWARD_PARAMS}
     cid = f"chatcmpl-{uuid.uuid4().hex}"
 
+    # [Modified by qiangyu]: tag every log line of this request with a short id (the first 8 hex
+    # chars of cid) so interleaved logs of concurrent requests can be separated. The full cid is
+    # logged once so a client response id can be mapped back to its log lines. The ContextVar is
+    # per asyncio task, so concurrent requests do not overwrite each other's id.
+    rid_token = _request_id_var.set(cid[len("chatcmpl-"):][:8])
+    log.info("[request] start  cid=%s  messages=%d  tools=%d",
+             cid, len(messages), len(tools or []))
+    # [Modified by qiangyu]: give this request its own CPU-timing accumulator (Layer 1) and count it
+    # for the lag monitor's idle-window check (Layer 3).
+    global _active_requests, _requests_started
+    cpu_token = _cpu_stats_var.set({})
+    t_request = time.monotonic()
+    _active_requests += 1
+    _requests_started += 1
     try:
         result, out_messages = await _handle_request(cid, messages, tools, client_max_tokens, client_stop, fwd)
         # [Modified by qiangyu]: hide defence-fabricated messages from the client unless
@@ -2454,6 +2631,17 @@ async def chat_completions(request: Request):
         log.exception("unhandled error in /v1/chat/completions")
         result = _build_response(cid, [], str(e), 0, 0, "stop")
         return JSONResponse(result)
+    finally:
+        # [Modified by qiangyu]: mark the end of the request in the log and restore the id, so
+        # nothing logged after this point is attributed to this request.
+        # [Modified by qiangyu]: log this request's CPU time on the event loop next to its wall
+        # time (Layer 1), then release the accumulator and the active-request count.
+        _active_requests -= 1
+        log.info("[cpu] %s", _format_cpu_stats(_cpu_stats_var.get() or {},
+                                               time.monotonic() - t_request))
+        _cpu_stats_var.reset(cpu_token)
+        log.info("[request] end  cid=%s", cid)
+        _request_id_var.reset(rid_token)
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
@@ -2665,10 +2853,10 @@ def main():
     log_path = Path(__file__).parent / log_filename
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setLevel(log_level)
-    file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
+    # [Modified by qiangyu]: the file log uses the same request-id format and filter as stdout,
+    # so concurrent requests can be separated in the log file too.
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+    file_handler.addFilter(_RequestIdFilter())
     logging.getLogger().addHandler(file_handler)
     log.info("Log file: %s", log_path)
 
