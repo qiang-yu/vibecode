@@ -266,8 +266,11 @@ class OpenAILLMToolFilter(BasePipelineElement):
         messages: Sequence[ChatMessage] = [],
         extra_args: dict = {},
     ) -> tuple[str, FunctionsRuntime, Env, Sequence[ChatMessage], dict]:
-        messages = [*messages, ChatUserMessage(role="user", content=[text_content_block_from_string(self.prompt)])]
-        openai_messages = [_message_to_openai(message, self.model) for message in messages]
+        # [Modified by qiangyu]: build the filter conversation in a separate list. The original
+        # `messages` is returned unchanged at the end so the filter Q&A never enters the main LLM's
+        # history (see the comment before the return statement).
+        filter_messages = [*messages, ChatUserMessage(role="user", content=[text_content_block_from_string(self.prompt)])]
+        openai_messages = [_message_to_openai(message, self.model) for message in filter_messages]
         # [Modified by qiangyu]: the filter LLM must see exactly ONE tool list on every backend.
         # Before, the list was sent via the `tools` API parameter with tool_choice="none" (plus
         # chat_template_kwargs for old vLLM). Whether a server renders `tools` under tool_choice="none"
@@ -301,13 +304,6 @@ class OpenAILLMToolFilter(BasePipelineElement):
         output_tool_list_str = raw.strip()
         print(f"defence tool_filter: {output_tool_list_str}")
 
-        # write cleaned text back so the thinking does not enter the main LLM's history
-        output = ChatAssistantMessage(
-            role="assistant",
-            content=[text_content_block_from_string(output_tool_list_str)],
-            tool_calls=output["tool_calls"],
-        )
-
         new_tools = {}
         for tool_name, tool in runtime.functions.items():
             if tool_name in output_tool_list_str:
@@ -315,5 +311,12 @@ class OpenAILLMToolFilter(BasePipelineElement):
 
         runtime.update_functions(new_tools)
 
-        messages = [*messages, output]
+        # [Modified by qiangyu]: upstream appended the filter prompt and the filter answer to the
+        # history, so the last user instruction the main LLM saw was "output the comma-separated list
+        # of tool names". gpt-oss-120b obeyed it and just repeated the tool list instead of calling
+        # tools (156 of 157 utility tasks, utility ~0). The filter now only narrows the runtime's
+        # tools and returns the history unchanged, so the main LLM sees the same conversation as
+        # without a defense, just with fewer tools. The filter answer is still printed above for the
+        # logs. Note: camel's count_tokens.get_input_and_output_text_tool_filter assumes the old
+        # layout (filter Q&A at messages[2:4]) and does not match results produced by this version.
         return query, runtime, env, messages, extra_args
