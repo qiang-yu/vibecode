@@ -1,5 +1,6 @@
 import json
-from collections.abc import Sequence
+# [Modified by qiangyu]: Iterable is needed by _format_tool_list_for_prompt (tool_filter fix).
+from collections.abc import Iterable, Sequence
 from typing import overload
 
 import openai
@@ -237,6 +238,18 @@ class OpenAILLM(BasePipelineElement):
         return query, runtime, env, messages, extra_args
 
 
+# [Modified by qiangyu]: helper for OpenAILLMToolFilter. Servers handle the `tools` parameter under
+# tool_choice="none" inconsistently, so the filter call sends no `tools` at all and instead writes
+# the available tool names and descriptions into the prompt as the single tool list.
+def _format_tool_list_for_prompt(functions: Iterable[Function]) -> str:
+    lines = ["Available tools:"]
+    for f in functions:
+        # Keep only the first line of the description to keep the prompt short.
+        description = (f.description or "").strip().split("\n")[0]
+        lines.append(f"- {f.name}: {description}" if description else f"- {f.name}")
+    return "\n".join(lines)
+
+
 class OpenAILLMToolFilter(BasePipelineElement):
     def __init__(self, prompt: str, client: openai.OpenAI, model: str, reasoning_effort: ChatCompletionReasoningEffort | None = None, temperature: float | None = 0.0) -> None:
         self.prompt = prompt
@@ -255,26 +268,29 @@ class OpenAILLMToolFilter(BasePipelineElement):
     ) -> tuple[str, FunctionsRuntime, Env, Sequence[ChatMessage], dict]:
         messages = [*messages, ChatUserMessage(role="user", content=[text_content_block_from_string(self.prompt)])]
         openai_messages = [_message_to_openai(message, self.model) for message in messages]
-        openai_tools = [_function_to_openai(tool) for tool in runtime.functions.values()]
-        # vLLM < 0.10 drops `tools` from the prompt when tool_choice="none", so the model never sees
-        # the tool list. Pass them again via chat_template_kwargs so the model's own chat template
-        # still renders them (tool-call parsing stays disabled because tool_choice is "none").
-        import os
-        extra_body = None
-        if is_local_llm_configured() and openai_tools:
-            extra_body = {"chat_template_kwargs": {"tools": [dict(t) for t in openai_tools]}}
+        # [Modified by qiangyu]: the filter LLM must see exactly ONE tool list on every backend.
+        # Before, the list was sent via the `tools` API parameter with tool_choice="none" (plus
+        # chat_template_kwargs for old vLLM). Whether a server renders `tools` under tool_choice="none"
+        # differs between servers: vLLM < 0.10 drops them, vLLM's Harmony path for gpt-oss ignores
+        # chat_template_kwargs (the filter saw no tools and invented names -> utility 0), and
+        # third-party OpenAI-compatible APIs (gpt-4o, deepseek, glm, ...) each behave differently,
+        # so the model could see zero or two lists. Now no `tools`, `tool_choice` or
+        # chat_template_kwargs are sent for this call; the only tool list is the plain text below.
+        # It is added to the request copy only, so the stored history keeps the original prompt and
+        # the main LLM's context is unchanged.
+        openai_messages[-1] = ChatCompletionUserMessageParam(
+            role="user",
+            content=self.prompt + "\n\n" + _format_tool_list_for_prompt(runtime.functions.values()),
+        )
         completion = self.client.chat.completions.create(
             model=self.model,
             messages=openai_messages,
-            tools=openai_tools or NOT_GIVEN,
-            tool_choice="none",
             temperature=(
                 self.temperature
                 if self.temperature is not None and _supports_temperature(self.model)
                 else NOT_GIVEN
             ),
             reasoning_effort=self.reasoning_effort or NOT_GIVEN,
-            extra_body=extra_body,
         )
         output = _openai_to_assistant_message(completion.choices[0].message)
 
